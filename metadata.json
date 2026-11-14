@@ -1,0 +1,8 @@
+{
+  "name": "Remix MathDocx_Lê Chí Hiếu 1",
+  "description": "Chuyển đổi tài liệu Toán học từ PDF hoặc Ảnh chụp sang file Word (.docx) với công thức Equation OMML chỉnh sửa trực tiếp.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

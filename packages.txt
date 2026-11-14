@@ -1,0 +1,5 @@
+pandoc
+tesseract-ocr
+poppler-utils
+libxml2-dev
+libxslt1-dev
