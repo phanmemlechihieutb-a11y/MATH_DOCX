@@ -3,9 +3,11 @@ import type {
   ChoiceLayoutMode,
   DocumentBlock,
   InlineSegment,
+  MathOutputFormat,
   PageExtraction,
 } from '../types/document';
 import {
+  cleanLatexDelimiters,
   computePageGeometry,
   groupBlocksIntoVisualBands,
   groupSegmentsByTabs,
@@ -19,6 +21,7 @@ import { MathRenderer } from './MathRenderer';
 interface DocumentPreviewProps {
   pages: PageExtraction[];
   choiceLayout?: ChoiceLayoutMode;
+  mathFormat?: MathOutputFormat;
   onSelectEquation?: (latex: string, isDisplay: boolean) => void;
 }
 
@@ -52,12 +55,14 @@ function RenderSegments({
   defaultBold = false,
   baseFontPt = 12,
   scale = 1.28,
+  mathFormat = 'omml',
   onSelectEquation,
 }: {
   segments?: InlineSegment[] | null;
   defaultBold?: boolean;
   baseFontPt?: number;
   scale?: number;
+  mathFormat?: MathOutputFormat;
   onSelectEquation?: (latex: string, isDisplay: boolean) => void;
 }) {
   if (!segments || segments.length === 0) return null;
@@ -77,6 +82,27 @@ function RenderSegments({
         ) : null;
 
         if (seg.type === 'math') {
+          if (mathFormat === 'latex') {
+            const latexText = `$${cleanLatexDelimiters(seg.content)}$`;
+            return (
+              <span key={idx}>
+                {tabPrefix}
+                <button
+                  type="button"
+                  onClick={() => onSelectEquation?.(seg.content, false)}
+                  title="Công thức LaTeX bọc $...$ — nhấn để xem chi tiết"
+                  style={{
+                    fontSize: `${segFontPt * scale * 0.92}px`,
+                    color: hex ? `#${hex}` : undefined,
+                  }}
+                  className="inline font-mono px-1 mx-0.5 rounded bg-amber-50 text-slate-900 border border-amber-200/80 hover:bg-amber-100/80 transition-colors cursor-pointer"
+                >
+                  {latexText}
+                </button>
+              </span>
+            );
+          }
+
           return (
             <span key={idx}>
               {tabPrefix}
@@ -135,6 +161,7 @@ function RenderSingleBlock({
   indentLeftPt,
   indentRightPt,
   firstLineIndentPt,
+  mathFormat = 'omml',
   onSelectEquation,
 }: {
   blk: DocumentBlock;
@@ -145,6 +172,7 @@ function RenderSingleBlock({
   indentLeftPt: number;
   indentRightPt: number;
   firstLineIndentPt: number;
+  mathFormat?: MathOutputFormat;
   onSelectEquation?: (latex: string, isDisplay: boolean) => void;
 }) {
   const alignClass = ALIGN_CLASS_MAP[blk.alignment] ?? 'text-left';
@@ -189,6 +217,7 @@ function RenderSingleBlock({
           defaultBold={true}
           baseFontPt={baseFontPt}
           scale={scale}
+          mathFormat={mathFormat}
           onSelectEquation={onSelectEquation}
         />
       </h3>
@@ -237,6 +266,7 @@ function RenderSingleBlock({
                 segments={grp}
                 baseFontPt={baseFontPt}
                 scale={scale}
+                mathFormat={mathFormat}
                 onSelectEquation={onSelectEquation}
               />
             </span>
@@ -251,6 +281,7 @@ function RenderSingleBlock({
           segments={blk.segments}
           baseFontPt={baseFontPt}
           scale={scale}
+          mathFormat={mathFormat}
           onSelectEquation={onSelectEquation}
         />
       </p>
@@ -260,6 +291,31 @@ function RenderSingleBlock({
   if (blk.block_type === 'equation' && blk.latex) {
     const eqAlign = blk.alignment ?? 'center';
     const flexJustify = JUSTIFY_FLEX_MAP[eqAlign] ?? 'justify-center';
+    if (mathFormat === 'latex') {
+      const latexText = `$${cleanLatexDelimiters(blk.latex)}$`;
+      return (
+        <div
+          style={{
+            marginTop: `${spaceBeforePt * scale}px`,
+            paddingLeft:
+              eqAlign === 'center' || indentLeftPt <= 0 ? undefined : `${indentLeftPt * scale}px`,
+            paddingRight:
+              eqAlign === 'center' || indentRightPt <= 0 ? undefined : `${indentRightPt * scale}px`,
+            fontSize: `${baseFontPt * scale * 0.92}px`,
+          }}
+          className={`flex ${flexJustify}`}
+        >
+          <button
+            type="button"
+            onClick={() => onSelectEquation?.(blk.latex ?? '', true)}
+            title="Công thức LaTeX bọc $...$ — nhấn để xem chi tiết"
+            className="font-mono px-2 py-1 rounded-md bg-amber-50 text-slate-900 border border-amber-200/80 hover:bg-amber-100/80 transition-colors cursor-pointer"
+          >
+            {latexText}
+          </button>
+        </div>
+      );
+    }
     return (
       <div
         style={{
@@ -346,6 +402,7 @@ function RenderSingleBlock({
                         defaultBold={isHeader}
                         baseFontPt={isBorderless ? baseFontPt : Math.min(baseFontPt, 11)}
                         scale={scale}
+                        mathFormat={mathFormat}
                         onSelectEquation={onSelectEquation}
                       />
                     </td>
@@ -406,6 +463,7 @@ function RenderSingleBlock({
 export function DocumentPreview({
   pages,
   choiceLayout = 'table',
+  mathFormat = 'omml',
   onSelectEquation,
 }: DocumentPreviewProps) {
   if (pages.length === 0) {
@@ -452,6 +510,7 @@ export function DocumentPreview({
                       indentLeftPt={band.indentLeftPt}
                       indentRightPt={band.indentRightPt}
                       firstLineIndentPt={band.firstLineIndentPt}
+                      mathFormat={mathFormat}
                       onSelectEquation={onSelectEquation}
                     />
                   );
@@ -480,6 +539,7 @@ export function DocumentPreview({
                         indentLeftPt={0}
                         indentRightPt={0}
                         firstLineIndentPt={0}
+                        mathFormat={mathFormat}
                         onSelectEquation={onSelectEquation}
                       />
                     </div>
@@ -493,6 +553,7 @@ export function DocumentPreview({
                         indentLeftPt={0}
                         indentRightPt={0}
                         firstLineIndentPt={0}
+                        mathFormat={mathFormat}
                         onSelectEquation={onSelectEquation}
                       />
                     </div>

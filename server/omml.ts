@@ -21,14 +21,79 @@ export function cleanLatex(raw: string): string {
   return s;
 }
 
+function expandBalancedMacro(
+  src: string,
+  macroName: string,
+  transform: (inner: string) => string
+): string {
+  const re = new RegExp(`\\\\${macroName}\\s*\\{`);
+  let out = src;
+  let safety = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(out)) !== null && safety < 50) {
+    safety++;
+    const braceStart = m.index + m[0].length - 1;
+    let depth = 0;
+    let endIdx = -1;
+    for (let i = braceStart; i < out.length; i++) {
+      if (out[i] === '\\' && i + 1 < out.length) {
+        i++;
+        continue;
+      }
+      if (out[i] === '{') depth++;
+      else if (out[i] === '}') {
+        depth--;
+        if (depth === 0) {
+          endIdx = i;
+          break;
+        }
+      }
+    }
+    if (endIdx === -1) break;
+    const inner = out.slice(braceStart + 1, endIdx);
+    out = out.slice(0, m.index) + transform(inner) + out.slice(endIdx + 1);
+  }
+  return out;
+}
+
 function sanitizeLatexForTemml(latex: string): string {
-  return cleanLatex(latex)
+  let s = cleanLatex(latex)
+    .replace(/\\label\{[^}]*\}/g, '')
+    .replace(/\\nonumber\b/g, '')
+    .replace(/\\allowbreak\b/g, '')
     .replace(/\\limits/g, '')
-    .replace(/\\displaystyle/g, '')
+    .replace(/\\(?:displaystyle|textstyle|scriptstyle|scriptscriptstyle)\b/g, '')
     .replace(/\\implies/g, '\\Rightarrow')
     .replace(/\\iff/g, '\\Leftrightarrow')
     .replace(/\\leqslant/g, '\\leq')
-    .replace(/\\geqslant/g, '\\geq');
+    .replace(/\\geqslant/g, '\\geq')
+    .replace(/\\arctg(?![a-zA-Z])/g, '\\arctan')
+    .replace(/\\arccotg(?![a-zA-Z])/g, '\\operatorname{arccot}')
+    .replace(/\\cotg(?![a-zA-Z])/g, '\\cot')
+    .replace(/\\tg(?![a-zA-Z])/g, '\\tan')
+    .replace(/\\degree(?![a-zA-Z])/g, '^\\circ')
+    .replace(/\\dx(?![a-zA-Z])/g, '\\,dx');
+
+  s = expandBalancedMacro(s, 'heva', (inner) => `\\begin{cases} ${inner} \\end{cases}`);
+  s = expandBalancedMacro(
+    s,
+    'hoac',
+    (inner) => `\\left[\\begin{aligned} ${inner} \\end{aligned}\\right.`
+  );
+  s = expandBalancedMacro(s, 'wideparen', (inner) => `\\widehat{${inner}}`);
+
+  const eqMatch = s.match(/^\\begin\{(equation\*?|displaymath)\}([\s\S]*)\\end\{\1\}$/);
+  if (eqMatch) {
+    s = eqMatch[2].trim();
+  }
+
+  s = s
+    .replace(/\\begin\{(align\*?|flalign\*?|eqnarray\*?)\}/g, '\\begin{aligned}')
+    .replace(/\\end\{(align\*?|flalign\*?|eqnarray\*?)\}/g, '\\end{aligned}')
+    .replace(/\\begin\{(gather\*?|multline\*?)\}/g, '\\begin{gathered}')
+    .replace(/\\end\{(gather\*?|multline\*?)\}/g, '\\end{gathered}');
+
+  return s.trim();
 }
 
 export function escapeXml(text: string): string {
@@ -362,6 +427,10 @@ function convertNode(node: XmlElement): string {
   return convertChildren(node);
 }
 
+const sharedDomParser = new DOMParser();
+const OMML_CACHE_MAX = 2000;
+const ommlCache = new Map<string, string | null>();
+
 export function latexToOmmlXml(
   rawLatex: string,
   isDisplay: boolean,
@@ -370,6 +439,13 @@ export function latexToOmmlXml(
   const sanitized = sanitizeLatexForTemml(rawLatex);
   if (!sanitized) return null;
 
+  const cacheKey = `${isDisplay ? 'D' : 'I'}|${style?.sizeHalfPt ?? ''}|${style?.align ?? ''}|${
+    style?.colorHex ?? ''
+  }|${sanitized}`;
+  if (ommlCache.has(cacheKey)) {
+    return ommlCache.get(cacheKey) ?? null;
+  }
+
   try {
     const mathml = temml.renderToString(sanitized, {
       displayMode: isDisplay,
@@ -377,8 +453,7 @@ export function latexToOmmlXml(
       throwOnError: false,
     });
 
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(mathml, 'application/xml');
+    const doc = sharedDomParser.parseFromString(mathml, 'application/xml');
     const root = doc.documentElement;
     if (!root) return null;
 
@@ -392,6 +467,7 @@ export function latexToOmmlXml(
     }
 
     const oMath = `<m:oMath>${innerOmml}</m:oMath>`;
+    let result: string;
     if (isDisplay) {
       const jcVal =
         style?.align === 'right'
@@ -399,9 +475,17 @@ export function latexToOmmlXml(
           : style?.align === 'left' || style?.align === 'justify'
           ? 'left'
           : 'center';
-      return `<m:oMathPara><m:oMathParaPr><m:jc m:val="${jcVal}"/></m:oMathParaPr>${oMath}</m:oMathPara>`;
+      result = `<m:oMathPara><m:oMathParaPr><m:jc m:val="${jcVal}"/></m:oMathParaPr>${oMath}</m:oMathPara>`;
+    } else {
+      result = oMath;
     }
-    return oMath;
+
+    if (ommlCache.size >= OMML_CACHE_MAX) {
+      const oldestKey = ommlCache.keys().next().value;
+      if (oldestKey !== undefined) ommlCache.delete(oldestKey);
+    }
+    ommlCache.set(cacheKey, result);
+    return result;
   } catch {
     return null;
   }

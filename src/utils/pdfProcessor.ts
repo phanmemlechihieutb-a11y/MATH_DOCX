@@ -4,6 +4,31 @@ import type { RenderedPage } from '../types/document';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
+function createOcrDataUrl(sourceCanvas: HTMLCanvasElement, maxDim = 1850): string {
+  const w = sourceCanvas.width;
+  const h = sourceCanvas.height;
+  if (w <= maxDim && h <= maxDim) {
+    return sourceCanvas.toDataURL('image/jpeg', 0.92);
+  }
+  const ratio = Math.min(maxDim / w, maxDim / h);
+  const targetW = Math.max(1, Math.round(w * ratio));
+  const targetH = Math.max(1, Math.round(h * ratio));
+  const smallCanvas = document.createElement('canvas');
+  smallCanvas.width = targetW;
+  smallCanvas.height = targetH;
+  const sCtx = smallCanvas.getContext('2d');
+  if (!sCtx) {
+    return sourceCanvas.toDataURL('image/jpeg', 0.92);
+  }
+  sCtx.fillStyle = '#ffffff';
+  sCtx.fillRect(0, 0, targetW, targetH);
+  sCtx.drawImage(sourceCanvas, 0, 0, targetW, targetH);
+  const url = smallCanvas.toDataURL('image/jpeg', 0.92);
+  smallCanvas.width = 0;
+  smallCanvas.height = 0;
+  return url;
+}
+
 export async function loadFileAsPages(file: File, dpi = 250): Promise<RenderedPage[]> {
   const isPdf =
     file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
@@ -34,11 +59,21 @@ export async function loadFileAsPages(file: File, dpi = 250): Promise<RenderedPa
         canvas,
       }).promise;
 
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.93);
+      const ocrDataUrl = createOcrDataUrl(canvas);
+      const pageW = canvas.width;
+      const pageH = canvas.height;
+
+      canvas.width = 0;
+      canvas.height = 0;
+      page.cleanup();
+
       pages.push({
         pageNumber: pageNum,
-        dataUrl: canvas.toDataURL('image/png'),
-        width: canvas.width,
-        height: canvas.height,
+        dataUrl,
+        ocrDataUrl,
+        width: pageW,
+        height: pageH,
       });
     }
 
@@ -72,10 +107,16 @@ export async function loadFileAsPages(file: File, dpi = 250): Promise<RenderedPa
         ctx.fillRect(0, 0, targetW, targetH);
         ctx.drawImage(img, 0, 0, targetW, targetH);
 
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.93);
+        const ocrDataUrl = createOcrDataUrl(canvas);
+        canvas.width = 0;
+        canvas.height = 0;
+
         resolve([
           {
             pageNumber: 1,
-            dataUrl: canvas.toDataURL('image/png'),
+            dataUrl,
+            ocrDataUrl,
             width: targetW,
             height: targetH,
           },
@@ -92,49 +133,68 @@ export async function loadFileAsPages(file: File, dpi = 250): Promise<RenderedPa
   });
 }
 
+function loadImageElement(src: string): Promise<HTMLImageElement | null> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => resolve(null);
+    img.src = src;
+  });
+}
+
+export async function cropFiguresFromPage(
+  page: RenderedPage,
+  boxes: number[][],
+  padRatio = 0.012
+): Promise<Array<{ dataUrl: string; width: number; height: number } | null>> {
+  if (boxes.length === 0) return [];
+  const img = await loadImageElement(page.dataUrl);
+  if (!img) return boxes.map(() => null);
+
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return boxes.map(() => null);
+
+  const padX = Math.round(page.width * padRatio);
+  const padY = Math.round(page.height * padRatio);
+
+  const results = boxes.map((box2d) => {
+    if (!box2d || box2d.length !== 4) return null;
+    const [ymin, xmin, ymax, xmax] = box2d;
+
+    const left = Math.max(0, Math.floor((xmin * page.width) / 1000) - padX);
+    const top = Math.max(0, Math.floor((ymin * page.height) / 1000) - padY);
+    const right = Math.min(page.width, Math.ceil((xmax * page.width) / 1000) + padX);
+    const bottom = Math.min(page.height, Math.ceil((ymax * page.height) / 1000) + padY);
+
+    const cropW = right - left;
+    const cropH = bottom - top;
+    if (cropW < 20 || cropH < 20) return null;
+
+    canvas.width = cropW;
+    canvas.height = cropH;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, cropW, cropH);
+    ctx.drawImage(img, left, top, cropW, cropH, 0, 0, cropW, cropH);
+    return {
+      dataUrl: canvas.toDataURL('image/png'),
+      width: cropW,
+      height: cropH,
+    };
+  });
+
+  canvas.width = 0;
+  canvas.height = 0;
+  return results;
+}
+
 export async function cropFigureFromPage(
   page: RenderedPage,
   box2d: number[],
   padRatio = 0.012
 ): Promise<{ dataUrl: string; width: number; height: number } | null> {
-  if (!box2d || box2d.length !== 4) return null;
-  const [ymin, xmin, ymax, xmax] = box2d;
-
-  const padX = Math.round(page.width * padRatio);
-  const padY = Math.round(page.height * padRatio);
-
-  const left = Math.max(0, Math.floor((xmin * page.width) / 1000) - padX);
-  const top = Math.max(0, Math.floor((ymin * page.height) / 1000) - padY);
-  const right = Math.min(page.width, Math.ceil((xmax * page.width) / 1000) + padX);
-  const bottom = Math.min(page.height, Math.ceil((ymax * page.height) / 1000) + padY);
-
-  const cropW = right - left;
-  const cropH = bottom - top;
-  if (cropW < 20 || cropH < 20) return null;
-
-  return new Promise((resolve) => {
-    const img = new Image();
-    img.onload = () => {
-      const canvas = document.createElement('canvas');
-      canvas.width = cropW;
-      canvas.height = cropH;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) {
-        resolve(null);
-        return;
-      }
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(0, 0, cropW, cropH);
-      ctx.drawImage(img, left, top, cropW, cropH, 0, 0, cropW, cropH);
-      resolve({
-        dataUrl: canvas.toDataURL('image/png'),
-        width: cropW,
-        height: cropH,
-      });
-    };
-    img.onerror = () => resolve(null);
-    img.src = page.dataUrl;
-  });
+  const [res] = await cropFiguresFromPage(page, [box2d], padRatio);
+  return res ?? null;
 }
 
 export function generateSampleMathWorksheet(): RenderedPage {

@@ -4,8 +4,10 @@ import type {
   ChoiceLayoutMode,
   DocumentBlock,
   InlineSegment,
+  MathOutputFormat,
   PageExtraction,
 } from '../src/types/document.ts';
+import { splitTextPreservingInlineMath } from '../src/utils/latexParser.ts';
 import {
   computePageGeometry,
   groupBlocksIntoVisualBands,
@@ -83,13 +85,35 @@ function renderRunXml(
 
 function renderSegmentsXml(
   segments: InlineSegment[] | null | undefined,
-  options: { sizeHalfPt?: number; defaultBold?: boolean } = {}
+  options: { sizeHalfPt?: number; defaultBold?: boolean; mathFormat?: MathOutputFormat } = {}
 ): string {
   if (!segments || segments.length === 0) return '';
-  const { sizeHalfPt = 24, defaultBold = false } = options;
+  const { sizeHalfPt = 24, defaultBold = false, mathFormat = 'omml' } = options;
   const out: string[] = [];
 
+  const normalizedSegments: InlineSegment[] = [];
   for (const seg of segments) {
+    if (
+      mathFormat === 'omml' &&
+      seg.type === 'text' &&
+      seg.content &&
+      (seg.content.includes('$') ||
+        seg.content.includes('＄') ||
+        seg.content.includes('\\(') ||
+        seg.content.includes('\\['))
+    ) {
+      const { type: _t, content, tab_before, ...style } = seg;
+      const split = splitTextPreservingInlineMath(content, style);
+      if (tab_before && split.length > 0) {
+        split[0] = { ...split[0], tab_before: true };
+      }
+      normalizedSegments.push(...split);
+    } else {
+      normalizedSegments.push(seg);
+    }
+  }
+
+  for (const seg of normalizedSegments) {
     if (seg.tab_before) {
       out.push('<w:r><w:tab/></w:r>');
     }
@@ -102,21 +126,36 @@ function renderSegmentsXml(
     const isBold = seg.bold !== undefined ? Boolean(seg.bold) : defaultBold;
 
     if (seg.type === 'math') {
-      const omml = latexToOmmlXml(seg.content, false, {
-        sizeHalfPt: segSizeHalfPt,
-        colorHex,
-      });
-      if (omml) {
-        out.push(omml);
+      if (mathFormat === 'latex') {
+        const cleaned = cleanLatex(seg.content);
+        if (cleaned) {
+          out.push(
+            renderRunXml(`$${cleaned}$`, {
+              sizeHalfPt: segSizeHalfPt,
+              colorHex,
+              bold: isBold,
+              italic: Boolean(seg.italic),
+              underline: Boolean(seg.underline),
+            })
+          );
+        }
       } else {
-        out.push(
-          renderRunXml(` ${cleanLatex(seg.content)} `, {
-            sizeHalfPt: segSizeHalfPt,
-            colorHex,
-            bold: isBold,
-            italic: Boolean(seg.italic),
-          })
-        );
+        const omml = latexToOmmlXml(seg.content, false, {
+          sizeHalfPt: segSizeHalfPt,
+          colorHex,
+        });
+        if (omml) {
+          out.push(omml);
+        } else {
+          out.push(
+            renderRunXml(` ${cleanLatex(seg.content)} `, {
+              sizeHalfPt: segSizeHalfPt,
+              colorHex,
+              bold: isBold,
+              italic: Boolean(seg.italic),
+            })
+          );
+        }
       }
     } else {
       const lines = (seg.content ?? '').split('\n');
@@ -223,6 +262,7 @@ function renderTableXml(
     availableWidthTwips: number;
     indentLeftTwip?: number;
     spaceBeforeTwip?: number;
+    mathFormat?: MathOutputFormat;
   }
 ): string {
   const rows = block.table_rows ?? [];
@@ -234,7 +274,12 @@ function renderTableXml(
   );
   if (maxCols === 0) return '';
 
-  const { availableWidthTwips, indentLeftTwip = 0, spaceBeforeTwip = 0 } = options;
+  const {
+    availableWidthTwips,
+    indentLeftTwip = 0,
+    spaceBeforeTwip = 0,
+    mathFormat = 'omml',
+  } = options;
   const totalWidthDxa = Math.max(2400, Math.round(availableWidthTwips));
   const isBorderless = Boolean(block.table_borderless);
 
@@ -313,6 +358,7 @@ function renderTableXml(
         const segXml = renderSegmentsXml(cell.segments, {
           sizeHalfPt: defaultSizeHalfPt,
           defaultBold: isHeader,
+          mathFormat,
         });
         const cellPara = renderParagraphXml(segXml, {
           align: cellAlign,
@@ -374,6 +420,7 @@ function renderSingleBlockXml(
     indentRightTwip: number;
     firstLineIndentTwip: number;
     availableWidthTwips: number;
+    mathFormat?: MathOutputFormat;
   }
 ): string {
   const {
@@ -382,6 +429,7 @@ function renderSingleBlockXml(
     indentRightTwip,
     firstLineIndentTwip,
     availableWidthTwips,
+    mathFormat = 'omml',
   } = opts;
 
   const lineSpacing240 =
@@ -412,6 +460,7 @@ function renderSingleBlockXml(
     const inner = renderSegmentsXml(blk.segments, {
       sizeHalfPt,
       defaultBold: true,
+      mathFormat,
     });
     return renderParagraphXml(inner, {
       align: blk.alignment,
@@ -428,7 +477,7 @@ function renderSingleBlockXml(
 
   if (blk.block_type === 'paragraph') {
     const sizeHalfPt = getBlockSizeHalfPt(blk);
-    const inner = renderSegmentsXml(blk.segments, { sizeHalfPt });
+    const inner = renderSegmentsXml(blk.segments, { sizeHalfPt, mathFormat });
     return renderParagraphXml(inner, {
       align: blk.alignment,
       spaceBeforeTwip,
@@ -444,6 +493,16 @@ function renderSingleBlockXml(
   if (blk.block_type === 'equation' && blk.latex) {
     const sizeHalfPt = getBlockSizeHalfPt(blk);
     const eqAlign = blk.alignment ?? 'center';
+    if (mathFormat === 'latex') {
+      const cleaned = cleanLatex(blk.latex);
+      return renderParagraphXml(cleaned ? renderRunXml(`$${cleaned}$`, { sizeHalfPt }) : '', {
+        align: eqAlign,
+        spaceBeforeTwip,
+        spaceAfterTwip: 0,
+        indentLeftTwip: eqAlign === 'center' ? 0 : indentLeftTwip,
+        indentRightTwip: eqAlign === 'center' ? 0 : indentRightTwip,
+      });
+    }
     const omml = latexToOmmlXml(blk.latex, true, {
       sizeHalfPt,
       align: eqAlign,
@@ -470,6 +529,7 @@ function renderSingleBlockXml(
       availableWidthTwips: Math.max(2400, availableWidthTwips - indentLeftTwip - indentRightTwip),
       indentLeftTwip,
       spaceBeforeTwip,
+      mathFormat,
     });
   }
 
@@ -531,9 +591,13 @@ function buildSectPrXml(geom: PageGeometry): string {
 
 export async function buildDocxBuffer(
   pages: PageExtraction[],
-  options: { addPageBreaks?: boolean; choiceLayout?: ChoiceLayoutMode } = {}
+  options: {
+    addPageBreaks?: boolean;
+    choiceLayout?: ChoiceLayoutMode;
+    mathFormat?: MathOutputFormat;
+  } = {}
 ): Promise<Buffer> {
-  const { addPageBreaks = true, choiceLayout = 'table' } = options;
+  const { addPageBreaks = true, choiceLayout = 'tabs', mathFormat = 'omml' } = options;
   const mediaItems: MediaItem[] = [];
   const bodyChunks: string[] = [];
 
@@ -591,6 +655,7 @@ export async function buildDocxBuffer(
           indentRightTwip: ptToTwips(band.indentRightPt),
           firstLineIndentTwip: Math.round(band.firstLineIndentPt * 20),
           availableWidthTwips: geom.contentWidthTwips,
+          mathFormat,
         });
         if (xml) pushChunk(xml);
       } else {
@@ -610,6 +675,7 @@ export async function buildDocxBuffer(
             indentRightTwip: 0,
             firstLineIndentTwip: 0,
             availableWidthTwips: leftWidthDxa,
+            mathFormat,
           }) || renderParagraphXml('', { spaceBeforeTwip: 0, spaceAfterTwip: 0 });
 
         const rightXml =
@@ -619,6 +685,7 @@ export async function buildDocxBuffer(
             indentRightTwip: 0,
             firstLineIndentTwip: 0,
             availableWidthTwips: rightWidthDxa,
+            mathFormat,
           }) || renderParagraphXml('', { spaceBeforeTwip: 0, spaceAfterTwip: 0 });
 
         const tblIndXml =
@@ -721,5 +788,9 @@ export async function buildDocxBuffer(
     zip.file(`word/media/${media.filename}`, media.data);
   }
 
-  return await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+  return await zip.generateAsync({
+    type: 'nodebuffer',
+    compression: 'DEFLATE',
+    compressionOptions: { level: 1 },
+  });
 }

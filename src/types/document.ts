@@ -2,6 +2,10 @@ export type BlockAlignment = 'left' | 'center' | 'right' | 'justify';
 
 export type ChoiceLayoutMode = 'table' | 'tabs';
 
+export type MathOutputFormat = 'omml' | 'latex';
+
+export type OcrSpeedMode = 'fast' | 'accurate';
+
 export interface InlineSegment {
   type: 'text' | 'math';
   content: string;
@@ -52,6 +56,7 @@ export interface PageExtraction {
 export interface RenderedPage {
   pageNumber: number;
   dataUrl: string;
+  ocrDataUrl?: string;
   width: number;
   height: number;
 }

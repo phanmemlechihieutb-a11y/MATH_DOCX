@@ -48,6 +48,21 @@ function clamp(val: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, val));
 }
 
+export function cleanLatexDelimiters(raw: string): string {
+  let s = (raw ?? '').trim();
+  if (s.startsWith('$$') && s.endsWith('$$') && s.length >= 4) {
+    s = s.slice(2, -2).trim();
+  } else if (s.startsWith('$') && s.endsWith('$') && s.length >= 2) {
+    s = s.slice(1, -1).trim();
+  } else if (
+    (s.startsWith('\\[') && s.endsWith('\\]')) ||
+    (s.startsWith('\\(') && s.endsWith('\\)'))
+  ) {
+    s = s.slice(2, -2).trim();
+  }
+  return s;
+}
+
 export function isValidBox(box?: number[] | null): box is [number, number, number, number] {
   return (
     Array.isArray(box) &&
@@ -141,8 +156,13 @@ function getCellPlainText(cell: TableCellData): string {
 
 export function isChoiceTableBlock(blk: DocumentBlock): boolean {
   if (blk.block_type !== 'table' || !blk.table_rows || blk.table_rows.length === 0) return false;
-  if (blk.is_choice_block) return true;
-  if (!blk.table_borderless) return false;
+  // Tuyệt đối không phá vỡ bảng có khung viền, bảng có tiêu đề hoặc bảng có ô gộp cột (col_span)
+  if (blk.table_borderless !== true) return false;
+
+  const hasHeaderOrMergedCell = blk.table_rows.some((row) =>
+    row.some((c) => c.is_header === true || (c.col_span ?? 1) > 1)
+  );
+  if (hasHeaderOrMergedCell) return false;
 
   let choiceCellCount = 0;
   for (const row of blk.table_rows) {
@@ -152,7 +172,8 @@ export function isChoiceTableBlock(blk: DocumentBlock): boolean {
       }
     }
   }
-  return choiceCellCount >= 2;
+  if (choiceCellCount >= 2) return true;
+  return Boolean(blk.is_choice_block) && choiceCellCount >= 1;
 }
 
 function splitSegmentsIntoChoiceGroups(segments: InlineSegment[]): InlineSegment[][] | null {

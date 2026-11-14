@@ -2,7 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import type { PageExtraction } from './src/types/document.ts';
 import { buildDocxBuffer } from './server/docxBuilder.ts';
 import { latexToOmmlXml } from './server/omml.ts';
@@ -12,19 +12,24 @@ const __dirname = path.dirname(__filename);
 
 const PORT = 3000;
 
+let cachedAiClient: GoogleGenAI | null = null;
+
 function getGeminiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     throw new Error('MISSING_API_KEY');
   }
-  return new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
+  if (!cachedAiClient) {
+    cachedAiClient = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
       },
-    },
-  });
+    });
+  }
+  return cachedAiClient;
 }
 
 const inlineSegmentSchema = {
@@ -182,14 +187,16 @@ Quy tắc bắt buộc:
    - Ghi nhận first_line_indent_pt (số dương nếu thụt đầu dòng đoạn văn, số âm như -24 nếu thụt lề treo như "Câu 1. ..."), indent_left_pt nếu cả khối thụt vào so với lề trái chung, và line_spacing (ví dụ 1.15, 1.3).
    - Khi nhiều phần tử nằm ngang hàng trên CÙNG MỘT DÒNG nhưng chia thành các cột rõ rệt (ví dụ: tiêu đề 2 cột "SỞ GD&ĐT... | ĐỀ THI...", hoặc hàng đáp án 4 cột "A. ...  B. ...  C. ...  D. ...", hoặc 2x2 đáp án), HÃY xuất thành block_type="table" với table_borderless=true, kèm width_pct và alignment cho từng ô để vị trí ngang khớp 100% với bản PDF.
    - Với đường kẻ ngang phân cách (như dưới tiêu đề đề thi), xuất block_type="horizontal_rule" kèm box_2d.
-4. CÔNG THỨC TOÁN & BẢNG BIỂU:
+4. CÔNG THỨC TOÁN & BẢNG BIỂU (BẮT BUỘC GIỮ NGUYÊN MỌI BẢNG BIỂU):
    - MỌI biểu thức toán học, ký hiệu biến số, phân số, căn thức, tích phân, giới hạn, ma trận, hệ phương trình phải tách thành segment type="math" (nếu nằm cùng dòng với chữ) hoặc block_type="equation" (nếu đứng riêng một dòng độc lập, giữ đúng alignment của công thức). Luôn xuất mã LaTeX chuẩn xác, KHÔNG bọc bằng $, $$, \\[ \\] hay \\( \\).
-   - Với bảng có viền (bảng biến thiên, bảng xét dấu, bảng số liệu), xuất block_type="table" với table_borderless=false, chính xác số hàng/cột, col_span (nếu gộp ô), alignment từng ô và segments text/math.
+   - TUYỆT ĐỐI KHÔNG LÀM MẤT BẢNG BIỂU từ tài liệu gốc: mọi bảng có đường kẻ khung (bảng số liệu, bảng thống kê, bảng tần số, bảng điểm, bảng giá trị, bảng xét dấu, bảng biến thiên, bảng ma trận/so sánh dù 2 cột hay nhiều cột) BẮT BUỘC phải xuất thành block_type="table" với table_borderless=false và is_choice_block=false (KHÔNG bao giờ chuyển bảng có viền thành paragraph hay bỏ qua). Ghi đủ 100% số hàng, số cột (kể cả ô trống dùng segments: []), col_span chính xác khi có ô gộp, is_header=true cho hàng tiêu đề, alignment từng ô và nội dung segments text/math đầy đủ.
 5. HÌNH VẼ MINH HỌA:
    - Với mọi hình học không gian/phẳng, đồ thị hàm số, biểu đồ hoặc ảnh chụp nhúng trong trang, xuất block_type="figure", alignment đúng vị trí ('left'/'center'/'right') và box_2d=[ymin, xmin, ymax, xmax] ôm trọn cả nhãn đỉnh (A, B, C, S, O, x, y...) để không bị cắt mất ký hiệu.
-6. Giữ nguyên ngôn ngữ gốc, chính tả, dấu câu và không tự ý thêm nội dung không có trên trang.`;
+6. Giữ nguyên ngôn ngữ gốc, chính tả, dấu câu và không tự ý thêm nội dung không có trên trang.
+7. TỐI ƯU TỐC ĐỘ JSON: Chỉ xuất các trường tùy chọn (bold, italic, underline, font_size_pt, color, tab_before, heading_level, indent_left_pt, first_line_indent_pt, tab_stops_pt, table_borderless, is_choice_block, alignment/width_pct/col_span của ô, caption) khi có giá trị thực sự cần thiết (true hoặc khác null/0). BỎ QUA không ghi các thuộc tính giá trị false hoặc null.`;
 
-const OCR_MODELS = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'] as const;
+const OCR_MODELS_FAST = ['gemini-3.1-flash-lite', 'gemini-4-hydrogen'] as const;
+const OCR_MODELS_ACCURATE = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'] as const;
 const DAILY_QUOTA_COOLDOWN_MS = 10 * 60 * 1000;
 const modelCooldownUntil = new Map<string, number>();
 
@@ -230,11 +237,13 @@ async function generateOcrWithModelFallback(
   ai: GoogleGenAI,
   mimeType: string,
   base64Data: string,
-  pageNumber: number
+  pageNumber: number,
+  speedMode: 'fast' | 'accurate' = 'fast'
 ) {
+  const orderedModels = speedMode === 'accurate' ? OCR_MODELS_ACCURATE : OCR_MODELS_FAST;
   const now = Date.now();
-  const activeModels = OCR_MODELS.filter((m) => (modelCooldownUntil.get(m) ?? 0) <= now);
-  const modelsToTry = activeModels.length > 0 ? activeModels : [...OCR_MODELS];
+  const activeModels = orderedModels.filter((m) => (modelCooldownUntil.get(m) ?? 0) <= now);
+  const modelsToTry = activeModels.length > 0 ? activeModels : [...orderedModels];
 
   let lastError: unknown;
 
@@ -242,6 +251,8 @@ async function generateOcrWithModelFallback(
     const maxRetries = 2;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
+        const thinkingLevel =
+          model === 'gemini-3.1-flash-lite' ? ThinkingLevel.MINIMAL : ThinkingLevel.LOW;
         return await ai.models.generateContent({
           model,
           contents: {
@@ -261,6 +272,7 @@ async function generateOcrWithModelFallback(
             systemInstruction: OCR_SYSTEM_INSTRUCTION,
             responseMimeType: 'application/json',
             responseSchema: pageExtractionSchema,
+            thinkingConfig: { thinkingLevel },
           },
         });
       } catch (err: unknown) {
@@ -298,9 +310,10 @@ async function createServer() {
 
   app.post('/api/ocr/page', async (req, res) => {
     try {
-      const { imageDataUrl, pageNumber } = req.body as {
+      const { imageDataUrl, pageNumber, speedMode } = req.body as {
         imageDataUrl?: string;
         pageNumber?: number;
+        speedMode?: 'fast' | 'accurate';
       };
 
       if (!imageDataUrl || typeof imageDataUrl !== 'string') {
@@ -322,7 +335,8 @@ async function createServer() {
         ai,
         mimeType,
         base64Data,
-        pageNumber ?? 1
+        pageNumber ?? 1,
+        speedMode === 'accurate' ? 'accurate' : 'fast'
       );
 
       const rawJson = (response.text ?? '{"blocks":[]}').trim();
@@ -379,11 +393,12 @@ async function createServer() {
 
   app.post('/api/export/docx', async (req, res) => {
     try {
-      const { pages, filename, addPageBreaks, choiceLayout } = req.body as {
+      const { pages, filename, addPageBreaks, choiceLayout, mathFormat } = req.body as {
         pages?: PageExtraction[];
         filename?: string;
         addPageBreaks?: boolean;
         choiceLayout?: 'table' | 'tabs';
+        mathFormat?: 'omml' | 'latex';
       };
 
       if (!Array.isArray(pages) || pages.length === 0) {
@@ -391,20 +406,24 @@ async function createServer() {
         return;
       }
 
+      const resolvedMathFormat = mathFormat === 'latex' ? 'latex' : 'omml';
+
       const buffer = await buildDocxBuffer(pages, {
         addPageBreaks: addPageBreaks !== false,
-        choiceLayout: choiceLayout === 'tabs' ? 'tabs' : 'table',
+        choiceLayout: choiceLayout === 'table' ? 'table' : 'tabs',
+        mathFormat: resolvedMathFormat,
       });
 
       const safeBase = (filename || 'tai_lieu_toan')
         .replace(/\.[^.]+$/, '')
         .replace(/[^a-zA-Z0-9_-]/g, '_');
 
+      const suffix = resolvedMathFormat === 'latex' ? 'LaTeX' : 'OMML';
       res.setHeader(
         'Content-Type',
         'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
       );
-      res.setHeader('Content-Disposition', `attachment; filename="${safeBase}_OMML.docx"`);
+      res.setHeader('Content-Disposition', `attachment; filename="${safeBase}_${suffix}.docx"`);
       res.send(buffer);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Lỗi xuất file Word.';

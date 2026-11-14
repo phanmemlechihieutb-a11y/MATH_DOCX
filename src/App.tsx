@@ -2,6 +2,7 @@ import { useCallback, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   CheckCircle2,
+  ClipboardPaste,
   Code2,
   Crop,
   Download,
@@ -19,11 +20,14 @@ import { MathRenderer } from './components/MathRenderer';
 import type {
   ChoiceLayoutMode,
   ExtractedEquationItem,
+  MathOutputFormat,
   PageExtraction,
   RenderedPage,
 } from './types/document';
+import { parseDocxFileToPages } from './utils/docxImporter';
+import { normalizePagesInlineMath, parsePastedLatexToPages } from './utils/latexParser';
 import {
-  cropFigureFromPage,
+  cropFiguresFromPage,
   generateSampleMathWorksheet,
   loadFileAsPages,
 } from './utils/pdfProcessor';
@@ -48,7 +52,13 @@ export default function App() {
   const [renderDpi, setRenderDpi] = useState<number>(250);
   const [addPageBreaks, setAddPageBreaks] = useState<boolean>(true);
   const [autoCropFigures, setAutoCropFigures] = useState<boolean>(true);
-  const [choiceLayout, setChoiceLayout] = useState<ChoiceLayoutMode>('table');
+  const [choiceLayout, setChoiceLayout] = useState<ChoiceLayoutMode>('tabs');
+  const [mathFormat, setMathFormat] = useState<MathOutputFormat>('omml');
+  const [inputSource, setInputSource] = useState<'file' | 'paste' | 'docx'>('file');
+
+  const [pendingDocxPages, setPendingDocxPages] = useState<PageExtraction[]>([]);
+  const [pastedLatex, setPastedLatex] = useState<string>('');
+  const [isExportingPaste, setIsExportingPaste] = useState<boolean>(false);
 
   const [isLoadingFile, setIsLoadingFile] = useState<boolean>(false);
   const [isConverting, setIsConverting] = useState<boolean>(false);
@@ -86,9 +96,57 @@ export default function App() {
       resetResults();
       setIsLoadingFile(true);
       setSourceFilename(file.name);
+      const lowerName = file.name.toLowerCase();
+
       try {
+        if (lowerName.endsWith('.doc') && !lowerName.endsWith('.docx')) {
+          throw new Error(
+            'Định dạng .doc cũ chưa được hỗ trợ trực tiếp. Vui lòng lưu tệp dưới dạng .docx trong Microsoft Word rồi tải lên lại.'
+          );
+        }
+
+        if (
+          lowerName.endsWith('.docx') ||
+          file.type ===
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        ) {
+          const pages = await parseDocxFileToPages(file);
+          setRenderedPages([]);
+          setPastedLatex('');
+          setPendingDocxPages(pages);
+          setInputSource('docx');
+          setActiveTab('preview');
+          setStatusMessage(
+            `Đã đọc ${pages.length} trang từ tệp Word. Nhấn "Bắt đầu chuyển đổi" để xuất file.`
+          );
+          return;
+        }
+
+        if (
+          lowerName.endsWith('.txt') ||
+          lowerName.endsWith('.tex') ||
+          lowerName.endsWith('.ltx') ||
+          file.type.startsWith('text/')
+        ) {
+          const rawText = (await file.text()).replace(/^\uFEFF/, '');
+          if (!rawText.trim()) {
+            throw new Error('Tệp văn bản / LaTeX trống, không có nội dung để chuyển đổi.');
+          }
+          setRenderedPages([]);
+          setPendingDocxPages([]);
+          setPastedLatex(rawText);
+          setInputSource('paste');
+          setActiveTab('preview');
+          setStatusMessage(
+            'Đã nạp tệp văn bản/LaTeX. Nhấn "Bắt đầu chuyển đổi" ở cột bên trái để tạo file Word.'
+          );
+          return;
+        }
+
         const pages = await loadFileAsPages(file, renderDpi);
+        setPendingDocxPages([]);
         setRenderedPages(pages);
+        setInputSource('file');
         setSelectedPageNum(1);
         setActiveTab('original');
       } catch (err) {
@@ -106,7 +164,8 @@ export default function App() {
       pagesToExport: PageExtraction[],
       filename: string,
       pageBreaks: boolean,
-      layout: ChoiceLayoutMode
+      layout: ChoiceLayoutMode,
+      format: MathOutputFormat
     ) => {
       const exportRes = await fetch('/api/export/docx', {
         method: 'POST',
@@ -116,6 +175,7 @@ export default function App() {
           filename,
           addPageBreaks: pageBreaks,
           choiceLayout: layout,
+          mathFormat: format,
         }),
       });
 
@@ -127,22 +187,29 @@ export default function App() {
       const blob = await exportRes.blob();
       const url = URL.createObjectURL(blob);
       const baseName = filename.replace(/\.[^.]+$/, '') || 'tai_lieu_toan';
+      const suffix = format === 'latex' ? 'LaTeX' : 'OMML';
 
       setDocxDownloadUrl((prev) => {
         if (prev) URL.revokeObjectURL(prev);
         return url;
       });
-      setDocxFileName(`${baseName}_OMML.docx`);
+      setDocxFileName(`${baseName}_${suffix}.docx`);
     },
     []
   );
 
   const handleChoiceLayoutChange = async (nextLayout: ChoiceLayoutMode) => {
     setChoiceLayout(nextLayout);
-    if (extractedPages.length > 0 && !isConverting) {
+    if (extractedPages.length > 0 && !isConverting && !isExportingPaste) {
       try {
         setStatusMessage('Đang cập nhật bố cục phương án trả lời trong file Word...');
-        await rebuildDocxExport(extractedPages, sourceFilename, addPageBreaks, nextLayout);
+        await rebuildDocxExport(
+          extractedPages,
+          sourceFilename || 'tai_lieu_toan',
+          addPageBreaks,
+          nextLayout,
+          mathFormat
+        );
         setStatusMessage('Đã cập nhật file Word theo định dạng phương án đã chọn.');
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Không thể cập nhật tệp Word.';
@@ -151,8 +218,116 @@ export default function App() {
     }
   };
 
+  const handleConvertStructuredPages = async (
+    pages: PageExtraction[],
+    targetFormat: MathOutputFormat,
+    filenameFallback: string,
+    successMsgOmml: string,
+    successMsgLatex: string
+  ) => {
+    setErrorMessage(null);
+    setMathFormat(targetFormat);
+    setIsExportingPaste(true);
+    setProgressPct(25);
+    setStatusMessage('Đang phân tích cấu trúc & công thức Toán...');
+
+    try {
+      const normalizedPages = normalizePagesInlineMath(pages);
+      setExtractedPages(normalizedPages);
+      setActiveTab('preview');
+
+      const seenEqKeys = new Set<string>();
+      const eqQueries: Array<{ latex: string; isDisplay: boolean }> = [];
+      const addEq = (latex: string, isDisplay: boolean) => {
+        const key = `${isDisplay ? 'D' : 'I'}:${latex}`;
+        if (!seenEqKeys.has(key)) {
+          seenEqKeys.add(key);
+          eqQueries.push({ latex, isDisplay });
+        }
+      };
+
+      for (const p of normalizedPages) {
+        for (const blk of p.blocks) {
+          if (blk.block_type === 'equation' && blk.latex) addEq(blk.latex, true);
+          for (const seg of blk.segments ?? []) {
+            if (seg.type === 'math' && seg.content) addEq(seg.content, false);
+          }
+          for (const row of blk.table_rows ?? []) {
+            for (const cell of row) {
+              for (const seg of cell.segments ?? []) {
+                if (seg.type === 'math' && seg.content) addEq(seg.content, false);
+              }
+            }
+          }
+        }
+      }
+
+      const ommlPreviewPromise =
+        eqQueries.length > 0
+          ? fetch('/api/omml/preview', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ equations: eqQueries }),
+            })
+              .then(async (ommlRes) => {
+                if (!ommlRes.ok) return;
+                const ommlJson = (await ommlRes.json()) as {
+                  results: Array<{ latex: string; isDisplay: boolean; omml: string }>;
+                };
+                const map: Record<string, string> = {};
+                for (const item of ommlJson.results) {
+                  map[`${item.isDisplay ? 'D' : 'I'}:${item.latex}`] = item.omml;
+                }
+                setOmmlMap(map);
+              })
+              .catch(() => undefined)
+          : Promise.resolve();
+
+      await Promise.all([
+        ommlPreviewPromise,
+        rebuildDocxExport(
+          normalizedPages,
+          sourceFilename || filenameFallback,
+          addPageBreaks,
+          choiceLayout,
+          targetFormat
+        ),
+      ]);
+
+      setProgressPct(100);
+      setStatusMessage(targetFormat === 'latex' ? successMsgLatex : successMsgOmml);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Không thể chuyển đổi nội dung.';
+      setErrorMessage(msg);
+      setProgressPct(0);
+      setStatusMessage('');
+    } finally {
+      setIsExportingPaste(false);
+    }
+  };
+
+  const handleConvertPastedLatex = async (targetFormat: MathOutputFormat = mathFormat) => {
+    const pages = parsePastedLatexToPages(pastedLatex, 'auto');
+    if (pages.length === 0) {
+      setErrorMessage(
+        'Vui lòng dán hoặc tải lên nội dung có công thức Toán ($...$ hoặc LaTeX căn bản) trước khi chuyển đổi.'
+      );
+      return;
+    }
+
+    await handleConvertStructuredPages(
+      pages,
+      targetFormat,
+      'tai_lieu_latex',
+      'Đã chuyển nội dung sang tệp Word Equation (OMML) thành công!',
+      'Đã tạo tệp Word với công thức LaTeX bọc $...$.'
+    );
+  };
+
   const handleUseSampleWorksheet = () => {
     resetResults();
+    setPendingDocxPages([]);
+    setInputSource('file');
     const sample = generateSampleMathWorksheet();
     setSourceFilename('De_on_tap_Toan_mau.png');
     setRenderedPages([sample]);
@@ -161,25 +336,63 @@ export default function App() {
   };
 
   const handleStartConversion = async () => {
-    if (renderedPages.length === 0) return;
+    const hasFile = renderedPages.length > 0;
+    const hasDocx = pendingDocxPages.length > 0;
+    const hasPaste = pastedLatex.trim().length > 0;
+
+    if (inputSource === 'docx' && hasDocx) {
+      await handleConvertStructuredPages(
+        pendingDocxPages,
+        mathFormat,
+        'tai_lieu_word',
+        'Đã xử lý tệp Word sang Word Equation (OMML) thành công!',
+        'Đã chuyển công thức trong tệp Word sang LaTeX bọc $...$.'
+      );
+      return;
+    }
+
+    if ((inputSource === 'paste' && hasPaste) || (!hasFile && !hasDocx && hasPaste)) {
+      await handleConvertPastedLatex(mathFormat);
+      return;
+    }
+
+    if (!hasFile && hasDocx) {
+      await handleConvertStructuredPages(
+        pendingDocxPages,
+        mathFormat,
+        'tai_lieu_word',
+        'Đã xử lý tệp Word sang Word Equation (OMML) thành công!',
+        'Đã chuyển công thức trong tệp Word sang LaTeX bọc $...$.'
+      );
+      return;
+    }
+
+    if (!hasFile) return;
 
     resetResults();
     setIsConverting(true);
     setProgressPct(5);
 
     try {
-      const processedPages: PageExtraction[] = [];
       const total = renderedPages.length;
+      const processedPages: Array<PageExtraction | undefined> = new Array(total);
+      let nextIndex = 0;
+      let completedCount = 0;
+      let abortedError: Error | null = null;
 
-      for (let idx = 0; idx < total; idx++) {
+      setStatusMessage(
+        total > 1
+          ? `Đang nhận dạng song song ${total} trang tài liệu...`
+          : 'Đang nhận dạng OCR & công thức trang 1/1...'
+      );
+
+      const processSinglePage = async (idx: number) => {
         const page = renderedPages[idx];
-        setStatusMessage(`Đang nhận dạng OCR & công thức trang ${idx + 1}/${total}...`);
-
         const ocrRes = await fetch('/api/ocr/page', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            imageDataUrl: page.dataUrl,
+            imageDataUrl: page.ocrDataUrl || page.dataUrl,
             pageNumber: page.pageNumber,
           }),
         });
@@ -191,43 +404,92 @@ export default function App() {
 
         const blocks = Array.isArray(ocrJson.blocks) ? ocrJson.blocks : [];
 
-        // Crop detected figures on this page
         if (autoCropFigures) {
-          setStatusMessage(`Đang cắt hình vẽ trang ${idx + 1}/${total}...`);
-          for (const blk of blocks) {
-            if (blk.block_type === 'figure' && Array.isArray(blk.box_2d)) {
-              const cropped = await cropFigureFromPage(page, blk.box_2d);
-              if (cropped) {
-                blk.croppedImageDataUrl = cropped.dataUrl;
-                blk.croppedWidthPx = cropped.width;
-                blk.croppedHeightPx = cropped.height;
+          const figureBlocks = blocks.filter(
+            (blk: { block_type?: string; box_2d?: unknown }) =>
+              blk.block_type === 'figure' && Array.isArray(blk.box_2d)
+          );
+          if (figureBlocks.length > 0) {
+            const croppedList = await cropFiguresFromPage(
+              page,
+              figureBlocks.map((b: { box_2d: number[] }) => b.box_2d)
+            );
+            figureBlocks.forEach(
+              (
+                blk: {
+                  croppedImageDataUrl?: string;
+                  croppedWidthPx?: number;
+                  croppedHeightPx?: number;
+                },
+                fIdx: number
+              ) => {
+                const cropped = croppedList[fIdx];
+                if (cropped) {
+                  blk.croppedImageDataUrl = cropped.dataUrl;
+                  blk.croppedWidthPx = cropped.width;
+                  blk.croppedHeightPx = cropped.height;
+                }
               }
-            }
+            );
           }
         }
 
-        processedPages.push({
+        processedPages[idx] = {
           pageNumber: page.pageNumber,
           pageWidthPx: page.width,
           pageHeightPx: page.height,
           blocks,
-        });
+        };
 
-        setExtractedPages([...processedPages]);
-        setProgressPct(Math.round(((idx + 1) / (total + 1)) * 78));
+        completedCount += 1;
+        setExtractedPages(processedPages.filter((p): p is PageExtraction => Boolean(p)));
+        setProgressPct(Math.round((completedCount / (total + 1)) * 82));
+        setStatusMessage(`Đã nhận dạng xong ${completedCount}/${total} trang...`);
+      };
+
+      const concurrency = Math.min(3, total);
+      const workers = Array.from({ length: concurrency }, async () => {
+        while (!abortedError) {
+          const idx = nextIndex++;
+          if (idx >= total) break;
+          try {
+            await processSinglePage(idx);
+          } catch (err) {
+            abortedError = err instanceof Error ? err : new Error(String(err));
+            break;
+          }
+        }
+      });
+
+      await Promise.all(workers);
+      if (abortedError) {
+        throw abortedError;
       }
 
-      // Collect equations to populate OMML XML inspector
+      const finalPages = normalizePagesInlineMath(
+        processedPages.filter((p): p is PageExtraction => Boolean(p))
+      );
+
+      // Deduplicate equations before populating OMML XML inspector
+      const seenEqKeys = new Set<string>();
       const eqQueries: Array<{ latex: string; isDisplay: boolean }> = [];
-      for (const p of processedPages) {
+      const addEqQuery = (latex: string, isDisplay: boolean) => {
+        const key = `${isDisplay ? 'D' : 'I'}:${latex}`;
+        if (!seenEqKeys.has(key)) {
+          seenEqKeys.add(key);
+          eqQueries.push({ latex, isDisplay });
+        }
+      };
+
+      for (const p of finalPages) {
         for (const blk of p.blocks) {
           if (blk.block_type === 'equation' && blk.latex) {
-            eqQueries.push({ latex: blk.latex, isDisplay: true });
+            addEqQuery(blk.latex, true);
           }
           if (blk.segments) {
             for (const seg of blk.segments) {
               if (seg.type === 'math' && seg.content) {
-                eqQueries.push({ latex: seg.content, isDisplay: false });
+                addEqQuery(seg.content, false);
               }
             }
           }
@@ -236,7 +498,7 @@ export default function App() {
               for (const cell of row) {
                 for (const seg of cell.segments ?? []) {
                   if (seg.type === 'math' && seg.content) {
-                    eqQueries.push({ latex: seg.content, isDisplay: false });
+                    addEqQuery(seg.content, false);
                   }
                 }
               }
@@ -245,29 +507,38 @@ export default function App() {
         }
       }
 
-      if (eqQueries.length > 0) {
-        setStatusMessage('Đang chuyển đổi công thức LaTeX sang Word OMML...');
-        const ommlRes = await fetch('/api/omml/preview', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ equations: eqQueries }),
-        });
-        if (ommlRes.ok) {
-          const ommlJson = (await ommlRes.json()) as {
-            results: Array<{ latex: string; isDisplay: boolean; omml: string }>;
-          };
-          const map: Record<string, string> = {};
-          for (const item of ommlJson.results) {
-            map[`${item.isDisplay ? 'D' : 'I'}:${item.latex}`] = item.omml;
-          }
-          setOmmlMap(map);
-        }
-      }
-
       setProgressPct(88);
-      setStatusMessage('Đang đóng gói tệp Word (.docx) với Equation OMML...');
+      setStatusMessage(
+        mathFormat === 'latex'
+          ? 'Đang đóng gói tệp Word (.docx) với công thức LaTeX ($...$)...'
+          : 'Đang đóng gói tệp Word (.docx) với Equation OMML...'
+      );
 
-      await rebuildDocxExport(processedPages, sourceFilename, addPageBreaks, choiceLayout);
+      const ommlPreviewPromise =
+        eqQueries.length > 0
+          ? fetch('/api/omml/preview', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ equations: eqQueries }),
+            })
+              .then(async (ommlRes) => {
+                if (!ommlRes.ok) return;
+                const ommlJson = (await ommlRes.json()) as {
+                  results: Array<{ latex: string; isDisplay: boolean; omml: string }>;
+                };
+                const map: Record<string, string> = {};
+                for (const item of ommlJson.results) {
+                  map[`${item.isDisplay ? 'D' : 'I'}:${item.latex}`] = item.omml;
+                }
+                setOmmlMap(map);
+              })
+              .catch(() => undefined)
+          : Promise.resolve();
+
+      await Promise.all([
+        ommlPreviewPromise,
+        rebuildDocxExport(finalPages, sourceFilename, addPageBreaks, choiceLayout, mathFormat),
+      ]);
 
       setProgressPct(100);
       setStatusMessage('Hoàn tất chuyển đổi! File Word đã sẵn sàng để tải xuống.');
@@ -469,7 +740,7 @@ export default function App() {
             <input
               ref={fileInputRef}
               type="file"
-              accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg"
+              accept=".pdf,.docx,.txt,.tex,.ltx,.png,.jpg,.jpeg,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain,text/x-tex,image/png,image/jpeg"
               className="hidden"
               onChange={(e) => {
                 const file = e.target.files?.[0];
@@ -499,17 +770,17 @@ export default function App() {
                 <div className="flex flex-col items-center gap-2 py-2">
                   <Loader2 className="w-6 h-6 text-blue-700 animate-spin" />
                   <span className="text-sm font-medium text-slate-700">
-                    Đang dựng trang tài liệu...
+                    Đang đọc nội dung tài liệu...
                   </span>
                 </div>
               ) : (
                 <div className="flex flex-col items-center gap-1.5">
                   <Upload className="w-6 h-6 text-slate-500" />
                   <div className="text-sm font-medium text-slate-800">
-                    Kéo thả hoặc nhấn để chọn PDF / Ảnh
+                    Kéo thả hoặc nhấn để chọn PDF, Docx, TXT, TEX, Ảnh
                   </div>
                   <div className="text-xs text-slate-500">
-                    Hỗ trợ PDF nhiều trang, PNG, JPG, JPEG
+                    Hỗ trợ PDF, Docx (.docx), .txt, .tex, PNG, JPG, JPEG
                   </div>
                 </div>
               )}
@@ -521,10 +792,39 @@ export default function App() {
                   {sourceFilename}
                 </span>
                 <span className="tabular-nums shrink-0 text-slate-500">
-                  {renderedPages.length} trang
+                  {renderedPages.length > 0
+                    ? `${renderedPages.length} trang`
+                    : pendingDocxPages.length > 0
+                    ? `${pendingDocxPages.length} trang Docx`
+                    : pastedLatex.trim()
+                    ? `${pastedLatex.split('\n').length} dòng`
+                    : 'Đã chọn'}
                 </span>
               </div>
             )}
+          </section>
+
+          {/* Dán công thức Toán (LaTeX bọc $...$ hoặc LaTeX căn bản) */}
+          <section className="p-5 space-y-2.5">
+            <div className="flex items-center gap-2">
+              <ClipboardPaste className="w-4 h-4 text-blue-700 shrink-0" />
+              <h2 className="text-xs font-semibold text-slate-900">
+                Dán công thức Toán (<code className="font-mono">$...$</code> hoặc LaTeX căn bản)
+              </h2>
+            </div>
+
+            <textarea
+              value={pastedLatex}
+              onChange={(e) => {
+                setPastedLatex(e.target.value);
+                setInputSource('paste');
+              }}
+              rows={5}
+              placeholder={
+                'Dán văn bản Toán học có công thức bọc $...$, $$...$$, \\(...\\), \\[...\\] hoặc mã LaTeX căn bản tại đây...'
+              }
+              className="w-full p-3 text-xs font-mono text-slate-800 bg-slate-50/70 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-600 focus:bg-white resize-y"
+            />
           </section>
 
           {/* 2. Tùy chọn chuyển đổi & Định dạng */}
@@ -635,10 +935,17 @@ export default function App() {
               <button
                 type="button"
                 onClick={handleStartConversion}
-                disabled={renderedPages.length === 0 || isConverting || isLoadingFile}
+                disabled={
+                  (renderedPages.length === 0 &&
+                    pendingDocxPages.length === 0 &&
+                    !pastedLatex.trim()) ||
+                  isConverting ||
+                  isExportingPaste ||
+                  isLoadingFile
+                }
                 className="w-full h-11 inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-blue-700 hover:bg-blue-800 disabled:bg-slate-300 disabled:text-slate-500 rounded-lg transition-colors cursor-pointer disabled:cursor-not-allowed"
               >
-                {isConverting ? (
+                {isConverting || isExportingPaste ? (
                   <>
                     <Loader2 className="w-4 h-4 animate-spin" />
                     Đang xử lý...
@@ -652,7 +959,7 @@ export default function App() {
               </button>
 
               {/* Progress Bar */}
-              {(isConverting || progressPct > 0) && (
+              {(isConverting || isExportingPaste || progressPct > 0) && (
                 <div className="space-y-1.5">
                   <div className="flex items-center justify-between text-xs text-slate-600 tabular-nums">
                     <span className="truncate pr-2">
@@ -773,6 +1080,7 @@ export default function App() {
             </div>
           </div>
 
+
           {/* Right Viewport: Tabs & Document / Equation / Figure Inspection */}
           <section className="space-y-4">
             {/* Segmented Tab Bar (hidden per user selection) */}
@@ -836,15 +1144,18 @@ export default function App() {
             </div>
 
             {/* Viewport Content */}
-            {renderedPages.length === 0 ? (
+            {renderedPages.length === 0 &&
+            pendingDocxPages.length === 0 &&
+            !pastedLatex.trim() &&
+            extractedPages.length === 0 ? (
               <div className="bg-white border border-slate-200 rounded-xl p-12 text-center">
                 <Layers className="w-10 h-10 text-slate-400 mx-auto mb-3" />
                 <h3 className="text-base font-semibold text-slate-900">
                   Chưa có tài liệu nào được tải lên
                 </h3>
                 <p className="mt-1.5 text-sm text-slate-600 max-w-md mx-auto">
-                  Hãy chọn một file PDF đề thi, bài giảng hoặc ảnh chụp bài toán bên trái, hoặc
-                  dùng đề toán mẫu để trải nghiệm trực tiếp.
+                  Hãy chọn file PDF, Docx (.docx), .txt, .tex hoặc ảnh chụp bài toán bên trái, hoặc
+                  dán trực tiếp mã LaTeX vào khung bên trái.
                 </p>
                 <div className="mt-5 flex flex-wrap items-center justify-center gap-3">
                   <button
@@ -853,7 +1164,7 @@ export default function App() {
                     className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors cursor-pointer"
                   >
                     <Upload className="w-4 h-4" />
-                    Tải file PDF / Ảnh
+                    Tải file PDF, Docx, TXT, TEX, Ảnh
                   </button>
                   <button
                     type="button"
@@ -866,42 +1177,53 @@ export default function App() {
                 </div>
               </div>
             ) : activeTab === 'original' ? (
-              <div className="bg-white border border-slate-200 rounded-xl p-5">
-                {currentOriginalPage && (
-                  <div className="relative max-w-[780px] mx-auto border border-slate-200 rounded overflow-hidden bg-white">
-                    <img
-                      src={currentOriginalPage.dataUrl}
-                      alt={`Trang gốc ${currentOriginalPage.pageNumber}`}
-                      referrerPolicy="no-referrer"
-                      className="w-full h-auto block"
-                    />
-                    {currentPageFigureBoxes.map((fig, idx) => {
-                      const [ymin, xmin, ymax, xmax] = fig.box;
-                      return (
-                        <div
-                          key={idx}
-                          style={{
-                            top: `${ymin / 10}%`,
-                            left: `${xmin / 10}%`,
-                            height: `${(ymax - ymin) / 10}%`,
-                            width: `${(xmax - xmin) / 10}%`,
-                          }}
-                          className="absolute border-2 border-blue-600 bg-blue-500/10 pointer-events-none"
-                        >
-                          <span className="absolute -top-5 left-0 bg-blue-700 text-white text-[10px] font-medium px-1.5 py-0.5 rounded whitespace-nowrap">
-                            Hình cắt #{idx + 1}
-                          </span>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
+              renderedPages.length > 0 ? (
+                <div className="bg-white border border-slate-200 rounded-xl p-5">
+                  {currentOriginalPage && (
+                    <div className="relative max-w-[780px] mx-auto border border-slate-200 rounded overflow-hidden bg-white">
+                      <img
+                        src={currentOriginalPage.dataUrl}
+                        alt={`Trang gốc ${currentOriginalPage.pageNumber}`}
+                        referrerPolicy="no-referrer"
+                        className="w-full h-auto block"
+                      />
+                      {currentPageFigureBoxes.map((fig, idx) => {
+                        const [ymin, xmin, ymax, xmax] = fig.box;
+                        return (
+                          <div
+                            key={idx}
+                            style={{
+                              top: `${ymin / 10}%`,
+                              left: `${xmin / 10}%`,
+                              height: `${(ymax - ymin) / 10}%`,
+                              width: `${(xmax - xmin) / 10}%`,
+                            }}
+                            className="absolute border-2 border-blue-600 bg-blue-500/10 pointer-events-none"
+                          >
+                            <span className="absolute -top-5 left-0 bg-blue-700 text-white text-[10px] font-medium px-1.5 py-0.5 rounded whitespace-nowrap">
+                              Hình cắt #{idx + 1}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="bg-white border border-slate-200 rounded-xl p-10 text-center">
+                  <p className="text-sm text-slate-600">
+                    Tệp đang chọn là tài liệu văn bản / Word / LaTeX. Nhấn{' '}
+                    <strong className="text-slate-900">Bắt đầu chuyển đổi</strong> ở cột bên trái
+                    hoặc chọn tab <strong className="text-slate-900">Xem trước Word</strong>.
+                  </p>
+                </div>
+              )
             ) : activeTab === 'preview' ? (
               extractedPages.length > 0 ? (
                 <DocumentPreview
                   pages={extractedPages}
                   choiceLayout={choiceLayout}
+                  mathFormat={mathFormat}
                   onSelectEquation={handleInspectEquation}
                 />
               ) : (
