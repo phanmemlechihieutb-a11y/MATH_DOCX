@@ -4881,10 +4881,10 @@ function findProtectedSpansForMathPromotion(
   addMatchSpans(/\n([ \t]*\d+(?:\.\d+)*[\.\)])(?=\s|$)/g, 1);
   // Leading bullet dashes at line start ("- Cho hàm số...", not "-5" or "- 5")
   if (opts.isLineStartAtZero) {
-    const b0 = text.match(/^[ \t]*-(?=[ \t]+(?!\d|[+-−]|\\|∞)[^\s])/);
+    const b0 = text.match(/^[ \t]*-(?=[ \t]+(?!\d|[+\-−]|\\|∞)[^\s])/);
     if (b0) spans.push([0, b0[0].length]);
   }
-  addMatchSpans(/\n([ \t]*-)(?=[ \t]+(?!\d|[+-−]|\\|∞)[^\s])/g, 1);
+  addMatchSpans(/\n([ \t]*-)(?=[ \t]+(?!\d|[+\-−]|\\|∞)[^\s])/g, 1);
   // Hyphenated compound words (e-learning, a-xít, COVID-19, ti-vi)
   addMatchSpans(/[\p{L}]{2,}-[\p{L}\p{N}]+|[\p{L}\p{N}]+-[\p{L}]{2,}/gu);
   // Year range dash (2024 - 2025): protect only the dash between years
@@ -5020,7 +5020,7 @@ function promoteSegmentNumbersAndSigns(
     const prevChar = pos > 0 ? text[pos - 1] : '';
 
     // 1. Optional sign + infinity symbol (e.g. -∞, +∞, ∞)
-    const infMatch = chunk.match(/^([+-−]\s*)?∞(?![\p{L}\p{N}_])/u);
+    const infMatch = chunk.match(/^([+\-−]\s*)?∞(?![\p{L}\p{N}_])/u);
     if (infMatch && !/[\p{L}\p{N}_]/u.test(prevChar)) {
       flushText();
       const signPart = infMatch[1] ? infMatch[1].replace(/\s+/g, '').replace(/−/g, '-') : '';
@@ -5032,7 +5032,7 @@ function promoteSegmentNumbersAndSigns(
     // 2. Number, signed number (+3, -5, -2,5), or arithmetic chain of numbers (2 + 3 - 1)
     if (!/[\p{L}\p{N}_]/u.test(prevChar)) {
       const numMatch = chunk.match(
-        /^(?:[+-−](?=\d))?\d+(?:[.,]\d+)?(?![\p{L}\p{N}_])(?:\s*[+-−]\s*\d+(?:[.,]\d+)?(?![\p{L}\p{N}_]))*/u
+        /^(?:[+\-−](?=\d))?\d+(?:[.,]\d+)?(?![\p{L}\p{N}_])(?:\s*[+\-−]\s*\d+(?:[.,]\d+)?(?![\p{L}\p{N}_]))*/u
       );
       if (numMatch) {
         flushText();

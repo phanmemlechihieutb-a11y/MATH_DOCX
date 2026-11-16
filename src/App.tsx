@@ -490,6 +490,41 @@ export default function App() {
     }
   };
 
+  const handleMathFormatChange = async (nextFormat: MathOutputFormat) => {
+    setMathFormat(nextFormat);
+    const activePages =
+      editedPages ?? (extractedPages.length > 0 ? extractedPages : []);
+    if (activePages.length > 0 && !isConverting && !isExportingPaste) {
+      try {
+        setStatusMessage(
+          nextFormat === 'latex'
+            ? 'Đang cập nhật tệp Word sang dạng Toggle TeX (${...}$)...'
+            : 'Đang cập nhật tệp Word sang dạng Equation (OMML)...'
+        );
+        await rebuildDocxExport(
+          activePages,
+          sourceFilename ||
+            (inputSource === 'docx'
+              ? 'tai_lieu_word'
+              : inputSource === 'paste'
+              ? 'tai_lieu_latex'
+              : 'tai_lieu_toan'),
+          addPageBreaks,
+          choiceLayout,
+          nextFormat
+        );
+        setStatusMessage(
+          nextFormat === 'latex'
+            ? 'Đã cập nhật file Word sang dạng Toggle TeX (${...}$).'
+            : 'Đã cập nhật file Word sang dạng Equation (OMML).'
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Không thể cập nhật tệp Word.';
+        setErrorMessage(msg);
+      }
+    }
+  };
+
   const handleConvertStructuredPages = async (
     pages: PageExtraction[],
     targetFormat: MathOutputFormat,
@@ -596,7 +631,7 @@ export default function App() {
       targetFormat,
       'tai_lieu_latex',
       'Đã chuyển nội dung sang tệp Word Equation (OMML) thành công!',
-      'Đã tạo tệp Word với công thức LaTeX bọc $...$.'
+      'Đã tạo tệp Word dạng Toggle TeX (${...}$).'
     );
   };
 
@@ -622,7 +657,7 @@ export default function App() {
         mathFormat,
         'tai_lieu_word',
         'Đã xử lý tệp Word sang Word Equation (OMML) thành công!',
-        'Đã chuyển công thức trong tệp Word sang LaTeX bọc $...$.'
+        'Đã chuyển công thức trong tệp Word sang Toggle TeX (${...}$).'
       );
       return;
     }
@@ -638,7 +673,7 @@ export default function App() {
         mathFormat,
         'tai_lieu_word',
         'Đã xử lý tệp Word sang Word Equation (OMML) thành công!',
-        'Đã chuyển công thức trong tệp Word sang LaTeX bọc $...$.'
+        'Đã chuyển công thức trong tệp Word sang Toggle TeX (${...}$).'
       );
       return;
     }
@@ -795,7 +830,7 @@ export default function App() {
       setProgressPct(88);
       setStatusMessage(
         mathFormat === 'latex'
-          ? 'Đang đóng gói tệp Word (.docx) với công thức LaTeX ($...$)...'
+          ? 'Đang đóng gói tệp Word (.docx) dạng Toggle TeX (${...}$)...'
           : 'Đang đóng gói tệp Word (.docx) với Equation OMML...'
       );
 
@@ -1292,6 +1327,61 @@ export default function App() {
                 Tự động nhận diện &amp; cắt chèn hình vẽ / đồ thị / bảng biến thiên
               </span>
             </label>
+
+            <div>
+              <span className="block text-xs font-medium text-slate-700 mb-1.5">
+                Định dạng công thức trong file Word
+              </span>
+              <div className="space-y-2">
+                <label
+                  className={`flex items-start gap-2.5 p-2.5 rounded-lg border transition-colors cursor-pointer select-none ${
+                    mathFormat === 'omml'
+                      ? 'border-blue-600 bg-blue-50/40'
+                      : 'border-slate-200 hover:border-blue-400'
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    name="math-format"
+                    value="omml"
+                    checked={mathFormat === 'omml'}
+                    onChange={() => void handleMathFormatChange('omml')}
+                    disabled={isConverting || isExportingPaste}
+                    className="mt-0.5 h-4 w-4 border-slate-300 text-blue-700 focus:ring-blue-600"
+                  />
+                  <span className="text-xs leading-relaxed text-slate-700">
+                    <strong className="block text-slate-900 font-semibold">
+                      Dạng Equation (Mặc định)
+                    </strong>
+                    Xuất Equation chuẩn Word (OMML), chỉnh sửa trực tiếp trong Microsoft Word
+                  </span>
+                </label>
+                <label
+                  className={`flex items-start gap-2.5 p-2.5 rounded-lg border transition-colors cursor-pointer select-none ${
+                    mathFormat === 'latex'
+                      ? 'border-blue-600 bg-blue-50/40'
+                      : 'border-slate-200 hover:border-blue-400'
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    name="math-format"
+                    value="latex"
+                    checked={mathFormat === 'latex'}
+                    onChange={() => void handleMathFormatChange('latex')}
+                    disabled={isConverting || isExportingPaste}
+                    className="mt-0.5 h-4 w-4 border-slate-300 text-blue-700 focus:ring-blue-600"
+                  />
+                  <span className="text-xs leading-relaxed text-slate-700">
+                    <strong className="block text-slate-900 font-semibold">
+                      Dạng Toggle TeX (<code className="font-mono">{'${...}$'}</code>)
+                    </strong>
+                    Công thức toán, số, dấu phép tính đặt trong dấu{' '}
+                    <code className="font-mono">{'${...}$'}</code> để Toggle TeX (Alt+\)
+                  </span>
+                </label>
+              </div>
+            </div>
 
             <div>
               <span className="block text-xs font-medium text-slate-700 mb-1.5">

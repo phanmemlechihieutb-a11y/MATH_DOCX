@@ -115,7 +115,7 @@ function renderSegmentsXml(
         const cleaned = cleanLatex(seg.content);
         if (cleaned) {
           out.push(
-            renderRunXml(`$${cleaned}$`, {
+            renderRunXml('${' + cleaned + '}$', {
               sizeHalfPt: segSizeHalfPt,
               colorHex,
               bold: isBold,
@@ -482,8 +482,10 @@ function renderSingleBlockXml(
     const sizeHalfPt = getBlockSizeHalfPt(blk);
     const eqAlign = blk.alignment ?? 'center';
     if (mathFormat === 'latex') {
-      const cleaned = cleanLatex(blk.latex);
-      return renderParagraphXml(cleaned ? renderRunXml(`$${cleaned}$`, { sizeHalfPt }) : '', {
+      let cleaned = cleanLatex(blk.latex);
+      const eqEnvM = cleaned.match(/^\\begin\{(equation\*?|displaymath)\}([\s\S]*)\\end\{\1\}$/);
+      if (eqEnvM) cleaned = eqEnvM[2].trim();
+      return renderParagraphXml(cleaned ? renderRunXml('${' + cleaned + '}$', { sizeHalfPt }) : '', {
         align: eqAlign,
         spaceBeforeTwip,
         spaceAfterTwip: 0,

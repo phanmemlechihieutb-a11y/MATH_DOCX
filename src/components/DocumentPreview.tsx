@@ -126,7 +126,7 @@ function RenderSegments({
 
         if (seg.type === 'math') {
           if (mathFormat === 'latex') {
-            const latexText = `$${cleanLatexDelimiters(seg.content)}$`;
+            const latexText = '${' + cleanLatexDelimiters(seg.content) + '}$';
             if (disableEquationInspect) {
               return (
                 <span key={idx}>
@@ -149,7 +149,7 @@ function RenderSegments({
                 <button
                   type="button"
                   onClick={() => onSelectEquation?.(seg.content, false)}
-                  title="Công thức LaTeX bọc $...$ — nhấn để xem chi tiết"
+                  title="Công thức Toggle TeX bọc ${...}$ — nhấn để xem chi tiết"
                   style={{
                     fontSize: `${segFontPt * scale * 0.92}px`,
                     color: hex ? `#${hex}` : undefined,
@@ -1072,7 +1072,7 @@ function RenderSingleBlock({
     const eqAlign = blk.alignment ?? 'center';
     const flexJustify = JUSTIFY_FLEX_MAP[eqAlign] ?? 'justify-center';
     if (mathFormat === 'latex') {
-      const latexText = `$${cleanLatexDelimiters(blk.latex)}$`;
+      const latexText = '${' + cleanLatexDelimiters(blk.latex) + '}$';
       return (
         <div
           style={{
@@ -1093,7 +1093,7 @@ function RenderSingleBlock({
             <button
               type="button"
               onClick={() => onSelectEquation?.(blk.latex ?? '', true)}
-              title="Công thức LaTeX bọc $...$ — nhấn để xem chi tiết"
+              title="Công thức Toggle TeX bọc ${...}$ — nhấn để xem chi tiết"
               className="font-mono px-2 py-1 rounded-md bg-amber-50 text-slate-900 border border-amber-200/80 hover:bg-amber-100/80 transition-colors cursor-pointer"
             >
               {latexText}
