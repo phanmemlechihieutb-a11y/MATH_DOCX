@@ -4,11 +4,23 @@ import type { RenderedPage } from '../types/document';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
-function createOcrDataUrl(sourceCanvas: HTMLCanvasElement, maxDim = 1850): string {
+function encodeJpegWithCap(
+  canvas: HTMLCanvasElement,
+  maxBytes = 1_800_000
+): string {
+  const qualities = [0.86, 0.78, 0.68, 0.56];
+  for (const q of qualities) {
+    const url = canvas.toDataURL('image/jpeg', q);
+    if (url.length <= maxBytes) return url;
+  }
+  return canvas.toDataURL('image/jpeg', 0.48);
+}
+
+function createOcrDataUrl(sourceCanvas: HTMLCanvasElement, maxDim = 1650): string {
   const w = sourceCanvas.width;
   const h = sourceCanvas.height;
   if (w <= maxDim && h <= maxDim) {
-    return sourceCanvas.toDataURL('image/jpeg', 0.92);
+    return encodeJpegWithCap(sourceCanvas);
   }
   const ratio = Math.min(maxDim / w, maxDim / h);
   const targetW = Math.max(1, Math.round(w * ratio));
@@ -18,12 +30,12 @@ function createOcrDataUrl(sourceCanvas: HTMLCanvasElement, maxDim = 1850): strin
   smallCanvas.height = targetH;
   const sCtx = smallCanvas.getContext('2d');
   if (!sCtx) {
-    return sourceCanvas.toDataURL('image/jpeg', 0.92);
+    return encodeJpegWithCap(sourceCanvas);
   }
   sCtx.fillStyle = '#ffffff';
   sCtx.fillRect(0, 0, targetW, targetH);
   sCtx.drawImage(sourceCanvas, 0, 0, targetW, targetH);
-  const url = smallCanvas.toDataURL('image/jpeg', 0.92);
+  const url = encodeJpegWithCap(smallCanvas);
   smallCanvas.width = 0;
   smallCanvas.height = 0;
   return url;
@@ -145,7 +157,7 @@ function loadImageElement(src: string): Promise<HTMLImageElement | null> {
 export async function cropFiguresFromPage(
   page: RenderedPage,
   boxes: number[][],
-  padRatio = 0.012
+  padRatio = 0.014
 ): Promise<Array<{ dataUrl: string; width: number; height: number } | null>> {
   if (boxes.length === 0) return [];
   const img = await loadImageElement(page.dataUrl);
@@ -171,15 +183,23 @@ export async function cropFiguresFromPage(
     const cropH = bottom - top;
     if (cropW < 20 || cropH < 20) return null;
 
-    canvas.width = cropW;
-    canvas.height = cropH;
+    const maxCropDim = 1200;
+    const scaleDown =
+      cropW > maxCropDim || cropH > maxCropDim
+        ? Math.min(maxCropDim / cropW, maxCropDim / cropH)
+        : 1;
+    const outW = Math.max(20, Math.round(cropW * scaleDown));
+    const outH = Math.max(20, Math.round(cropH * scaleDown));
+
+    canvas.width = outW;
+    canvas.height = outH;
     ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, 0, cropW, cropH);
-    ctx.drawImage(img, left, top, cropW, cropH, 0, 0, cropW, cropH);
+    ctx.fillRect(0, 0, outW, outH);
+    ctx.drawImage(img, left, top, cropW, cropH, 0, 0, outW, outH);
     return {
       dataUrl: canvas.toDataURL('image/png'),
-      width: cropW,
-      height: cropH,
+      width: outW,
+      height: outH,
     };
   });
 

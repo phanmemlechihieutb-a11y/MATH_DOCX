@@ -59,7 +59,10 @@ function expandBalancedMacro(
 function sanitizeLatexForTemml(latex: string): string {
   let s = cleanLatex(latex)
     .replace(/\\label\{[^}]*\}/g, '')
-    .replace(/\\nonumber\b/g, '')
+    .replace(/\\tag\*?\{[^}]*\}/g, '')
+    .replace(/\\(?:nonumber|notag|noindent)(?![a-zA-Z])\s*/g, '')
+    .replace(/\\intertext\{([^}]*)\}/g, '\\\\ \\text{$1} \\\\')
+    .replace(/\\shortintertext\{([^}]*)\}/g, '\\\\ \\text{$1} \\\\')
     .replace(/\\allowbreak\b/g, '')
     .replace(/\\limits/g, '')
     .replace(/\\(?:displaystyle|textstyle|scriptstyle|scriptscriptstyle)\b/g, '')
@@ -72,7 +75,16 @@ function sanitizeLatexForTemml(latex: string): string {
     .replace(/\\cotg(?![a-zA-Z])/g, '\\cot')
     .replace(/\\tg(?![a-zA-Z])/g, '\\tan')
     .replace(/\\degree(?![a-zA-Z])/g, '^\\circ')
-    .replace(/\\dx(?![a-zA-Z])/g, '\\,dx');
+    .replace(/\\dx(?![a-zA-Z])/g, '\\,dx')
+    .replace(/\\(?:SI|qty)(?:\[[^\]]*\])?\s*\{([^}]*)\}\s*\{([^}]*)\}/g, (_m, v: string, u: string) => {
+      const unit = u.replace(/\\per\b/g, '/').replace(/\\([a-zA-Z]+)/g, '$1').trim();
+      return `${v.trim()}\\,\\mathrm{${unit}}`;
+    })
+    .replace(/\\num(?:\[[^\]]*\])?\s*\{([^}]*)\}/g, '$1')
+    .replace(/\\(?:si|unit)(?:\[[^\]]*\])?\s*\{([^}]*)\}/g, (_m, u: string) => {
+      const unit = u.replace(/\\per\b/g, '/').replace(/\\([a-zA-Z]+)/g, '$1').trim();
+      return `\\mathrm{${unit}}`;
+    });
 
   s = expandBalancedMacro(s, 'heva', (inner) => `\\begin{cases} ${inner} \\end{cases}`);
   s = expandBalancedMacro(
@@ -88,8 +100,12 @@ function sanitizeLatexForTemml(latex: string): string {
   }
 
   s = s
-    .replace(/\\begin\{(align\*?|flalign\*?|eqnarray\*?)\}/g, '\\begin{aligned}')
-    .replace(/\\end\{(align\*?|flalign\*?|eqnarray\*?)\}/g, '\\end{aligned}')
+    .replace(/\\begin\{alignat\*?\}\s*\{[^}]*\}/g, '\\begin{aligned}')
+    .replace(/\\end\{alignat\*?\}/g, '\\end{aligned}')
+    .replace(/\\begin\{alignedat\}\s*\{[^}]*\}/g, '\\begin{aligned}')
+    .replace(/\\end\{alignedat\}/g, '\\end{aligned}')
+    .replace(/\\begin\{(align\*?|flalign\*?|eqnarray\*?|split)\}/g, '\\begin{aligned}')
+    .replace(/\\end\{(align\*?|flalign\*?|eqnarray\*?|split)\}/g, '\\end{aligned}')
     .replace(/\\begin\{(gather\*?|multline\*?)\}/g, '\\begin{gathered}')
     .replace(/\\end\{(gather\*?|multline\*?)\}/g, '\\end{gathered}');
 

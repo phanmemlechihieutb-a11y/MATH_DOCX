@@ -4,7 +4,7 @@ import type {
   InlineSegment,
   PageExtraction,
   TableCellData,
-} from '../types/document';
+} from '../types/document.ts';
 
 export interface PageGeometry {
   pageWidthPt: number;
@@ -379,20 +379,126 @@ function convertChoiceParagraphToTable(blk: DocumentBlock): DocumentBlock | null
   };
 }
 
-function ensureTabStopsOnChoiceParagraph(
-  blk: DocumentBlock,
-  geom: PageGeometry
-): DocumentBlock {
-  if (blk.block_type !== 'paragraph' || !blk.segments || blk.segments.length === 0) return blk;
-  const groups = splitSegmentsIntoChoiceGroups(blk.segments);
-  if (!groups || groups.length < 2) return blk;
+function estimateMathWidthPt(latex: string, fontSizePt: number): number {
+  let s = latex.trim();
+  // Collapse innermost \frac{a}{b} / \dfrac{a}{b} / \tfrac{a}{b} to wider branch
+  for (let pass = 0; pass < 4; pass++) {
+    const next = s.replace(
+      /\\(?:d|t)?frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g,
+      (_m, a: string, b: string) => (a.length >= b.length ? a : b) + ' '
+    );
+    if (next === s) break;
+    s = next;
+  }
+  s = s
+    .replace(/\\(?:left|right|displaystyle|textstyle|scriptstyle|nolimits|limits)\b/g, '')
+    .replace(/\\sqrt(?:\s*\[[^\]]*\])?\s*\{([^{}]*)\}/g, '√$1 ')
+    .replace(/\\(?:text|mathrm|mathbf|mathit|operatorname)\s*\{([^{}]*)\}/g, '$1')
+    .replace(/\\mathbb\{([A-Z])\}/g, '$1')
+    .replace(/\\[a-zA-Z]+/g, 'M')
+    .replace(/[{}\^_\\]/g, '');
+  return Math.max(fontSizePt * 0.6, s.length * fontSizePt * 0.56 + 4);
+}
+
+function estimateSegmentsWidthPt(segments: InlineSegment[], fontSizePt: number): number {
+  let maxLineW = 0;
+  let curLineW = 0;
+  for (const seg of segments) {
+    const sz = seg.font_size_pt ?? fontSizePt;
+    if (seg.type === 'math') {
+      curLineW += estimateMathWidthPt(seg.content ?? '', sz);
+    } else {
+      const lines = (seg.content ?? '').split('\n');
+      const factor = seg.bold ? 0.56 : 0.50;
+      lines.forEach((line, idx) => {
+        if (idx > 0) {
+          if (curLineW > maxLineW) maxLineW = curLineW;
+          curLineW = 0;
+        }
+        curLineW += line.length * sz * factor;
+      });
+    }
+  }
+  return Math.max(maxLineW, curLineW);
+}
+
+function reflowChoiceTableIfNeeded(blk: DocumentBlock, geom: PageGeometry): DocumentBlock {
+  if (!isChoiceTableBlock(blk) || !blk.table_rows || blk.table_rows.length === 0) return blk;
+  const rows = blk.table_rows;
+  const currentCols = Math.max(...rows.map((r) => r.length));
+  if (currentCols <= 1) return blk;
 
   const { indentLeftPt, indentRightPt } = computeBlockHorizontalOffsets(blk, geom);
   const availWidthPt = Math.max(140, geom.contentWidthPt - indentLeftPt - indentRightPt);
+  const fontSizePt = blk.font_size_pt ?? 12;
+
+  const cells = rows.flat();
+  if (cells.length === 0) return blk;
+
+  const maxCellW = Math.max(
+    ...cells.map((c) => estimateSegmentsWidthPt(c.segments ?? [], fontSizePt))
+  );
+  const colAvail = availWidthPt / currentCols - 10;
+  if (maxCellW <= colAvail) return blk;
+
+  const twoColAvail = availWidthPt / 2 - 12;
+  if (cells.length === 4 && currentCols >= 3 && maxCellW <= twoColAvail) {
+    return {
+      ...blk,
+      table_rows: [
+        [
+          { ...cells[0], width_pct: 50 },
+          { ...cells[1], width_pct: 50 },
+        ],
+        [
+          { ...cells[2], width_pct: 50 },
+          { ...cells[3], width_pct: 50 },
+        ],
+      ],
+    };
+  }
+
+  if (currentCols > 2 && cells.length % 2 === 0 && maxCellW <= twoColAvail) {
+    const newRows: TableCellData[][] = [];
+    for (let k = 0; k < cells.length; k += 2) {
+      newRows.push([
+        { ...cells[k], width_pct: 50 },
+        { ...cells[k + 1], width_pct: 50 },
+      ]);
+    }
+    return { ...blk, table_rows: newRows };
+  }
+
+  return {
+    ...blk,
+    table_rows: cells.map((c) => [{ ...c, width_pct: 100 }]),
+  };
+}
+
+function ensureTabStopsOnChoiceParagraph(
+  blk: DocumentBlock,
+  geom: PageGeometry
+): DocumentBlock[] {
+  if (blk.block_type !== 'paragraph' || !blk.segments || blk.segments.length === 0) return [blk];
+  const groups = splitSegmentsIntoChoiceGroups(blk.segments);
+  if (!groups || groups.length < 2) return [blk];
+
+  const { indentLeftPt, indentRightPt } = computeBlockHorizontalOffsets(blk, geom);
+  const availWidthPt = Math.max(140, geom.contentWidthPt - indentLeftPt - indentRightPt);
+  const fontSizePt = blk.font_size_pt ?? 12;
+  const maxGroupW = Math.max(...groups.map((g) => estimateSegmentsWidthPt(g, fontSizePt)));
+
+  if (maxGroupW > availWidthPt / groups.length - 10) {
+    const asTable = convertChoiceParagraphToTable(blk);
+    if (asTable) {
+      const reflowed = reflowChoiceTableIfNeeded(asTable, geom);
+      return convertChoiceTableToTabParagraphs(reflowed, geom);
+    }
+  }
 
   const hasExplicitTabs = blk.segments.some((s) => s.tab_before);
   if (hasExplicitTabs && Array.isArray(blk.tab_stops_pt) && blk.tab_stops_pt.length >= groups.length - 1) {
-    return blk;
+    return [blk];
   }
 
   const tabStopsPt = computeTabStopsForColCount(groups.length, availWidthPt, indentLeftPt, null);
@@ -405,12 +511,14 @@ function ensureTabStopsOnChoiceParagraph(
     mergedSegments.push(...cleaned);
   });
 
-  return {
-    ...blk,
-    segments: mergedSegments,
-    tab_stops_pt: tabStopsPt,
-    is_choice_block: true,
-  };
+  return [
+    {
+      ...blk,
+      segments: mergedSegments,
+      tab_stops_pt: tabStopsPt,
+      is_choice_block: true,
+    },
+  ];
 }
 
 export function transformBlocksForChoiceLayout(
@@ -423,18 +531,23 @@ export function transformBlocksForChoiceLayout(
   for (const blk of blocks) {
     if (choiceLayout === 'tabs') {
       if (isChoiceTableBlock(blk)) {
-        result.push(...convertChoiceTableToTabParagraphs(blk, geom));
+        const reflowed = reflowChoiceTableIfNeeded(blk, geom);
+        result.push(...convertChoiceTableToTabParagraphs(reflowed, geom));
         continue;
       }
       if (blk.block_type === 'paragraph') {
-        result.push(ensureTabStopsOnChoiceParagraph(blk, geom));
+        result.push(...ensureTabStopsOnChoiceParagraph(blk, geom));
         continue;
       }
     } else if (choiceLayout === 'table') {
+      if (isChoiceTableBlock(blk)) {
+        result.push(reflowChoiceTableIfNeeded(blk, geom));
+        continue;
+      }
       if (blk.block_type === 'paragraph') {
         const asTable = convertChoiceParagraphToTable(blk);
         if (asTable) {
-          result.push(asTable);
+          result.push(reflowChoiceTableIfNeeded(asTable, geom));
           continue;
         }
       }

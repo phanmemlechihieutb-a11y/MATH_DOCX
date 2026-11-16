@@ -7,7 +7,7 @@ import type {
   MathOutputFormat,
   PageExtraction,
 } from '../src/types/document.ts';
-import { splitTextPreservingInlineMath } from '../src/utils/latexParser.ts';
+import { normalizeSegmentListInlineMath } from '../src/utils/latexParser.ts';
 import {
   computePageGeometry,
   groupBlocksIntoVisualBands,
@@ -85,33 +85,18 @@ function renderRunXml(
 
 function renderSegmentsXml(
   segments: InlineSegment[] | null | undefined,
-  options: { sizeHalfPt?: number; defaultBold?: boolean; mathFormat?: MathOutputFormat } = {}
+  options: {
+    sizeHalfPt?: number;
+    defaultBold?: boolean;
+    mathFormat?: MathOutputFormat;
+    isTableCell?: boolean;
+  } = {}
 ): string {
   if (!segments || segments.length === 0) return '';
-  const { sizeHalfPt = 24, defaultBold = false, mathFormat = 'omml' } = options;
+  const { sizeHalfPt = 24, defaultBold = false, mathFormat = 'omml', isTableCell = false } = options;
   const out: string[] = [];
 
-  const normalizedSegments: InlineSegment[] = [];
-  for (const seg of segments) {
-    if (
-      mathFormat === 'omml' &&
-      seg.type === 'text' &&
-      seg.content &&
-      (seg.content.includes('$') ||
-        seg.content.includes('＄') ||
-        seg.content.includes('\\(') ||
-        seg.content.includes('\\['))
-    ) {
-      const { type: _t, content, tab_before, ...style } = seg;
-      const split = splitTextPreservingInlineMath(content, style);
-      if (tab_before && split.length > 0) {
-        split[0] = { ...split[0], tab_before: true };
-      }
-      normalizedSegments.push(...split);
-    } else {
-      normalizedSegments.push(seg);
-    }
-  }
+  const normalizedSegments = normalizeSegmentListInlineMath(segments, { isTableCell }) ?? segments;
 
   for (const seg of normalizedSegments) {
     if (seg.tab_before) {
@@ -357,8 +342,9 @@ function renderTableXml(
         const cellAlign: BlockAlignment = cell.alignment ?? (isHeader ? 'center' : 'left');
         const segXml = renderSegmentsXml(cell.segments, {
           sizeHalfPt: defaultSizeHalfPt,
-          defaultBold: isHeader,
+          defaultBold: false,
           mathFormat,
+          isTableCell: true,
         });
         const cellPara = renderParagraphXml(segXml, {
           align: cellAlign,
@@ -459,7 +445,7 @@ function renderSingleBlockXml(
     const sizeHalfPt = getBlockSizeHalfPt(blk);
     const inner = renderSegmentsXml(blk.segments, {
       sizeHalfPt,
-      defaultBold: true,
+      defaultBold: false,
       mathFormat,
     });
     return renderParagraphXml(inner, {
@@ -550,12 +536,23 @@ function renderSingleBlockXml(
     const heightPx = Math.max(40, blk.croppedHeightPx ?? 400);
     const box = isValidBox(blk.box_2d) ? blk.box_2d : null;
     const maxAvailWidthIn = Math.max(1.2, availableWidthTwips / 1440);
+    const maxAvailHeightIn = Math.max(
+      2.0,
+      ((geom.pageHeightPt - geom.marginTopPt - geom.marginBottomPt) / 72) * 0.78
+    );
     const rawBoxWidthIn = box
       ? ((box[3] - box[1]) / 1000) * (geom.pageWidthPt / 72)
+      : blk.croppedWidthPx
+      ? Math.max(1.5, Math.min(maxAvailWidthIn * 0.94, widthPx / 96))
       : maxAvailWidthIn * 0.6;
-    const targetWidthIn = Math.max(0.8, Math.min(maxAvailWidthIn * 0.96, rawBoxWidthIn));
+    let targetWidthIn = Math.max(0.8, Math.min(maxAvailWidthIn * 0.96, rawBoxWidthIn));
+    let targetHeightIn = targetWidthIn * (heightPx / widthPx);
+    if (targetHeightIn > maxAvailHeightIn) {
+      targetHeightIn = maxAvailHeightIn;
+      targetWidthIn = Math.max(0.4, targetHeightIn * (widthPx / heightPx));
+    }
     const cxEmu = Math.round(targetWidthIn * 914400);
-    const cyEmu = Math.round(cxEmu * (heightPx / widthPx));
+    const cyEmu = Math.round(targetHeightIn * 914400);
 
     const figAlign = blk.alignment ?? 'center';
     const picRun = renderPictureRunXml(relId, imgIndex, cxEmu, cyEmu, filename);

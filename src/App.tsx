@@ -19,6 +19,7 @@ import { DocumentPreview } from './components/DocumentPreview';
 import { MathRenderer } from './components/MathRenderer';
 import type {
   ChoiceLayoutMode,
+  DocumentBlock,
   ExtractedEquationItem,
   MathOutputFormat,
   PageExtraction,
@@ -31,6 +32,7 @@ import {
   generateSampleMathWorksheet,
   loadFileAsPages,
 } from './utils/pdfProcessor';
+import { createNewBlock, mutatePageBlock } from './utils/previewEditor';
 
 type ActiveTab = 'preview' | 'original' | 'equations' | 'figures';
 
@@ -41,6 +43,85 @@ interface CroppedFigureItem {
   width: number;
   height: number;
   caption?: string | null;
+}
+
+async function parseJsonResponseSafe<T>(res: Response): Promise<T> {
+  const raw = await res.text();
+  try {
+    return (raw ? JSON.parse(raw) : {}) as T;
+  } catch {
+    if (res.status === 413) {
+      throw new Error('Dung lượng dữ liệu gửi lên vượt quá giới hạn máy chủ (HTTP 413).');
+    }
+    if (res.status === 504) {
+      throw new Error('Máy chủ xử lý quá thời gian cho phép (HTTP 504). Vui lòng thử lại.');
+    }
+    const snippet = raw.replace(/\s+/g, ' ').trim().slice(0, 120);
+    throw new Error(
+      `Máy chủ trả về phản hồi không hợp lệ (HTTP ${res.status})${snippet ? `: ${snippet}` : ''}`
+    );
+  }
+}
+
+async function fetchWithRetry(
+  input: RequestInfo | URL,
+  init: RequestInit,
+  maxRetries = 2
+): Promise<Response> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await fetch(input, init);
+      const isTransientStatus =
+        res.status === 429 || res.status === 502 || res.status === 503 || res.status === 504;
+      if (isTransientStatus && attempt < maxRetries) {
+        await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+        continue;
+      }
+      return res;
+    } catch (err) {
+      lastError = err;
+      if (attempt < maxRetries) {
+        await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+        continue;
+      }
+    }
+  }
+  const rawMsg = lastError instanceof Error ? lastError.message : String(lastError || '');
+  if (/failed to fetch|networkerror|load failed/i.test(rawMsg)) {
+    throw new Error(
+      'Kết nối tới máy chủ xử lý bị gián đoạn (Failed to fetch). Vui lòng thử lại hoặc chọn độ phân giải 200 DPI.'
+    );
+  }
+  throw lastError instanceof Error ? lastError : new Error(rawMsg || 'Lỗi kết nối máy chủ.');
+}
+
+async function downscalePngDataUrl(dataUrl: string, scale: number): Promise<string> {
+  if (!dataUrl.startsWith('data:image/')) return dataUrl;
+  return await new Promise<string>((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const w = Math.max(24, Math.round(img.naturalWidth * scale));
+      const h = Math.max(24, Math.round(img.naturalHeight * scale));
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        resolve(dataUrl);
+        return;
+      }
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, w, h);
+      ctx.drawImage(img, 0, 0, w, h);
+      const out = canvas.toDataURL('image/png');
+      canvas.width = 0;
+      canvas.height = 0;
+      resolve(out.length < dataUrl.length ? out : dataUrl);
+    };
+    img.onerror = () => resolve(dataUrl);
+    img.src = dataUrl;
+  });
 }
 
 export default function App() {
@@ -67,6 +148,11 @@ export default function App() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   const [extractedPages, setExtractedPages] = useState<PageExtraction[]>([]);
+  const [editedPages, setEditedPages] = useState<PageExtraction[] | null>(null);
+  const [isPreviewEditMode, setIsPreviewEditMode] = useState<boolean>(false);
+  const [isSyncingEditedWord, setIsSyncingEditedWord] = useState<boolean>(false);
+  const syncRequestIdRef = useRef<number>(0);
+
   const [ommlMap, setOmmlMap] = useState<Record<string, string>>({});
   const [docxDownloadUrl, setDocxDownloadUrl] = useState<string | null>(null);
   const [docxFileName, setDocxFileName] = useState<string>('tai_lieu_toan.docx');
@@ -79,7 +165,11 @@ export default function App() {
   } | null>(null);
 
   const resetResults = useCallback(() => {
+    syncRequestIdRef.current += 1;
     setExtractedPages([]);
+    setEditedPages(null);
+    setIsPreviewEditMode(false);
+    setIsSyncingEditedWord(false);
     setOmmlMap({});
     setProgressPct(0);
     setStatusMessage('');
@@ -138,7 +228,7 @@ export default function App() {
           setInputSource('paste');
           setActiveTab('preview');
           setStatusMessage(
-            'Đã nạp tệp văn bản/LaTeX. Nhấn "Bắt đầu chuyển đổi" ở cột bên trái để tạo file Word.'
+            'Đã biên dịch bản xem trước LaTeX bên phải. Nhấn "Bắt đầu chuyển đổi" để xuất file Word (.docx).'
           );
           return;
         }
@@ -159,6 +249,35 @@ export default function App() {
     [renderDpi, resetResults]
   );
 
+  const svgDataUrlToPngDataUrl = useCallback(
+    async (svgUrl: string, fallbackW = 420, fallbackH = 300): Promise<string> => {
+      if (!svgUrl.startsWith('data:image/svg+xml')) return svgUrl;
+      return await new Promise<string>((resolve) => {
+        const img = new Image();
+        img.onload = () => {
+          const w = Math.max(40, img.naturalWidth || fallbackW);
+          const h = Math.max(40, img.naturalHeight || fallbackH);
+          const scale = 2.5;
+          const canvas = document.createElement('canvas');
+          canvas.width = Math.round(w * scale);
+          canvas.height = Math.round(h * scale);
+          const ctx = canvas.getContext('2d');
+          if (!ctx) {
+            resolve(svgUrl);
+            return;
+          }
+          ctx.fillStyle = '#FFFFFF';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          resolve(canvas.toDataURL('image/png'));
+        };
+        img.onerror = () => resolve(svgUrl);
+        img.src = svgUrl;
+      });
+    },
+    []
+  );
+
   const rebuildDocxExport = useCallback(
     async (
       pagesToExport: PageExtraction[],
@@ -167,20 +286,79 @@ export default function App() {
       layout: ChoiceLayoutMode,
       format: MathOutputFormat
     ) => {
-      const exportRes = await fetch('/api/export/docx', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          pages: pagesToExport,
-          filename,
-          addPageBreaks: pageBreaks,
-          choiceLayout: layout,
-          mathFormat: format,
-        }),
+      const preparedPages: PageExtraction[] = await Promise.all(
+        pagesToExport.map(async (page) => ({
+          ...page,
+          blocks: await Promise.all(
+            page.blocks.map(async (blk) => {
+              if (
+                blk.block_type === 'figure' &&
+                blk.croppedImageDataUrl?.startsWith('data:image/svg+xml')
+              ) {
+                const pngUrl = await svgDataUrlToPngDataUrl(
+                  blk.croppedImageDataUrl,
+                  blk.croppedWidthPx ?? 420,
+                  blk.croppedHeightPx ?? 300
+                );
+                return { ...blk, croppedImageDataUrl: pngUrl };
+              }
+              return blk;
+            })
+          ),
+        }))
+      );
+
+      let exportPayload = JSON.stringify({
+        pages: preparedPages,
+        filename,
+        addPageBreaks: pageBreaks,
+        choiceLayout: layout,
+        mathFormat: format,
       });
 
+      if (exportPayload.length > 3_600_000) {
+        for (const scale of [0.68, 0.5]) {
+          const compactPages: PageExtraction[] = await Promise.all(
+            preparedPages.map(async (page) => ({
+              ...page,
+              blocks: await Promise.all(
+                page.blocks.map(async (blk) => {
+                  if (
+                    blk.block_type === 'figure' &&
+                    blk.croppedImageDataUrl &&
+                    blk.croppedImageDataUrl.length > 180_000
+                  ) {
+                    const smaller = await downscalePngDataUrl(blk.croppedImageDataUrl, scale);
+                    return { ...blk, croppedImageDataUrl: smaller };
+                  }
+                  return blk;
+                })
+              ),
+            }))
+          );
+          exportPayload = JSON.stringify({
+            pages: compactPages,
+            filename,
+            addPageBreaks: pageBreaks,
+            choiceLayout: layout,
+            mathFormat: format,
+          });
+          if (exportPayload.length <= 3_600_000) break;
+        }
+      }
+
+      const exportRes = await fetchWithRetry(
+        '/api/export/docx',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: exportPayload,
+        },
+        2
+      );
+
       if (!exportRes.ok) {
-        const errData = await exportRes.json().catch(() => ({}));
+        const errData = await parseJsonResponseSafe<{ error?: string }>(exportRes);
         throw new Error(errData.error || 'Không thể tạo tệp Word.');
       }
 
@@ -195,16 +373,110 @@ export default function App() {
       });
       setDocxFileName(`${baseName}_${suffix}.docx`);
     },
-    []
+    [svgDataUrlToPngDataUrl]
+  );
+
+  const syncPagesToWordAndOmml = useCallback(
+    async (pagesToSync: PageExtraction[], successMsg: string) => {
+      const reqId = ++syncRequestIdRef.current;
+      setErrorMessage(null);
+      setIsSyncingEditedWord(true);
+      setStatusMessage('Đang cập nhật nội dung đã chỉnh sửa sang file Word...');
+
+      try {
+        const normalizedPages = normalizePagesInlineMath(pagesToSync);
+        const seenEqKeys = new Set<string>();
+        const eqQueries: Array<{ latex: string; isDisplay: boolean }> = [];
+        const addEq = (latex: string, isDisplay: boolean) => {
+          const key = `${isDisplay ? 'D' : 'I'}:${latex}`;
+          if (!seenEqKeys.has(key)) {
+            seenEqKeys.add(key);
+            eqQueries.push({ latex, isDisplay });
+          }
+        };
+
+        for (const p of normalizedPages) {
+          for (const blk of p.blocks) {
+            if (blk.block_type === 'equation' && blk.latex) addEq(blk.latex, true);
+            for (const seg of blk.segments ?? []) {
+              if (seg.type === 'math' && seg.content) addEq(seg.content, false);
+            }
+            for (const row of blk.table_rows ?? []) {
+              for (const cell of row) {
+                for (const seg of cell.segments ?? []) {
+                  if (seg.type === 'math' && seg.content) addEq(seg.content, false);
+                }
+              }
+            }
+          }
+        }
+
+        const ommlPreviewPromise =
+          eqQueries.length > 0
+            ? fetchWithRetry(
+                '/api/omml/preview',
+                {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ equations: eqQueries }),
+                },
+                1
+              )
+                .then(async (ommlRes) => {
+                  if (!ommlRes.ok || reqId !== syncRequestIdRef.current) return;
+                  const ommlJson = (await ommlRes.json()) as {
+                    results: Array<{ latex: string; isDisplay: boolean; omml: string }>;
+                  };
+                  const map: Record<string, string> = {};
+                  for (const item of ommlJson.results) {
+                    map[`${item.isDisplay ? 'D' : 'I'}:${item.latex}`] = item.omml;
+                  }
+                  if (reqId === syncRequestIdRef.current) {
+                    setOmmlMap(map);
+                  }
+                })
+                .catch(() => undefined)
+            : Promise.resolve();
+
+        const fallbackName = inputSource === 'docx' ? 'tai_lieu_word' : 'tai_lieu_latex';
+        await Promise.all([
+          ommlPreviewPromise,
+          rebuildDocxExport(
+            normalizedPages,
+            sourceFilename || fallbackName,
+            addPageBreaks,
+            choiceLayout,
+            mathFormat
+          ),
+        ]);
+
+        if (reqId === syncRequestIdRef.current) {
+          setProgressPct(100);
+          setStatusMessage(successMsg);
+        }
+      } catch (err) {
+        if (reqId === syncRequestIdRef.current) {
+          const msg = err instanceof Error ? err.message : 'Không thể cập nhật tệp Word.';
+          setErrorMessage(msg);
+        }
+      } finally {
+        if (reqId === syncRequestIdRef.current) {
+          setIsSyncingEditedWord(false);
+        }
+      }
+    },
+    [addPageBreaks, choiceLayout, inputSource, mathFormat, rebuildDocxExport, sourceFilename]
   );
 
   const handleChoiceLayoutChange = async (nextLayout: ChoiceLayoutMode) => {
     setChoiceLayout(nextLayout);
-    if (extractedPages.length > 0 && !isConverting && !isExportingPaste) {
+    const activePages =
+      editedPages ?? (extractedPages.length > 0 ? extractedPages : []);
+    if (activePages.length > 0 && !isConverting && !isExportingPaste) {
       try {
         setStatusMessage('Đang cập nhật bố cục phương án trả lời trong file Word...');
         await rebuildDocxExport(
-          extractedPages,
+          activePages,
           sourceFilename || 'tai_lieu_toan',
           addPageBreaks,
           nextLayout,
@@ -264,11 +536,15 @@ export default function App() {
 
       const ommlPreviewPromise =
         eqQueries.length > 0
-          ? fetch('/api/omml/preview', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ equations: eqQueries }),
-            })
+          ? fetchWithRetry(
+              '/api/omml/preview',
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ equations: eqQueries }),
+              },
+              1
+            )
               .then(async (ommlRes) => {
                 if (!ommlRes.ok) return;
                 const ommlJson = (await ommlRes.json()) as {
@@ -307,7 +583,7 @@ export default function App() {
   };
 
   const handleConvertPastedLatex = async (targetFormat: MathOutputFormat = mathFormat) => {
-    const pages = parsePastedLatexToPages(pastedLatex, 'auto');
+    const pages = editedPages ?? parsePastedLatexToPages(pastedLatex, 'auto');
     if (pages.length === 0) {
       setErrorMessage(
         'Vui lòng dán hoặc tải lên nội dung có công thức Toán ($...$ hoặc LaTeX căn bản) trước khi chuyển đổi.'
@@ -342,7 +618,7 @@ export default function App() {
 
     if (inputSource === 'docx' && hasDocx) {
       await handleConvertStructuredPages(
-        pendingDocxPages,
+        editedPages ?? pendingDocxPages,
         mathFormat,
         'tai_lieu_word',
         'Đã xử lý tệp Word sang Word Equation (OMML) thành công!',
@@ -358,7 +634,7 @@ export default function App() {
 
     if (!hasFile && hasDocx) {
       await handleConvertStructuredPages(
-        pendingDocxPages,
+        editedPages ?? pendingDocxPages,
         mathFormat,
         'tai_lieu_word',
         'Đã xử lý tệp Word sang Word Equation (OMML) thành công!',
@@ -388,16 +664,23 @@ export default function App() {
 
       const processSinglePage = async (idx: number) => {
         const page = renderedPages[idx];
-        const ocrRes = await fetch('/api/ocr/page', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            imageDataUrl: page.ocrDataUrl || page.dataUrl,
-            pageNumber: page.pageNumber,
-          }),
-        });
+        const ocrRes = await fetchWithRetry(
+          '/api/ocr/page',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              imageDataUrl: page.ocrDataUrl || page.dataUrl,
+              pageNumber: page.pageNumber,
+            }),
+          },
+          2
+        );
 
-        const ocrJson = await ocrRes.json();
+        const ocrJson = await parseJsonResponseSafe<{
+          blocks?: PageExtraction['blocks'];
+          error?: string;
+        }>(ocrRes);
         if (!ocrRes.ok) {
           throw new Error(ocrJson.error || `Lỗi OCR trang ${page.pageNumber}`);
         }
@@ -406,31 +689,22 @@ export default function App() {
 
         if (autoCropFigures) {
           const figureBlocks = blocks.filter(
-            (blk: { block_type?: string; box_2d?: unknown }) =>
+            (blk): blk is DocumentBlock & { box_2d: number[] } =>
               blk.block_type === 'figure' && Array.isArray(blk.box_2d)
           );
           if (figureBlocks.length > 0) {
             const croppedList = await cropFiguresFromPage(
               page,
-              figureBlocks.map((b: { box_2d: number[] }) => b.box_2d)
+              figureBlocks.map((b) => b.box_2d)
             );
-            figureBlocks.forEach(
-              (
-                blk: {
-                  croppedImageDataUrl?: string;
-                  croppedWidthPx?: number;
-                  croppedHeightPx?: number;
-                },
-                fIdx: number
-              ) => {
-                const cropped = croppedList[fIdx];
-                if (cropped) {
-                  blk.croppedImageDataUrl = cropped.dataUrl;
-                  blk.croppedWidthPx = cropped.width;
-                  blk.croppedHeightPx = cropped.height;
-                }
+            figureBlocks.forEach((blk, fIdx) => {
+              const cropped = croppedList[fIdx];
+              if (cropped) {
+                blk.croppedImageDataUrl = cropped.dataUrl;
+                blk.croppedWidthPx = cropped.width;
+                blk.croppedHeightPx = cropped.height;
               }
-            );
+            });
           }
         }
 
@@ -447,7 +721,7 @@ export default function App() {
         setStatusMessage(`Đã nhận dạng xong ${completedCount}/${total} trang...`);
       };
 
-      const concurrency = Math.min(3, total);
+      const concurrency = Math.min(2, total);
       const workers = Array.from({ length: concurrency }, async () => {
         while (!abortedError) {
           const idx = nextIndex++;
@@ -516,11 +790,15 @@ export default function App() {
 
       const ommlPreviewPromise =
         eqQueries.length > 0
-          ? fetch('/api/omml/preview', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ equations: eqQueries }),
-            })
+          ? fetchWithRetry(
+              '/api/omml/preview',
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ equations: eqQueries }),
+              },
+              1
+            )
               .then(async (ommlRes) => {
                 if (!ommlRes.ok) return;
                 const ommlJson = (await ommlRes.json()) as {
@@ -546,16 +824,136 @@ export default function App() {
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Đã xảy ra lỗi khi chuyển đổi.';
       setErrorMessage(msg);
-      setStatusMessage('');
+      setStatusMessage('Chuyển đổi bị gián đoạn');
     } finally {
       setIsConverting(false);
     }
   };
 
+  const liveLatexPreviewPages = useMemo<PageExtraction[]>(() => {
+    if (inputSource !== 'paste' || !pastedLatex.trim()) return [];
+    try {
+      return normalizePagesInlineMath(parsePastedLatexToPages(pastedLatex, 'auto'));
+    } catch {
+      return [];
+    }
+  }, [inputSource, pastedLatex]);
+
+  const basePreviewPages = useMemo<PageExtraction[]>(() => {
+    if (inputSource === 'file' && extractedPages.length > 0) return extractedPages;
+    if (inputSource === 'paste' && liveLatexPreviewPages.length > 0) return liveLatexPreviewPages;
+    if (inputSource === 'docx' && pendingDocxPages.length > 0) return pendingDocxPages;
+    if (extractedPages.length > 0) return extractedPages;
+    return [];
+  }, [extractedPages, inputSource, liveLatexPreviewPages, pendingDocxPages]);
+
+  const displayPreviewPages = editedPages ?? basePreviewPages;
+
+  const applyEditedPagesChange = useCallback(
+    (nextPages: PageExtraction[]) => {
+      setEditedPages(nextPages);
+      if (docxDownloadUrl) {
+        void syncPagesToWordAndOmml(
+          nextPages,
+          'Đã cập nhật nội dung đã chỉnh sửa vào file Word!'
+        );
+      } else {
+        setStatusMessage(
+          'Đã lưu chỉnh sửa trên bản xem trước. Nhấn "Xuất ra file Word" hoặc "Bắt đầu chuyển đổi" để tạo tệp Word.'
+        );
+      }
+    },
+    [docxDownloadUrl, syncPagesToWordAndOmml]
+  );
+
+  const handleUpdatePreviewBlock = useCallback(
+    (pageNumber: number, blockIndex: number, nextBlock: DocumentBlock) => {
+      const nextPages = mutatePageBlock(displayPreviewPages, pageNumber, (blocks) => {
+        if (blockIndex < 0 || blockIndex >= blocks.length) return blocks;
+        blocks[blockIndex] = nextBlock;
+        return blocks;
+      });
+      applyEditedPagesChange(nextPages);
+    },
+    [applyEditedPagesChange, displayPreviewPages]
+  );
+
+  const handleDeletePreviewBlock = useCallback(
+    (pageNumber: number, blockIndex: number) => {
+      const nextPages = mutatePageBlock(displayPreviewPages, pageNumber, (blocks) =>
+        blocks.filter((_, idx) => idx !== blockIndex)
+      );
+      applyEditedPagesChange(nextPages);
+    },
+    [applyEditedPagesChange, displayPreviewPages]
+  );
+
+  const handleInsertPreviewBlock = useCallback(
+    (
+      pageNumber: number,
+      afterBlockIndex: number,
+      kind: 'paragraph' | 'heading' | 'equation'
+    ) => {
+      const newBlock = createNewBlock(kind);
+      const nextPages = mutatePageBlock(displayPreviewPages, pageNumber, (blocks) => {
+        const insertAt = Math.max(0, Math.min(blocks.length, afterBlockIndex + 1));
+        blocks.splice(insertAt, 0, newBlock);
+        return blocks;
+      });
+      applyEditedPagesChange(nextPages);
+    },
+    [applyEditedPagesChange, displayPreviewPages]
+  );
+
+  const handleMovePreviewBlock = useCallback(
+    (pageNumber: number, blockIndex: number, direction: -1 | 1) => {
+      const nextPages = mutatePageBlock(displayPreviewPages, pageNumber, (blocks) => {
+        const targetIdx = blockIndex + direction;
+        if (
+          blockIndex < 0 ||
+          blockIndex >= blocks.length ||
+          targetIdx < 0 ||
+          targetIdx >= blocks.length
+        ) {
+          return blocks;
+        }
+        const temp = blocks[blockIndex];
+        blocks[blockIndex] = blocks[targetIdx];
+        blocks[targetIdx] = temp;
+        return blocks;
+      });
+      applyEditedPagesChange(nextPages);
+    },
+    [applyEditedPagesChange, displayPreviewPages]
+  );
+
+  const handleResetPreviewEdits = useCallback(() => {
+    setEditedPages(null);
+    if (inputSource !== 'file') {
+      setExtractedPages([]);
+    }
+    if (docxDownloadUrl && basePreviewPages.length > 0) {
+      void syncPagesToWordAndOmml(
+        basePreviewPages,
+        'Đã khôi phục nội dung gốc và cập nhật lại file Word.'
+      );
+    } else {
+      setStatusMessage('Đã khôi phục nội dung gốc trên bản xem trước.');
+    }
+  }, [basePreviewPages, docxDownloadUrl, inputSource, syncPagesToWordAndOmml]);
+
+  const handleSyncPreviewWord = useCallback(() => {
+    if (displayPreviewPages.length === 0) return;
+    void syncPagesToWordAndOmml(
+      displayPreviewPages,
+      'Đã xuất file Word theo nội dung trên bản xem trước!'
+    );
+  }, [displayPreviewPages, syncPagesToWordAndOmml]);
+
   const equationsList = useMemo<ExtractedEquationItem[]>(() => {
     const items: ExtractedEquationItem[] = [];
     let counter = 1;
-    for (const page of extractedPages) {
+    for (const page of displayPreviewPages) {
       for (const blk of page.blocks) {
         if (blk.block_type === 'equation' && blk.latex) {
           items.push({
@@ -599,12 +997,12 @@ export default function App() {
       }
     }
     return items;
-  }, [extractedPages, ommlMap]);
+  }, [displayPreviewPages, ommlMap]);
 
   const figuresList = useMemo<CroppedFigureItem[]>(() => {
     const list: CroppedFigureItem[] = [];
     let counter = 1;
-    for (const page of extractedPages) {
+    for (const page of displayPreviewPages) {
       for (const blk of page.blocks) {
         if (blk.block_type === 'figure' && blk.croppedImageDataUrl) {
           list.push({
@@ -619,17 +1017,17 @@ export default function App() {
       }
     }
     return list;
-  }, [extractedPages]);
+  }, [displayPreviewPages]);
 
   const tableCount = useMemo(() => {
     let count = 0;
-    for (const p of extractedPages) {
+    for (const p of displayPreviewPages) {
       for (const b of p.blocks) {
         if (b.block_type === 'table') count++;
       }
     }
     return count;
-  }, [extractedPages]);
+  }, [displayPreviewPages]);
 
   const currentOriginalPage = useMemo(
     () => renderedPages.find((p) => p.pageNumber === selectedPageNum) ?? renderedPages[0],
@@ -637,12 +1035,12 @@ export default function App() {
   );
 
   const currentPageFigureBoxes = useMemo(() => {
-    const match = extractedPages.find((p) => p.pageNumber === selectedPageNum);
+    const match = displayPreviewPages.find((p) => p.pageNumber === selectedPageNum);
     if (!match) return [];
     return match.blocks
       .filter((b) => b.block_type === 'figure' && Array.isArray(b.box_2d) && b.box_2d.length === 4)
       .map((b) => ({ box: b.box_2d as number[], caption: b.caption }));
-  }, [extractedPages, selectedPageNum]);
+  }, [displayPreviewPages, selectedPageNum]);
 
   const handleInspectEquation = (latex: string, isDisplay: boolean) => {
     const key = `${isDisplay ? 'D' : 'I'}:${latex}`;
@@ -816,8 +1214,15 @@ export default function App() {
             <textarea
               value={pastedLatex}
               onChange={(e) => {
-                setPastedLatex(e.target.value);
+                const nextVal = e.target.value;
+                if (extractedPages.length > 0 || editedPages !== null || docxDownloadUrl) {
+                  resetResults();
+                }
+                setRenderedPages([]);
+                setPendingDocxPages([]);
+                setPastedLatex(nextVal);
                 setInputSource('paste');
+                setActiveTab('preview');
               }}
               rows={5}
               placeholder={
@@ -873,7 +1278,7 @@ export default function App() {
                 className="mt-0.5 h-4 w-4 rounded border-slate-300 text-blue-700 focus:ring-blue-600"
               />
               <span className="text-sm text-slate-700">
-                Tự động nhận diện & cắt chèn hình vẽ / đồ thị
+                Tự động nhận diện &amp; cắt chèn hình vẽ / đồ thị / bảng biến thiên
               </span>
             </label>
 
@@ -1003,7 +1408,7 @@ export default function App() {
               )}
             </div>
 
-            {extractedPages.length > 0 && (
+            {displayPreviewPages.length > 0 && (
               <div className="pt-3 border-t border-slate-100 grid grid-cols-3 gap-2 text-center tabular-nums">
                 <div>
                   <div className="text-base font-bold text-slate-900">
@@ -1147,7 +1552,7 @@ export default function App() {
             {renderedPages.length === 0 &&
             pendingDocxPages.length === 0 &&
             !pastedLatex.trim() &&
-            extractedPages.length === 0 ? (
+            displayPreviewPages.length === 0 ? (
               <div className="bg-white border border-slate-200 rounded-xl p-12 text-center">
                 <Layers className="w-10 h-10 text-slate-400 mx-auto mb-3" />
                 <h3 className="text-base font-semibold text-slate-900">
@@ -1219,12 +1624,24 @@ export default function App() {
                 </div>
               )
             ) : activeTab === 'preview' ? (
-              extractedPages.length > 0 ? (
+              displayPreviewPages.length > 0 ? (
                 <DocumentPreview
-                  pages={extractedPages}
+                  pages={displayPreviewPages}
                   choiceLayout={choiceLayout}
                   mathFormat={mathFormat}
                   onSelectEquation={handleInspectEquation}
+                  editable={!isConverting && !isExportingPaste}
+                  isEditMode={isPreviewEditMode}
+                  onToggleEditMode={() => setIsPreviewEditMode((v) => !v)}
+                  hasEdits={editedPages !== null}
+                  onResetEdits={handleResetPreviewEdits}
+                  onSyncWord={handleSyncPreviewWord}
+                  isSyncingWord={isSyncingEditedWord}
+                  hasWordOutput={Boolean(docxDownloadUrl)}
+                  onUpdateBlock={handleUpdatePreviewBlock}
+                  onDeleteBlock={handleDeletePreviewBlock}
+                  onInsertBlock={handleInsertPreviewBlock}
+                  onMoveBlock={handleMovePreviewBlock}
                 />
               ) : (
                 <div className="bg-white border border-slate-200 rounded-xl p-10 text-center">

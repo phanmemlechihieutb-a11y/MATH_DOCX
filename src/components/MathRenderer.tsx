@@ -60,15 +60,31 @@ function stripDelimiters(raw: string): string {
   }
   s = s
     .replace(/\\label\{[^}]*\}/g, '')
-    .replace(/\\nonumber\b/g, '')
+    .replace(/\\tag\*?\{[^}]*\}/g, '')
+    .replace(/\\(?:nonumber|notag|noindent)(?![a-zA-Z])\s*/g, '')
+    .replace(/\\intertext\{([^}]*)\}/g, '\\\\ \\text{$1} \\\\')
+    .replace(/\\shortintertext\{([^}]*)\}/g, '\\\\ \\text{$1} \\\\')
     .replace(/\\arctg(?![a-zA-Z])/g, '\\arctan')
     .replace(/\\arccotg(?![a-zA-Z])/g, '\\operatorname{arccot}')
     .replace(/\\cotg(?![a-zA-Z])/g, '\\cot')
     .replace(/\\tg(?![a-zA-Z])/g, '\\tan')
     .replace(/\\degree(?![a-zA-Z])/g, '^\\circ')
     .replace(/\\dx(?![a-zA-Z])/g, '\\,dx')
-    .replace(/\\begin\{(align\*?|flalign\*?|eqnarray\*?)\}/g, '\\begin{aligned}')
-    .replace(/\\end\{(align\*?|flalign\*?|eqnarray\*?)\}/g, '\\end{aligned}')
+    .replace(/\\(?:SI|qty)(?:\[[^\]]*\])?\s*\{([^}]*)\}\s*\{([^}]*)\}/g, (_m, v: string, u: string) => {
+      const unit = u.replace(/\\per\b/g, '/').replace(/\\([a-zA-Z]+)/g, '$1').trim();
+      return `${v.trim()}\\,\\mathrm{${unit}}`;
+    })
+    .replace(/\\num(?:\[[^\]]*\])?\s*\{([^}]*)\}/g, '$1')
+    .replace(/\\(?:si|unit)(?:\[[^\]]*\])?\s*\{([^}]*)\}/g, (_m, u: string) => {
+      const unit = u.replace(/\\per\b/g, '/').replace(/\\([a-zA-Z]+)/g, '$1').trim();
+      return `\\mathrm{${unit}}`;
+    })
+    .replace(/\\begin\{alignat\*?\}\s*\{[^}]*\}/g, '\\begin{aligned}')
+    .replace(/\\end\{alignat\*?\}/g, '\\end{aligned}')
+    .replace(/\\begin\{alignedat\}\s*\{[^}]*\}/g, '\\begin{aligned}')
+    .replace(/\\end\{alignedat\}/g, '\\end{aligned}')
+    .replace(/\\begin\{(align\*?|flalign\*?|eqnarray\*?|split)\}/g, '\\begin{aligned}')
+    .replace(/\\end\{(align\*?|flalign\*?|eqnarray\*?|split)\}/g, '\\end{aligned}')
     .replace(/\\begin\{(gather\*?|multline\*?)\}/g, '\\begin{gathered}')
     .replace(/\\end\{(gather\*?|multline\*?)\}/g, '\\end{gathered}');
 
