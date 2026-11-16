@@ -693,9 +693,19 @@ export default function App() {
               blk.block_type === 'figure' && Array.isArray(blk.box_2d)
           );
           if (figureBlocks.length > 0) {
+            const neighborBoxes = blocks
+              .filter(
+                (blk): blk is DocumentBlock & { box_2d: number[] } =>
+                  blk.block_type !== 'figure' &&
+                  Array.isArray(blk.box_2d) &&
+                  blk.box_2d.length === 4
+              )
+              .map((b) => b.box_2d);
             const croppedList = await cropFiguresFromPage(
               page,
-              figureBlocks.map((b) => b.box_2d)
+              figureBlocks.map((b) => b.box_2d),
+              0.014,
+              neighborBoxes
             );
             figureBlocks.forEach((blk, fIdx) => {
               const cropped = croppedList[fIdx];
@@ -703,6 +713,7 @@ export default function App() {
                 blk.croppedImageDataUrl = cropped.dataUrl;
                 blk.croppedWidthPx = cropped.width;
                 blk.croppedHeightPx = cropped.height;
+                blk.box_2d = cropped.box2d;
               }
             });
           }
