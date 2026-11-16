@@ -43,7 +43,7 @@ const DISPLAY_MATH_ENVS = new Set([
 ]);
 
 const BARE_LATEX_CMD_RE =
-  /\\(?:(?:frac|dfrac|tfrac|binom|dbinom|sqrt|int|iint|iiint|oint|sum|prod|lim|limsup|liminf|vec|overrightarrow|overleftarrow|widehat|widetilde|overline|bar|tilde|hat|heva|hoac|mathbb|mathcal|mathfrak|mathrm|sin|cos|tan|cot|sec|csc|arcsin|arccos|arctan|log|ln|lg|exp|max|min|sup|inf|alpha|beta|gamma|delta|Delta|epsilon|varepsilon|zeta|eta|theta|vartheta|lambda|mu|nu|xi|pi|rho|sigma|tau|phi|varphi|chi|psi|omega|Omega|Gamma|Theta|Lambda|Sigma|Phi|Psi|infty|partial|nabla|leq|geq|neq|approx|equiv|sim|simeq|cong|propto|pm|mp|times|cdot|div|ast|star|circ|bullet|in|notin|ni|subset|subseteq|supset|supseteq|cup|cap|setminus|emptyset|varnothing|forall|exists|nexists|neg|land|lor|Rightarrow|Leftrightarrow|Leftarrow|rightarrow|leftarrow|leftrightarrow|to|mapsto|implies|iff)(?![a-zA-Z])|begin\{)/;
+  /\\(?:(?:frac|dfrac|tfrac|cfrac|binom|dbinom|sqrt|int|iint|iiint|oint|sum|prod|lim|limsup|liminf|limits|nolimits|displaystyle|textstyle|scriptstyle|scriptscriptstyle|underset|overset|mathop|operatorname|left|right|vec|overrightarrow|overleftarrow|widehat|widetilde|overline|bar|tilde|hat|heva|hoac|mathbb|mathcal|mathfrak|mathrm|sin|cos|tan|cot|sec|csc|arcsin|arccos|arctan|log|ln|lg|exp|max|min|sup|inf|alpha|beta|gamma|delta|Delta|epsilon|varepsilon|zeta|eta|theta|vartheta|lambda|mu|nu|xi|pi|rho|sigma|tau|phi|varphi|chi|psi|omega|Omega|Gamma|Theta|Lambda|Sigma|Phi|Psi|infty|partial|nabla|leq|geq|neq|approx|equiv|sim|simeq|cong|propto|pm|mp|times|cdot|div|ast|star|circ|bullet|in|notin|ni|subset|subseteq|supset|supseteq|cup|cap|setminus|emptyset|varnothing|forall|exists|nexists|neg|land|lor|Rightarrow|Leftrightarrow|Leftarrow|rightarrow|leftarrow|leftrightarrow|to|mapsto|implies|iff|dots|cdots|ldots|vdots|ddots)(?![a-zA-Z])|begin\{)/;
 
 const LATEX_COLOR_MAP: Record<string, string> = {
   red: '#DC2626',
@@ -1335,6 +1335,353 @@ function normalizeMathContent(latex: string): string {
     .trim();
 }
 
+const BARE_TEXT_STYLE_CMDS = new Set([
+  'textbf',
+  'textit',
+  'emph',
+  'underline',
+  'textcolor',
+  'text',
+  'textrm',
+  'textsf',
+  'texttt',
+  'mbox',
+  'hbox',
+]);
+
+const BARE_PREFIX_MODIFIER_CMDS = new Set([
+  'displaystyle',
+  'textstyle',
+  'scriptstyle',
+  'scriptscriptstyle',
+  'mathop',
+]);
+
+const BARE_LIMIT_EXTEND_CMDS = new Set([
+  'lim',
+  'limsup',
+  'liminf',
+]);
+
+const VIETNAMESE_CHAR_RE =
+  /[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]/i;
+
+function readBalancedParens(
+  src: string,
+  openIdx: number
+): { content: string; endIdx: number } | null {
+  if (src[openIdx] !== '(') return null;
+  let depth = 0;
+  for (let i = openIdx; i < src.length; i++) {
+    const ch = src[i];
+    if (ch === '\\' && i + 1 < src.length) {
+      i++;
+      continue;
+    }
+    if (ch === '(') depth++;
+    else if (ch === ')') {
+      depth--;
+      if (depth === 0) {
+        return {
+          content: src.slice(openIdx + 1, i),
+          endIdx: i,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+function isMathGroupContent(inner: string): boolean {
+  if (VIETNAMESE_CHAR_RE.test(inner)) return false;
+  // Strip LaTeX commands before checking for multi-letter natural-language prose words
+  const stripped = inner.replace(/\\[a-zA-Z]+\*?/g, ' ');
+  const proseWords = stripped.match(/[a-zA-Z]{2,}/g) ?? [];
+  return proseWords.length === 0;
+}
+
+function skipHorizontalSpaces(text: string, idx: number): number {
+  let i = idx;
+  while (i < text.length && (text[i] === ' ' || text[i] === '\t')) {
+    i++;
+  }
+  return i;
+}
+
+function consumeBareLatexCmdChain(
+  text: string,
+  startIdx: number
+): { end: number; cmds: string[] } | null {
+  const rest = text.slice(startIdx);
+  const firstMatch = rest.match(/^\\([a-zA-Z]+)\*?/);
+  if (!firstMatch) return null;
+  const firstCmd = firstMatch[1];
+  if (BARE_TEXT_STYLE_CMDS.has(firstCmd)) return null;
+  if (!BARE_LATEX_CMD_RE.test(`\\${firstCmd}`) && !(firstCmd === 'begin' && rest.startsWith('\\begin{'))) {
+    return null;
+  }
+
+  const cmds: string[] = [firstCmd];
+  let end = startIdx + firstMatch[0].length;
+  let lastCmd = firstCmd;
+
+  // Handle \left ... \right pairing if starting on \left
+  if (firstCmd === 'left') {
+    let depth = 1;
+    let p = end;
+    while (p < text.length && depth > 0) {
+      if (text[p] === '\n') break;
+      if (text[p] === '\\') {
+        const sub = text.slice(p);
+        if (/^\\left(?![a-zA-Z])/.test(sub)) {
+          depth++;
+          p += 5;
+          continue;
+        }
+        if (/^\\right(?![a-zA-Z])/.test(sub)) {
+          depth--;
+          p += 6;
+          if (depth === 0) {
+            // Consume closing delimiter (e.g. ')', '.', '\|', '\}', ']')
+            if (text[p] === '\\' && p + 1 < text.length) p += 2;
+            else if (p < text.length && !/\s/.test(text[p])) p++;
+            end = p;
+            break;
+          }
+          continue;
+        }
+        p += 2;
+        continue;
+      }
+      p++;
+    }
+  }
+
+  let progressed = true;
+  while (progressed && end < text.length) {
+    progressed = false;
+    const afterSpaces = skipHorizontalSpaces(text, end);
+    const nextChar = text[afterSpaces];
+    if (!nextChar || nextChar === '\n') break;
+
+    if (nextChar === '[') {
+      const brk = readBalancedBrackets(text, afterSpaces);
+      if (brk) {
+        end = brk.endIdx + 1;
+        progressed = true;
+        continue;
+      }
+    }
+    if (nextChar === '{') {
+      const br = readBalancedBraces(text, afterSpaces);
+      if (br) {
+        end = br.endIdx + 1;
+        progressed = true;
+        continue;
+      }
+    }
+    if (nextChar === '^' || nextChar === '_') {
+      let p = afterSpaces + 1;
+      if (text[p] === '{') {
+        const br = readBalancedBraces(text, p);
+        if (br) p = br.endIdx + 1;
+      } else if (text[p] === '\\') {
+        const cm = text.slice(p).match(/^\\[a-zA-Z]+/);
+        p += cm ? cm[0].length : 1;
+      } else if (p < text.length && !/\s/.test(text[p])) {
+        p++;
+      }
+      end = p;
+      progressed = true;
+      continue;
+    }
+
+    const limModMatch = text.slice(afterSpaces).match(/^\\(limits|nolimits)(?![a-zA-Z])/);
+    if (limModMatch) {
+      cmds.push(limModMatch[1]);
+      lastCmd = limModMatch[1];
+      end = afterSpaces + limModMatch[0].length;
+      progressed = true;
+      continue;
+    }
+
+    if (BARE_PREFIX_MODIFIER_CMDS.has(lastCmd) && text[afterSpaces] === '\\') {
+      const subChain = consumeBareLatexCmdChain(text, afterSpaces);
+      if (subChain) {
+        cmds.push(...subChain.cmds);
+        lastCmd = subChain.cmds[subChain.cmds.length - 1] ?? lastCmd;
+        end = subChain.end;
+        progressed = true;
+        continue;
+      }
+    }
+  }
+
+  return { end, cmds };
+}
+
+function extendBareLimitExpression(text: string, initialEnd: number): number {
+  let end = initialEnd;
+  let hasOperand = false;
+  let safety = 0;
+
+  while (end < text.length && safety < 80) {
+    safety++;
+    const p = skipHorizontalSpaces(text, end);
+    if (p >= text.length) break;
+    const ch = text[p];
+
+    // Hard stop boundaries
+    if (ch === '\n' || ch === ';' || ch === ',' || ch === '?' || ch === '!' || ch === ':') {
+      break;
+    }
+    if (ch === '.' && !/^\.\d/.test(text.slice(p))) {
+      break;
+    }
+    if (VIETNAMESE_CHAR_RE.test(ch)) {
+      break;
+    }
+
+    // Bare LaTeX command (e.g. \frac{...}{...}, \infty, \sin, \left(...\right), \lim...)
+    if (ch === '\\') {
+      const chain = consumeBareLatexCmdChain(text, p);
+      if (!chain) break;
+      end = chain.end;
+      hasOperand = true;
+      continue;
+    }
+
+    // Parenthesized / bracketed math group (e.g. (x^2 + 1), [0, 1])
+    if (ch === '(') {
+      const pr = readBalancedParens(text, p);
+      if (!pr || !isMathGroupContent(pr.content)) break;
+      let nextEnd = pr.endIdx + 1;
+      // Consume trailing ^ / _ / ' (e.g. (x+1)^2 or (x)')
+      while (nextEnd < text.length && (text[nextEnd] === '^' || text[nextEnd] === '_' || text[nextEnd] === "'")) {
+        if (text[nextEnd] === "'") {
+          nextEnd++;
+        } else {
+          nextEnd++;
+          if (text[nextEnd] === '{') {
+            const br = readBalancedBraces(text, nextEnd);
+            if (br) nextEnd = br.endIdx + 1;
+          } else if (nextEnd < text.length && !/\s/.test(text[nextEnd])) {
+            nextEnd++;
+          }
+        }
+      }
+      end = nextEnd;
+      hasOperand = true;
+      continue;
+    }
+    if (ch === '[') {
+      const brk = readBalancedBrackets(text, p);
+      if (!brk || !isMathGroupContent(brk.content)) break;
+      end = brk.endIdx + 1;
+      hasOperand = true;
+      continue;
+    }
+
+    // Absolute value |...|
+    if (ch === '|') {
+      const closeBar = text.indexOf('|', p + 1);
+      if (closeBar === -1 || text.slice(p + 1, closeBar).includes('\n')) break;
+      if (!isMathGroupContent(text.slice(p + 1, closeBar))) break;
+      end = closeBar + 1;
+      hasOperand = true;
+      continue;
+    }
+
+    // Number (e.g. 1, 2.5, 2x)
+    const numM = text.slice(p).match(/^\d+(?:[.,]\d+)?/);
+    if (numM) {
+      let nextEnd = p + numM[0].length;
+      if (
+        nextEnd < text.length &&
+        /[a-zA-Z]/.test(text[nextEnd]) &&
+        !/\p{L}/u.test(text[nextEnd + 1] || '')
+      ) {
+        nextEnd++;
+      }
+      end = nextEnd;
+      hasOperand = true;
+      continue;
+    }
+
+    // Single-letter identifier / function call like f(x), g'(x), u_n, x^2, y (never "B." choice marker or "và")
+    if (/[a-zA-Z]/.test(ch)) {
+      const nextCh = text[p + 1] ?? '';
+      if (/\p{L}/u.test(nextCh)) {
+        // Multi-letter bare word (including Vietnamese words like "và", "với", "tại") -> stop
+        break;
+      }
+      if (nextCh === '.' && (p + 2 >= text.length || /\s/.test(text[p + 2]))) {
+        // Choice marker like "B. " or end-of-sentence single letter
+        break;
+      }
+      let nextEnd = p + 1;
+      while (nextEnd < text.length) {
+        if (text[nextEnd] === "'") {
+          nextEnd++;
+        } else if (text[nextEnd] === '^' || text[nextEnd] === '_') {
+          nextEnd++;
+          if (text[nextEnd] === '{') {
+            const br = readBalancedBraces(text, nextEnd);
+            if (br) nextEnd = br.endIdx + 1;
+          } else if (text[nextEnd] === '\\') {
+            const cm = text.slice(nextEnd).match(/^\\[a-zA-Z]+/);
+            nextEnd += cm ? cm[0].length : 1;
+          } else if (nextEnd < text.length && !/\s/.test(text[nextEnd])) {
+            nextEnd++;
+          }
+        } else if (text[nextEnd] === '(') {
+          const pr = readBalancedParens(text, nextEnd);
+          if (pr && isMathGroupContent(pr.content)) {
+            nextEnd = pr.endIdx + 1;
+          } else {
+            break;
+          }
+        } else {
+          break;
+        }
+      }
+      end = nextEnd;
+      hasOperand = true;
+      continue;
+    }
+
+    // Math operators / relations (only consume if followed by a valid math token)
+    if (ch === '=' || ch === '<' || ch === '>' || ch === '≤' || ch === '≥' || ch === '≠' || ch === '+' || ch === '-' || ch === '−' || ch === '*' || ch === '/') {
+      const afterOp = skipHorizontalSpaces(text, p + 1);
+      const nextAfterOp = text[afterOp];
+      if (!nextAfterOp || nextAfterOp === '\n' || VIETNAMESE_CHAR_RE.test(nextAfterOp)) break;
+      const validNext =
+        nextAfterOp === '\\' ||
+        nextAfterOp === '(' ||
+        nextAfterOp === '[' ||
+        nextAfterOp === '|' ||
+        nextAfterOp === '+' ||
+        nextAfterOp === '-' ||
+        nextAfterOp === '−' ||
+        /\d/.test(nextAfterOp) ||
+        (/[a-zA-Z]/.test(nextAfterOp) &&
+          !/\p{L}/u.test(text[afterOp + 1] || '') &&
+          !(text[afterOp + 1] === '.' && (afterOp + 2 >= text.length || /\s/.test(text[afterOp + 2]))));
+      if (!validNext) break;
+      if (!hasOperand && (ch === '=' || ch === '<' || ch === '>')) {
+        // Don't swallow trailing relation if no operand was seen yet unless unary +/-
+        break;
+      }
+      end = p + 1;
+      continue;
+    }
+
+    break;
+  }
+
+  return end;
+}
+
 function splitBareLatexTokens(text: string): InlineSegment[] {
   const segments: InlineSegment[] = [];
   let cursor = 0;
@@ -1352,70 +1699,21 @@ function splitBareLatexTokens(text: string): InlineSegment[] {
 
   while (i < text.length) {
     if (text[i] === '\\') {
-      const rest = text.slice(i);
-      const cmdMatch = rest.match(/^\\([a-zA-Z]+)\*?/);
-      if (cmdMatch) {
-        const cmd = cmdMatch[1];
-        if (
-          cmd === 'textbf' ||
-          cmd === 'textit' ||
-          cmd === 'emph' ||
-          cmd === 'underline' ||
-          cmd === 'textcolor'
-        ) {
-          i++;
-          continue;
+      const chain = consumeBareLatexCmdChain(text, i);
+      if (chain) {
+        let end = chain.end;
+        if (chain.cmds.some((c) => BARE_LIMIT_EXTEND_CMDS.has(c))) {
+          end = extendBareLimitExpression(text, end);
         }
-        if (BARE_LATEX_CMD_RE.test(`\\${cmd}`)) {
-          let end = i + cmdMatch[0].length;
-          let progressed = true;
-          while (progressed && end < text.length) {
-            progressed = false;
-            while (end < text.length && (text[end] === ' ' || text[end] === '\t')) {
-              const nextChar = text[end + 1];
-              if (nextChar === '{' || nextChar === '[' || nextChar === '^' || nextChar === '_') {
-                end++;
-              } else {
-                break;
-              }
-            }
-            if (text[end] === '[') {
-              const closeBr = text.indexOf(']', end + 1);
-              if (closeBr !== -1) {
-                end = closeBr + 1;
-                progressed = true;
-                continue;
-              }
-            }
-            if (text[end] === '{') {
-              const br = readBalancedBraces(text, end);
-              if (br) {
-                end = br.endIdx + 1;
-                progressed = true;
-                continue;
-              }
-            }
-            if (text[end] === '^' || text[end] === '_') {
-              end++;
-              if (text[end] === '{') {
-                const br = readBalancedBraces(text, end);
-                if (br) end = br.endIdx + 1;
-              } else if (end < text.length) {
-                end++;
-              }
-              progressed = true;
-            }
-          }
 
-          if (i > cursor) pushText(text.slice(cursor, i));
-          const expr = text.slice(i, end).trim();
-          if (expr) {
-            segments.push({ type: 'math', content: expr });
-          }
-          cursor = end;
-          i = end;
-          continue;
+        if (i > cursor) pushText(text.slice(cursor, i));
+        const expr = text.slice(i, end).trim();
+        if (expr) {
+          segments.push({ type: 'math', content: expr });
         }
+        cursor = end;
+        i = end;
+        continue;
       }
     }
     i++;
@@ -2100,7 +2398,7 @@ function isPureBareLatexLine(trimmed: string): boolean {
   if (hasVietnameseWords) return false;
 
   if (
-    /^\\(?:frac|dfrac|tfrac|sqrt|int|iint|sum|prod|lim|left|vec|overrightarrow|widehat|overline)(?![a-zA-Z])/.test(
+    /^\\(?:frac|dfrac|tfrac|cfrac|sqrt|int|iint|sum|prod|lim|limsup|liminf|displaystyle|textstyle|underset|overset|max|min|sup|inf|left|vec|overrightarrow|widehat|overline)(?![a-zA-Z])/.test(
       trimmed
     )
   ) {

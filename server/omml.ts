@@ -5,6 +5,13 @@ import type { Element as XmlElement, Node as XmlNode } from '@xmldom/xmldom';
 const NARY_CHARS = new Set(['∫', '∬', '∭', '∮', '∑', '∏', '∐', '⋃', '⋂', '⋁', '⋀']);
 const ACCENT_CHARS = new Set(['→', '⃗', '¯', '^', 'ˆ', '˜', '˙', '¨', '˘', 'ˇ', '‾']);
 const RELATION_BREAK_CHARS = new Set(['=', '<', '>', '≤', '≥', '≠', '≈', '≡', '⇒', '⇔', '→']);
+const INVISIBLE_MATH_CHARS_RE = /[\u2061-\u2064\u200B\uFEFF]/g;
+const LIMIT_FUNC_BASES = new Set(['lim', 'limsup', 'liminf', 'max', 'min', 'sup', 'inf']);
+const FUNC_ARG_BREAK_CHARS = new Set([
+  '=', '<', '>', '≤', '≥', '≠', '≈', '≡', '⇒', '⇔', '→',
+  ',', ';', ':', '|', '.', ')', ']', '}',
+]);
+const BINARY_BREAK_CHARS = new Set(['+', '-', '−', '±', '∓']);
 
 export function cleanLatex(raw: string): string {
   let s = (raw ?? '').trim();
@@ -64,8 +71,7 @@ function sanitizeLatexForTemml(latex: string): string {
     .replace(/\\intertext\{([^}]*)\}/g, '\\\\ \\text{$1} \\\\')
     .replace(/\\shortintertext\{([^}]*)\}/g, '\\\\ \\text{$1} \\\\')
     .replace(/\\allowbreak\b/g, '')
-    .replace(/\\limits/g, '')
-    .replace(/\\(?:displaystyle|textstyle|scriptstyle|scriptscriptstyle)\b/g, '')
+    .replace(/\\(lim|limsup|liminf)(?![a-zA-Z])(?!\s*\\(?:no)?limits(?![a-zA-Z]))(?=\s*_)/g, '\\$1\\limits')
     .replace(/\\implies/g, '\\Rightarrow')
     .replace(/\\iff/g, '\\Leftrightarrow')
     .replace(/\\leqslant/g, '\\leq')
@@ -272,6 +278,80 @@ function convertMrowList(children: XmlElement[]): string {
       }
     }
 
+    // Check for limit/extremum operator with limits (\lim_{...}, \limsup_{...}, \max\limits_{...}, etc.)
+    if (tag === 'munder' || tag === 'msub' || tag === 'mi') {
+      let baseText = '';
+      if (tag === 'mi') {
+        baseText = getNodeText(ch).replace(INVISIBLE_MATH_CHARS_RE, '').replace(/\s+/g, '').trim();
+      } else {
+        const subChildren = getElementChildren(ch);
+        if (subChildren.length > 0) {
+          baseText = getNodeText(subChildren[0])
+            .replace(INVISIBLE_MATH_CHARS_RE, '')
+            .replace(/\s+/g, '')
+            .trim();
+        }
+      }
+
+      if (LIMIT_FUNC_BASES.has(baseText)) {
+        const fNameXml = convertNode(ch);
+        let j = i + 1;
+        // Skip invisible function-application operators and thin space right after operator
+        while (j < children.length) {
+          const nextEl = children[j];
+          const nextTag = nextEl.localName || nextEl.tagName;
+          if (nextTag === 'mo') {
+            const cleanedOp = getNodeText(nextEl).replace(INVISIBLE_MATH_CHARS_RE, '').trim();
+            if (!cleanedOp) {
+              j++;
+              continue;
+            }
+          }
+          if (nextTag === 'mspace') {
+            const widthAttr = (nextEl.getAttribute('width') ?? '').trim();
+            const emMatch = widthAttr.match(/^([\d.]+)em$/i);
+            if (!emMatch || parseFloat(emMatch[1]) <= 0.25) {
+              j++;
+              continue;
+            }
+          }
+          break;
+        }
+
+        const bodyNodes: XmlElement[] = [];
+        while (j < children.length) {
+          const nextEl = children[j];
+          const nextTag = nextEl.localName || nextEl.tagName;
+          const nextText = getNodeText(nextEl).replace(INVISIBLE_MATH_CHARS_RE, '').trim();
+          if (nextTag === 'mo') {
+            if (!nextText) {
+              j++;
+              continue;
+            }
+            if (FUNC_ARG_BREAK_CHARS.has(nextText)) {
+              break;
+            }
+            if (bodyNodes.length > 0 && BINARY_BREAK_CHARS.has(nextText)) {
+              break;
+            }
+          }
+          bodyNodes.push(nextEl);
+          j++;
+        }
+
+        if (bodyNodes.length > 0) {
+          const bodyXml = convertMrowList(bodyNodes);
+          result += `<m:func><m:funcPr/><m:fName>${fNameXml}</m:fName><m:e>${bodyXml}</m:e></m:func>`;
+          i = j;
+          continue;
+        }
+
+        result += fNameXml;
+        i = j;
+        continue;
+      }
+    }
+
     result += convertNode(ch);
     i++;
   }
@@ -283,7 +363,7 @@ function convertNode(node: XmlElement): string {
   const tag = node.localName || node.tagName;
 
   if (tag === 'mi' || tag === 'mn' || tag === 'mo' || tag === 'mtext' || tag === 'ms') {
-    const txt = getNodeText(node);
+    const txt = getNodeText(node).replace(INVISIBLE_MATH_CHARS_RE, '');
     if (!txt) return '';
     const isPlain =
       tag === 'mn' || tag === 'mtext' || tag === 'ms' || (tag === 'mi' && txt.length > 1);
@@ -291,6 +371,13 @@ function convertNode(node: XmlElement): string {
   }
 
   if (tag === 'mspace') {
+    const widthAttr = (node.getAttribute('width') ?? '').trim();
+    const emMatch = widthAttr.match(/^([\d.]+)em$/i);
+    if (emMatch) {
+      const emVal = parseFloat(emMatch[1]);
+      if (emVal <= 0.05) return '';
+      if (emVal <= 0.22) return makeMathRun('\u2009', true);
+    }
     return makeMathRun(' ', true);
   }
 
@@ -392,7 +479,7 @@ function convertNode(node: XmlElement): string {
   if (tag === 'munder') {
     const children = getElementChildren(node);
     if (children.length >= 2) {
-      return `<m:limLow><m:e>${convertNode(children[0])}</m:e><m:lim>${convertNode(children[1])}</m:lim></m:limLow>`;
+      return `<m:limLow><m:limLowPr/><m:e>${convertNode(children[0])}</m:e><m:lim>${convertNode(children[1])}</m:lim></m:limLow>`;
     }
   }
 

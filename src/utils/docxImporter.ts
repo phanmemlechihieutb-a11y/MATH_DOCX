@@ -226,7 +226,11 @@ function ommlElementToLatex(el: Element): string {
           'log', 'ln', 'lg', 'exp', 'lim', 'limsup', 'liminf',
           'max', 'min', 'sup', 'inf', 'det', 'gcd', 'mod', 'arg',
         ]);
-        const trimmed = rawText.trim();
+        const trimmed = rawText.replace(/\u2009/g, ' ').trim();
+        const compact = trimmed.replace(/\s+/g, '');
+        if (compact === 'limsup' || compact === 'liminf') {
+          return `\\${compact} `;
+        }
         if (knownFuncs.has(trimmed)) {
           return `\\${trimmed} `;
         }
@@ -406,6 +410,12 @@ function ommlElementToLatex(el: Element): string {
       if (base === 'lim' || base === '\\lim' || base === '\\text{lim}') {
         return `\\lim_{${lim}}`;
       }
+      if (base === '\\limsup' || base === 'limsup') return `\\limsup_{${lim}}`;
+      if (base === '\\liminf' || base === 'liminf') return `\\liminf_{${lim}}`;
+      if (base === '\\max' || base === 'max') return `\\max_{${lim}}`;
+      if (base === '\\min' || base === 'min') return `\\min_{${lim}}`;
+      if (base === '\\sup' || base === 'sup') return `\\sup_{${lim}}`;
+      if (base === '\\inf' || base === 'inf') return `\\inf_{${lim}}`;
       return `\\underset{${lim}}{${base}}`;
     }
 

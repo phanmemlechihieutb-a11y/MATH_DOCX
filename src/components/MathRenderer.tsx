@@ -95,6 +95,10 @@ function stripDelimiters(raw: string): string {
     (inner) => `\\left[\\begin{aligned} ${inner} \\end{aligned}\\right.`
   );
   s = expandBalancedMacro(s, 'wideparen', (inner) => `\\widehat{${inner}}`);
+  s = s.replace(
+    /\\(lim|limsup|liminf)(?![a-zA-Z])(?!\s*\\(?:no)?limits(?![a-zA-Z]))(?=\s*_)/g,
+    '\\$1\\limits'
+  );
   return s.trim();
 }
 
