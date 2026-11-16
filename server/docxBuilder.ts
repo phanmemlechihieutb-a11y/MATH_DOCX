@@ -128,6 +128,8 @@ function renderSegmentsXml(
         const omml = latexToOmmlXml(seg.content, false, {
           sizeHalfPt: segSizeHalfPt,
           colorHex,
+          bold: isBold,
+          italic: Boolean(seg.italic),
         });
         if (omml) {
           out.push(omml);

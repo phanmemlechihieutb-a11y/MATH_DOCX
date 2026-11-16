@@ -136,12 +136,20 @@ export interface OmmlStyleOptions {
   sizeHalfPt?: number;
   align?: 'left' | 'center' | 'right' | 'justify';
   colorHex?: string | null;
+  bold?: boolean;
+  italic?: boolean;
 }
 
 function buildWordRunPr(style?: OmmlStyleOptions): string {
   const parts = [
     '<w:rFonts w:ascii="Cambria Math" w:hAnsi="Cambria Math" w:cs="Cambria Math"/>',
   ];
+  if (style?.bold) {
+    parts.push('<w:b/>');
+  }
+  if (style?.italic) {
+    parts.push('<w:i/>');
+  }
   if (style?.colorHex) {
     parts.push(`<w:color w:val="${style.colorHex}"/>`);
   }
@@ -457,7 +465,7 @@ export function latexToOmmlXml(
 
   const cacheKey = `${isDisplay ? 'D' : 'I'}|${style?.sizeHalfPt ?? ''}|${style?.align ?? ''}|${
     style?.colorHex ?? ''
-  }|${sanitized}`;
+  }|${style?.bold ? 'B' : ''}${style?.italic ? 'I' : ''}|${sanitized}`;
   if (ommlCache.has(cacheKey)) {
     return ommlCache.get(cacheKey) ?? null;
   }
@@ -476,10 +484,21 @@ export function latexToOmmlXml(
     let innerOmml = convertNode(root);
     if (!innerOmml) return null;
 
-    if (style?.sizeHalfPt || style?.colorHex) {
+    if (style?.sizeHalfPt || style?.colorHex || style?.bold || style?.italic) {
       const styledWrPr = buildWordRunPr(style);
       const defaultWrPr = buildWordRunPr();
       innerOmml = innerOmml.split(defaultWrPr).join(styledWrPr);
+    }
+
+    if (style?.bold) {
+      innerOmml = innerOmml
+        .replace(/<m:rPr><m:sty m:val="p"\/><\/m:rPr>/g, '<m:rPr><m:sty m:val="b"/></m:rPr>')
+        .replace(/<m:r><w:rPr>/g, '<m:r><m:rPr><m:sty m:val="bi"/></m:rPr><w:rPr>');
+    } else if (style?.italic) {
+      innerOmml = innerOmml.replace(
+        /<m:rPr><m:sty m:val="p"\/><\/m:rPr>/g,
+        '<m:rPr><m:sty m:val="i"/></m:rPr>'
+      );
     }
 
     const oMath = `<m:oMath>${innerOmml}</m:oMath>`;

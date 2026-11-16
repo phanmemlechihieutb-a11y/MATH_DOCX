@@ -162,6 +162,14 @@ function RenderSegments({
             );
           }
 
+          const mathStyleClass = [
+            isBold ? 'font-bold' : '',
+            seg.italic ? 'italic' : '',
+            seg.underline ? 'underline' : '',
+          ]
+            .filter(Boolean)
+            .join(' ');
+
           if (disableEquationInspect) {
             return (
               <span key={idx}>
@@ -171,7 +179,7 @@ function RenderSegments({
                     fontSize: `${segFontPt * scale}px`,
                     color: hex ? `#${hex}` : undefined,
                   }}
-                  className="inline-flex items-center px-[1px] align-baseline"
+                  className={`inline-flex items-center px-[1px] align-baseline ${mathStyleClass}`}
                 >
                   <MathRenderer latex={seg.content} displayMode={false} />
                 </span>
@@ -190,7 +198,7 @@ function RenderSegments({
                   fontSize: `${segFontPt * scale}px`,
                   color: hex ? `#${hex}` : undefined,
                 }}
-                className="inline-flex items-center px-[1px] rounded hover:bg-blue-50 hover:ring-1 hover:ring-blue-300 transition-colors align-baseline cursor-pointer"
+                className={`inline-flex items-center px-[1px] rounded hover:bg-blue-50 hover:ring-1 hover:ring-blue-300 transition-colors align-baseline cursor-pointer ${mathStyleClass}`}
               >
                 <MathRenderer latex={seg.content} displayMode={false} />
               </button>

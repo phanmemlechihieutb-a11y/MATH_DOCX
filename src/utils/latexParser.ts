@@ -4129,6 +4129,7 @@ function promoteSegmentNumbersAndSigns(
       content: cleaned,
       ...(style.bold ? { bold: true } : {}),
       ...(style.italic ? { italic: true } : {}),
+      ...(style.underline ? { underline: true } : {}),
       ...(style.font_size_pt ? { font_size_pt: style.font_size_pt } : {}),
       ...(style.color ? { color: style.color } : {}),
     });

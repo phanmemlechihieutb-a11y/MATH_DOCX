@@ -750,10 +750,69 @@ export function groupBlocksIntoVisualBands(
   return bands;
 }
 
+const NAMED_HEX_COLORS: Record<string, string> = {
+  red: 'DC2626',
+  crimson: 'DC143C',
+  darkred: '991B1B',
+  maroon: '800000',
+  blue: '2563EB',
+  darkblue: '1E3A8A',
+  navy: '1E3A8A',
+  royalblue: '1D4ED8',
+  dodgerblue: '1E90FF',
+  green: '16A34A',
+  darkgreen: '15803D',
+  forestgreen: '15803D',
+  emerald: '059669',
+  teal: '0D9488',
+  cyan: '0891B2',
+  orange: 'EA580C',
+  darkorange: 'C2410C',
+  amber: 'D97706',
+  gold: 'CA8A04',
+  yellow: 'CA8A04',
+  purple: '9333EA',
+  violet: '7C3AED',
+  indigo: '4338CA',
+  magenta: 'DB2777',
+  pink: 'EC4899',
+  brown: '92400E',
+  gray: '64748B',
+  grey: '64748B',
+  darkgray: '475569',
+  darkgrey: '475569',
+};
+
 export function normalizeHexColor(color?: string | null): string | null {
   if (!color || typeof color !== 'string') return null;
-  const cleaned = color.trim().replace(/^#/, '').toUpperCase();
+  const raw = color.trim();
+  if (!raw) return null;
+
+  const lower = raw.toLowerCase();
+  if (NAMED_HEX_COLORS[lower]) {
+    return NAMED_HEX_COLORS[lower];
+  }
+
+  const rgbMatch = lower.match(/^rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})/);
+  if (rgbMatch) {
+    const r = Math.max(0, Math.min(255, Number(rgbMatch[1])));
+    const g = Math.max(0, Math.min(255, Number(rgbMatch[2])));
+    const b = Math.max(0, Math.min(255, Number(rgbMatch[3])));
+    const hex = [r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('').toUpperCase();
+    if (hex === '000000' || hex === '0F172A' || hex === '111827') return null;
+    return hex;
+  }
+
+  const cleaned = raw.replace(/^#/, '').toUpperCase();
+  if (/^[0-9A-F]{3}$/.test(cleaned)) {
+    const expanded = cleaned
+      .split('')
+      .map((ch) => ch + ch)
+      .join('');
+    if (expanded === '000000') return null;
+    return expanded;
+  }
   if (!/^[0-9A-F]{6}$/.test(cleaned)) return null;
-  if (cleaned === '000000' || cleaned === '0F172A') return null;
+  if (cleaned === '000000' || cleaned === '0F172A' || cleaned === '111827') return null;
   return cleaned;
 }

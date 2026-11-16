@@ -6,17 +6,17 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 function encodeJpegWithCap(
   canvas: HTMLCanvasElement,
-  maxBytes = 1_800_000
+  maxBytes = 2_300_000
 ): string {
-  const qualities = [0.86, 0.78, 0.68, 0.56];
+  const qualities = [0.90, 0.82, 0.72, 0.60];
   for (const q of qualities) {
     const url = canvas.toDataURL('image/jpeg', q);
     if (url.length <= maxBytes) return url;
   }
-  return canvas.toDataURL('image/jpeg', 0.48);
+  return canvas.toDataURL('image/jpeg', 0.50);
 }
 
-function createOcrDataUrl(sourceCanvas: HTMLCanvasElement, maxDim = 1650): string {
+function createOcrDataUrl(sourceCanvas: HTMLCanvasElement, maxDim = 2000): string {
   const w = sourceCanvas.width;
   const h = sourceCanvas.height;
   if (w <= maxDim && h <= maxDim) {

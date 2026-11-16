@@ -57,7 +57,8 @@ const inlineSegmentSchema = {
     },
     color: {
       type: Type.STRING,
-      description: 'Optional 6-digit hex color like #1D4ED8 if not black.',
+      description:
+        '6-digit hex color like #DC2626 or #1D4ED8 whenever the text/symbol/math color in the PDF is NOT black/dark-gray. Omit for black text.',
     },
     tab_before: {
       type: Type.BOOLEAN,
@@ -184,16 +185,19 @@ Quy tắc bắt buộc:
    - BẮT BUỘC trả về box_2d=[ymin, xmin, ymax, xmax] trên thang chuẩn hóa 0..1000 cho MỌI khối (heading, paragraph, equation, table, figure, horizontal_rule).
    - Hệ thống dùng box_2d để tính chính xác lề trang, khoảng cách dọc giữa các đoạn, vị trí thụt lề ngang, độ rộng hình vẽ và bố cục đặt cạnh nhau (ví dụ: đề bài bên trái, hình vẽ bên phải).
 2. ĐỊNH DẠNG IN ĐẬM / IN NGHIÊNG / GẠCH CHÂN / CỠ CHỮ / MÀU SẮC (ĐÚNG 100% THEO TRANG PDF GỐC):
-   - Quan sát kỹ độ dày nét chữ (stroke weight) trên ảnh PDF: CHỈ đặt bold=true cho các từ/cụm từ THỰC SỰ IN ĐẬM (nét chữ dày đậm rõ rệt hơn văn bản thường).
-   - MỌI chữ có nét mảnh/bình thường trên PDF — kể cả tiêu đề phụ, dòng căn giữa, dòng cỡ chữ lớn hơn, chữ in nghiêng, ghi chú trong ngoặc, hàng tiêu đề bảng không in đậm, phần đề bài sau "Câu 1.", hoặc nội dung đáp án sau "A.", "B.", "C.", "D." — TUYỆT ĐỐI KHÔNG được gán bold=true (bắt buộc để bold=false hoặc bỏ qua thuộc tính bold).
-   - BẮT BUỘC tách thành các segment riêng mỗi khi đổi định dạng trên cùng một dòng! Ví dụ:
-     + "Câu 1. Cho hàm số..." -> segment 1 ("Câu 1. ", bold: true), segment 2 ("Cho hàm số...", bold: false). Không được gán bold=true cho cả câu.
+   - IN ĐẬM (bold): Quan sát thật kỹ độ dày nét chữ (stroke weight) trên ảnh PDF. CHỈ đặt bold=true cho các từ/cụm từ THỰC SỰ IN ĐẬM (nét chữ dày đậm rõ rệt hơn văn bản thường). MỌI chữ có nét mảnh/bình thường — kể cả tiêu đề phụ, dòng căn giữa, dòng cỡ chữ lớn hơn, chữ in nghiêng, ghi chú trong ngoặc, hàng tiêu đề bảng không in đậm, phần đề bài sau "Câu 1.", hoặc nội dung đáp án sau "A.", "B.", "C.", "D." — TUYỆT ĐỐI KHÔNG được gán bold=true (bắt buộc bỏ qua hoặc để bold=false).
+   - IN NGHIÊNG (italic): Quan sát kỹ độ nghiêng nét chữ trên ảnh PDF. BẮT BUỘC đặt italic=true cho MỌI từ/cụm từ/ghi chú/tiêu đề phụ/câu trích dẫn thực sự in nghiêng trên PDF (ví dụ: "(Đề gồm 04 trang)", "(Thí sinh không được sử dụng tài liệu)", "Hướng dẫn giải", "Chú ý:", chữ nghiêng xen giữa câu). Nếu chữ vừa đậm vừa nghiêng -> đặt CẢ bold=true và italic=true; nếu chỉ nghiêng nét mảnh -> CHỈ đặt italic=true, TUYỆT ĐỐI KHÔNG đặt bold=true.
+   - GẠCH CHÂN (underline): Đặt underline=true cho mọi chữ có đường gạch chân bên dưới.
+   - MÀU SẮC CHỮ (color): Quan sát kỹ màu mực thực tế của từng chữ, nhãn câu, tiêu đề, công thức và ô bảng trên PDF! Với chữ màu đen bình thường thì bỏ qua trường color. Với BẤT KỲ chữ/số/công thức nào có màu khác đen (đỏ, xanh dương, xanh lá, tím, cam, nâu, xám nhạt...): BẮT BUỘC gán đúng mã màu hex 6 ký tự dạng "#RRGGBB" (ví dụ: đỏ "#DC2626" hoặc "#FF0000", xanh dương "#1D4ED8" hoặc "#0000FF", xanh lá "#15803D", tím "#7C3AED", cam "#EA580C"). Không được bỏ sót chữ có màu!
+   - BẮT BUỘC tách thành các segment riêng NGAY TẠI ranh giới đổi định dạng (đổi đậm/thường, đứng/nghiêng, gạch chân, đổi màu, đổi cỡ chữ) trên cùng một dòng! Ví dụ:
+     + "Câu 1. Cho hàm số..." -> segment 1 ("Câu 1. ", bold: true, kèm color nếu Câu 1. có màu), segment 2 ("Cho hàm số...", bold: false).
      + "A. x = 2" -> nếu chỉ "A." in đậm thì tách segment 1 ("A. ", bold: true) và segment 2 (math "x = 2"); nếu "A." không in đậm thì KHÔNG gán bold=true.
      + Trong block heading hoặc ô bảng is_header=true: hệ thống KHÔNG tự động tô đậm. Chỉ segment nào thực sự in đậm trên PDF mới đặt bold=true; segment nét thường hoặc chỉ in nghiêng phải để bold=false.
-3. CĂN LỀ, THỤT ĐẦU DÒNG & BỐ CỤC NHIỀU CỘT:
-   - Nhận diện đúng alignment ('left', 'center', 'right', 'justify') cho từng khối và từng ô bảng.
-   - Ghi nhận first_line_indent_pt (số dương nếu thụt đầu dòng đoạn văn, số âm như -24 nếu thụt lề treo như "Câu 1. ..."), indent_left_pt nếu cả khối thụt vào so với lề trái chung, và line_spacing (ví dụ 1.15, 1.3).
-   - Khi nhiều phần tử nằm ngang hàng trên CÙNG MỘT DÒNG nhưng chia thành các cột rõ rệt (ví dụ: tiêu đề 2 cột "SỞ GD&ĐT... | ĐỀ THI...", hoặc hàng đáp án 4 cột "A. ...  B. ...  C. ...  D. ...", hoặc 2x2 đáp án), HÃY xuất thành block_type="table" với table_borderless=true, kèm width_pct và alignment cho từng ô để vị trí ngang khớp 100% với bản PDF.
+3. VỊ TRÍ CHỮ, CĂN LỀ, THỤT ĐẦU DÒNG & BỐ CỤC NHIỀU CỘT (CHÍNH XÁC 100%):
+   - Đo chính xác box_2d=[ymin, xmin, ymax, xmax] khớp vị trí thực của khối chữ trên trang PDF (không co giãn sai vị trí ngang/dọc) để bảo toàn khoảng cách dòng, thụt lề và bố cục đặt cạnh nhau.
+   - Nhận diện đúng alignment ('left', 'center', 'right', 'justify') cho từng khối và từng ô bảng đúng như vị trí trên trang PDF.
+   - Ghi nhận chính xác indent_left_pt (khi cả khối thụt vào so với lề trái trang), first_line_indent_pt (số dương khi dòng đầu thụt vào trong, số âm như -24 khi thụt lề treo như "Câu 1. ..."), font_size_pt và line_spacing (1.0, 1.15, 1.3...).
+   - Khi nhiều phần tử nằm ngang hàng trên CÙNG MỘT DÒNG nhưng ở các vị trí cột khác nhau (ví dụ: tiêu đề 2 cột "SỞ GD&ĐT... | ĐỀ THI...", ngày tháng/chữ ký bên phải, hoặc hàng đáp án 4 cột / 2x2), HÃY xuất thành block_type="table" với table_borderless=true, kèm width_pct và alignment cho từng ô để vị trí ngang các chữ khớp 100% với bản PDF.
    - Với đường kẻ ngang phân cách (như dưới tiêu đề đề thi), xuất block_type="horizontal_rule" kèm box_2d.
 4. CÔNG THỨC TOÁN, CHỮ SỐ, DẤU +/- & BẢNG BIỂU:
    - MỌI biểu thức toán học, ký hiệu biến số, phân số, căn thức, tích phân, giới hạn, ma trận, hệ phương trình PHẢI tách thành segment type="math" (nếu nằm cùng dòng với chữ) hoặc block_type="equation" (nếu đứng riêng một dòng độc lập, giữ đúng alignment của công thức). Luôn xuất mã LaTeX chuẩn xác, KHÔNG bọc bằng $, $$, \\[ \\] hay \\( \\).
@@ -275,7 +279,7 @@ async function generateOcrWithModelFallback(
                 },
               },
               {
-                text: `Hãy trích xuất toàn bộ nội dung trang ${pageNumber} theo đúng schema JSON, tách chuẩn công thức LaTeX, tọa độ hình vẽ và giữ chính xác tuyệt đối định dạng in đậm/in nghiêng/chữ thường theo bản PDF gốc (chỗ nào không in đậm tuyệt đối không đánh dấu bold=true).`,
+                text: `Hãy trích xuất toàn bộ nội dung trang ${pageNumber} theo đúng schema JSON, tách chuẩn công thức LaTeX, tọa độ vị trí box_2d chính xác, và giữ đúng 100% định dạng in đậm (bold), in nghiêng (italic), gạch chân (underline), màu chữ (#RRGGBB) và căn lề/thụt lề theo đúng trang PDF gốc.`,
               },
             ],
           },
@@ -381,7 +385,7 @@ export async function handleOcrPage(req: RequestWithOptionalBody, res: ServerRes
       mimeType,
       base64Data,
       pageNumber ?? 1,
-      speedMode === 'accurate' ? 'accurate' : 'fast'
+      speedMode === 'fast' ? 'fast' : 'accurate'
     );
 
     const rawJson = (response.text ?? '{"blocks":[]}').trim();
