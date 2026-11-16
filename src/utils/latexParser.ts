@@ -242,6 +242,8 @@ function stripLatexComments(raw: string): string {
     }
   );
 
+  const hasDocClassOrBegin = /\\(?:documentclass|usepackage|begin\{document\})/.test(raw);
+
   const lines = protectedRaw.split('\n');
   const cleanedLines = lines.map((line) => {
     for (let i = 0; i < line.length; i++) {
@@ -250,6 +252,16 @@ function stripLatexComments(raw: string): string {
         continue;
       }
       if (line[i] === '%') {
+        if (
+          !hasDocClassOrBegin &&
+          i > 0 &&
+          /\d/.test(line[i - 1]) &&
+          !/\\(?:def|gdef|edef|xdef|newcommand|renewcommand|pgfmath|draw|fill|path|node|coordinate|foreach|clip|pic)\b/.test(
+            line.slice(0, i)
+          )
+        ) {
+          continue;
+        }
         return line.slice(0, i);
       }
     }
@@ -357,6 +369,516 @@ function cleanMetaValue(raw: string | undefined, isVietnamese: boolean): string 
   s = s.replace(/\\inst\{[^}]*\}/g, '');
   s = s.replace(/\\orcidlink\{[^}]*\}/g, '');
   return s.trim() || undefined;
+}
+
+function unescapeChatGptMathInner(inner: string, isSingleLineInline = false): string {
+  let out = inner
+    .replace(/\\\\\\\\/g, '\\\\')
+    .replace(/\\\\([,;:!{}|_])/g, '\\$1');
+  if (isSingleLineInline && !/\\begin\{/.test(out)) {
+    out = out.replace(/\\\\(?=[ \t])/g, '\\');
+  }
+  return out;
+}
+
+function escapeLatexTextLiteral(text: string): string {
+  const map: Record<string, string> = {
+    '\\': '\\textbackslash{}',
+    '{': '\\{',
+    '}': '\\}',
+    '%': '\\%',
+    '$': '\\$',
+    '&': '\\&',
+    _: '\\_',
+    '#': '\\#',
+    '~': '\\textasciitilde{}',
+    '^': '\\textasciicircum{}',
+  };
+  return text.replace(/[\\{}%$&_#~^]/g, (ch) => map[ch] ?? ch);
+}
+
+function isTexLineBreakSpacingAfterDoubleBackslash(src: string, bracketIdx: number): boolean {
+  return /^\s*-?\d+(?:\.\d+)?\s*(?:pt|cm|mm|em|ex|in|pc|bp|dd|cc|sp|px|\\baselineskip|\\linewidth)\s*\]/.test(
+    src.slice(bracketIdx + 1)
+  );
+}
+
+function normalizeChatGptAndMarkdownBody(input: string): string {
+  if (!input) return input;
+
+  const protStore: string[] = [];
+  const codeStore: string[] = [];
+  const mathStore: string[] = [];
+  const starStore: string[] = [];
+
+  const pushProt = (val: string) => {
+    const tok = `\x00MDPROT_${protStore.length}\x00`;
+    protStore.push(val);
+    return tok;
+  };
+  const pushCode = (val: string) => {
+    const tok = `\x00MDCODE_${codeStore.length}\x00`;
+    codeStore.push(val);
+    return tok;
+  };
+  const pushMath = (val: string) => {
+    const tok = `\x00MDMATH_${mathStore.length}\x00`;
+    mathStore.push(val);
+    return tok;
+  };
+  const pushStar = (val: string) => {
+    const tok = `\x00MDSTAR_${starStore.length}\x00`;
+    starStore.push(val);
+    return tok;
+  };
+
+  // 1. Handle fenced code blocks (unwrap ```latex / ```tex / ```markdown, protect others as verbatim)
+  let s = input.replace(
+    /^[ \t]*```([a-zA-Z0-9_-]*)[ \t]*\n([\s\S]*?)^[ \t]*```[ \t]*$/gm,
+    (_full, langRaw: string, codeBody: string) => {
+      const lang = langRaw.trim().toLowerCase();
+      if (lang === 'latex' || lang === 'tex' || lang === 'markdown' || lang === 'md') {
+        return codeBody;
+      }
+      const trimmed = codeBody.replace(/\n+$/, '');
+      return pushProt(`\\begin{verbatim}\n${trimmed}\n\\end{verbatim}`);
+    }
+  );
+
+  // 2. Protect verbatim / picture / tabular environments cleanly
+  const protectedEnvNames = new Set([
+    'verbatim',
+    'verbatim*',
+    'lstlisting',
+    'minted',
+    'tikzpicture',
+    'pgfpicture',
+    'picture',
+    'axis',
+    'circuitikz',
+    'tabular',
+    'tabular*',
+    'tabularx',
+    'longtable',
+  ]);
+
+  {
+    let out = '';
+    let cursor = 0;
+    let i = 0;
+    while (i < s.length) {
+      if (s[i] === '\\') {
+        const rest = s.slice(i);
+        const envM = rest.match(/^\\begin\{([^}]+)\}/);
+        if (envM && protectedEnvNames.has(envM[1].trim())) {
+          const envName = envM[1].trim();
+          const closeTok = `\\end{${envName}}`;
+          const endIdx = findMatchingEnvEnd(s, envName, i + envM[0].length);
+          if (endIdx !== -1) {
+            out += s.slice(cursor, i);
+            out += pushProt(s.slice(i, endIdx + closeTok.length));
+            i = endIdx + closeTok.length;
+            cursor = i;
+            continue;
+          }
+        }
+        const verbM = rest.match(/^\\(?:verb\*?|lstinline(?:\[[^\]]*\])?)(.)/);
+        if (verbM) {
+          const delim = verbM[1];
+          const closeIdx = s.indexOf(delim, i + verbM[0].length);
+          if (closeIdx !== -1 && !s.slice(i, closeIdx).includes('\n')) {
+            out += s.slice(cursor, i);
+            out += pushProt(s.slice(i, closeIdx + 1));
+            i = closeIdx + 1;
+            cursor = i;
+            continue;
+          }
+        }
+        const tikzM = rest.match(/^\\tikz(?![a-zA-Z])/);
+        if (tikzM) {
+          let p = i + tikzM[0].length;
+          while (p < s.length && /[ \t]/.test(s[p])) p++;
+          if (s[p] === '[') {
+            const brk = readBalancedBrackets(s, p);
+            if (brk) {
+              p = brk.endIdx + 1;
+              while (p < s.length && /[ \t]/.test(s[p])) p++;
+            }
+          }
+          if (s[p] === '{') {
+            const br = readBalancedBraces(s, p);
+            if (br) {
+              out += s.slice(cursor, i);
+              out += pushProt(s.slice(i, br.endIdx + 1));
+              i = br.endIdx + 1;
+              cursor = i;
+              continue;
+            }
+          }
+        }
+        const urlM = rest.match(/^\\url\s*\{/);
+        if (urlM) {
+          const br = readBalancedBraces(s, i + urlM[0].length - 1);
+          if (br) {
+            out += s.slice(cursor, i);
+            out += pushProt(s.slice(i, br.endIdx + 1));
+            i = br.endIdx + 1;
+            cursor = i;
+            continue;
+          }
+        }
+        const hrefM = rest.match(/^\\href\s*\{/);
+        if (hrefM) {
+          const br = readBalancedBraces(s, i + hrefM[0].length - 1);
+          if (br) {
+            out += s.slice(cursor, i + hrefM[0].length - 1);
+            out += `{${pushProt(br.content)}}`;
+            i = br.endIdx + 1;
+            cursor = i;
+            continue;
+          }
+        }
+      }
+      i++;
+    }
+    out += s.slice(cursor);
+    s = out;
+  }
+
+  // Protect bare http/https URLs outside LaTeX commands
+  s = s.replace(/https?:\/\/[^\s<>()]+/g, (url) => pushProt(url));
+
+  // 3. Protect inline code `...` before math scanning
+  s = s.replace(/(?<!\\)`([^`\n]+)`/g, (_full, inner: string) =>
+    pushCode(`\\texttt{${escapeLatexTextLiteral(inner)}}`)
+  );
+
+  // 4. Unescape double-escaped ChatGPT math delimiters & math spacing, and protect ALL math spans
+  {
+    let out = '';
+    let i = 0;
+    while (i < s.length) {
+      if (s[i] === '\\' && s[i + 1] === '$') {
+        out += '\\$';
+        i += 2;
+        continue;
+      }
+
+      // Double-escaped display math \\[ ... \\]
+      if (
+        s.slice(i, i + 3) === '\\\\[' &&
+        !isTexLineBreakSpacingAfterDoubleBackslash(s, i + 2)
+      ) {
+        const closeIdx = s.indexOf('\\\\]', i + 3);
+        if (closeIdx !== -1) {
+          const nextOpen = s.indexOf('\\\\[', i + 3);
+          if (nextOpen === -1 || nextOpen > closeIdx) {
+            const inner = s.slice(i + 3, closeIdx);
+            out += pushMath(`\\[${unescapeChatGptMathInner(inner, false)}\\]`);
+            i = closeIdx + 3;
+            continue;
+          }
+        }
+      }
+
+      // Single-escaped display math \[ ... \]
+      if (s[i] === '\\' && s[i + 1] === '[' && (i === 0 || s[i - 1] !== '\\')) {
+        const closeIdx = s.indexOf('\\]', i + 2);
+        if (closeIdx !== -1) {
+          const inner = s.slice(i + 2, closeIdx);
+          out += pushMath(`\\[${unescapeChatGptMathInner(inner, false)}\\]`);
+          i = closeIdx + 2;
+          continue;
+        }
+      }
+
+      // Double-escaped inline math \\( ... \\)
+      if (s.slice(i, i + 3) === '\\\\(') {
+        const closeIdx = s.indexOf('\\\\)', i + 3);
+        if (closeIdx !== -1 && !/\n[ \t]*\n/.test(s.slice(i + 3, closeIdx))) {
+          const inner = s.slice(i + 3, closeIdx);
+          const isSingleLine = !inner.includes('\n');
+          out += pushMath(`\\(${unescapeChatGptMathInner(inner, isSingleLine)}\\)`);
+          i = closeIdx + 3;
+          continue;
+        }
+      }
+
+      // Single-escaped inline math \( ... \)
+      if (s[i] === '\\' && s[i + 1] === '(' && (i === 0 || s[i - 1] !== '\\')) {
+        const closeIdx = s.indexOf('\\)', i + 2);
+        if (closeIdx !== -1 && !/\n[ \t]*\n/.test(s.slice(i + 2, closeIdx))) {
+          const inner = s.slice(i + 2, closeIdx);
+          const isSingleLine = !inner.includes('\n');
+          out += pushMath(`\\(${unescapeChatGptMathInner(inner, isSingleLine)}\\)`);
+          i = closeIdx + 2;
+          continue;
+        }
+      }
+
+      // Display math environments (\begin{equation}...\end{equation}, align, cases, etc.)
+      if (s[i] === '\\') {
+        const envM = s.slice(i).match(/^\\begin\{([^}]+)\}/);
+        if (envM && DISPLAY_MATH_ENVS.has(envM[1].trim())) {
+          const envName = envM[1].trim();
+          const closeTok = `\\end{${envName}}`;
+          const endIdx = findMatchingEnvEnd(s, envName, i + envM[0].length);
+          if (endIdx !== -1) {
+            const fullEnv = s.slice(i, endIdx + closeTok.length);
+            out += pushMath(unescapeChatGptMathInner(fullEnv, false));
+            i = endIdx + closeTok.length;
+            continue;
+          }
+        }
+      }
+
+      // $$...$$
+      if (s[i] === '$' && s[i + 1] === '$') {
+        const closeIdx = s.indexOf('$$', i + 2);
+        if (closeIdx !== -1) {
+          const inner = s.slice(i + 2, closeIdx);
+          out += pushMath(`$$${unescapeChatGptMathInner(inner, false)}$$`);
+          i = closeIdx + 2;
+          continue;
+        }
+      }
+
+      // $...$
+      if (s[i] === '$' && s[i + 1] !== '$') {
+        let braceDepth = 0;
+        let closeIdx = -1;
+        for (let j = i + 1; j < s.length; j++) {
+          if (s[j] === '\\' && j + 1 < s.length) {
+            j++;
+            continue;
+          }
+          if (s[j] === '{') {
+            braceDepth++;
+            continue;
+          }
+          if (s[j] === '}') {
+            braceDepth = Math.max(0, braceDepth - 1);
+            continue;
+          }
+          if (s[j] === '\n' && /^[ \t]*\n/.test(s.slice(j + 1))) {
+            break;
+          }
+          if (s[j] === '$' && s[j + 1] !== '$' && braceDepth === 0) {
+            closeIdx = j;
+            break;
+          }
+        }
+        if (closeIdx !== -1) {
+          const inner = s.slice(i + 1, closeIdx);
+          const isSingleLine = !inner.includes('\n');
+          out += pushMath(`$${unescapeChatGptMathInner(inner, isSingleLine)}$`);
+          i = closeIdx + 1;
+          continue;
+        }
+      }
+
+      out += s[i];
+      i++;
+    }
+    s = out;
+  }
+
+  // 5. Protect LaTeX starred commands (\section*, \hspace*, etc.) & escaped \* before Markdown * parsing
+  s = s.replace(/\\[a-zA-Z]+\*/g, (m) => pushStar(m));
+  s = s.replace(/\\\*/g, () => pushStar('*'));
+  s = s.replace(/(?<=\d)\\\.(?=\s|$|\*)/g, '.');
+  s = s.replace(/(^|[ \t])\\-(?=[ \t]|$)/gm, '$1-');
+
+  const convertInlineMd = (line: string): string => {
+    let t = line;
+    t = t.replace(/\*\*\*(?=\S)([^\n]*?\S|\S)\*\*\*/g, '\\textbf{\\textit{$1}}');
+    t = t.replace(/\*\*(?=\S)([^\n]*?\S|\S)\*\*/g, '\\textbf{$1}');
+    t = t.replace(/(?<![\p{L}\p{N}_\\])__(?=\S)([^\n]*?\S|\S)__(?![\p{L}\p{N}_])/gu, '\\textbf{$1}');
+    t = t.replace(/(?<!\*)\*(?!\*)(?=\S)([^\n*]*?\S|\S)\*(?!\*)/g, '\\textit{$1}');
+    t = t.replace(/(?<![\p{L}\p{N}_\\])_(?=\S)([^\n_]*?\S|\S)_(?![\p{L}\p{N}_])/gu, '\\textit{$1}');
+    t = t.replace(/~~(?=\S)([^\n]*?\S|\S)~~/g, '\\sout{$1}');
+    return t;
+  };
+
+  // 6. Block-level Markdown conversion line by line
+  const lines = s.split('\n');
+  const outLines: string[] = [];
+  const hrRe = /^[ \t]*(?:-[ \t]*-[ \t]*-[-\t ]*|\*[ \t]*\*[ \t]*\*[*\t ]*|_[ \t]*_[ \t]*_[_\t ]*)$/;
+  const mdSepRe = /^[ \t]*\|?(?:\s*:?-{2,}:?\s*\|)+\s*(?::?-{2,}:?\s*\|?)?[ \t]*$/;
+  const headingRe = /^[ \t]*(#{1,6})[ \t]+(.+?)(?:[ \t]+#+)?[ \t]*$/;
+
+  const parseMdTableRow = (rowLine: string): string[] => {
+    let trimmed = rowLine.trim();
+    if (trimmed.startsWith('|')) trimmed = trimmed.slice(1);
+    if (trimmed.endsWith('|') && !trimmed.endsWith('\\|')) trimmed = trimmed.slice(0, -1);
+    return trimmed.split('|').map((cell) =>
+      convertInlineMd(cell.trim()).replace(/(?<!\\)&/g, '\\&')
+    );
+  };
+
+  const isBulletStart = (line: string): boolean => {
+    if (hrRe.test(line)) return false;
+    if (/^[ \t]*[*+][ \t]+\S/.test(line)) return true;
+    // Allow "- item" bullet if not a bare negative number like "- 5" or isolated "- \x00MDMATH"
+    const dashM = line.match(/^[ \t]*-[ \t]+(.+)$/);
+    if (!dashM) return false;
+    const rhs = dashM[1].trim();
+    if (/^\d/.test(rhs)) return false;
+    return true;
+  };
+
+  let li = 0;
+  while (li < lines.length) {
+    const line = lines[li];
+
+    // ATX Headings (#, ##, ###, ####...)
+    const hm = line.match(headingRe);
+    if (hm) {
+      const level = hm[1].length;
+      let titleText = hm[2].trim();
+      // Strip redundant outer **...** on headings since headings already render bold
+      if (/^\*\*[^*][\s\S]*\*\*$/.test(titleText) && titleText.slice(2, -2).indexOf('**') === -1) {
+        titleText = titleText.slice(2, -2).trim();
+      }
+      titleText = convertInlineMd(titleText);
+      const cmd =
+        level === 1
+          ? '\\section*'
+          : level === 2
+          ? '\\subsection*'
+          : level === 3
+          ? '\\subsubsection*'
+          : '\\paragraph*';
+      outLines.push(`${cmd}{${titleText}}`);
+      li++;
+      continue;
+    }
+
+    // Horizontal rules (---, ***, ___)
+    if (hrRe.test(line)) {
+      outLines.push('---');
+      li++;
+      continue;
+    }
+
+    // Markdown pipe tables
+    if (
+      line.includes('|') &&
+      li + 1 < lines.length &&
+      mdSepRe.test(lines[li + 1])
+    ) {
+      const headerCells = parseMdTableRow(line);
+      const sepRaw = lines[li + 1].trim().replace(/^\|/, '').replace(/\|$/, '');
+      const sepParts = sepRaw.split('|').map((p) => p.trim());
+      const colCount = Math.max(headerCells.length, sepParts.length);
+      const colAligns: string[] = [];
+      for (let c = 0; c < colCount; c++) {
+        const sp = sepParts[c] ?? '';
+        if (sp.startsWith(':') && sp.endsWith(':')) colAligns.push('c');
+        else if (sp.endsWith(':')) colAligns.push('r');
+        else colAligns.push('l');
+      }
+
+      const bodyRows: string[][] = [];
+      let rj = li + 2;
+      while (rj < lines.length) {
+        const rLine = lines[rj];
+        if (!rLine.trim() || !rLine.includes('|') || hrRe.test(rLine) || headingRe.test(rLine)) {
+          break;
+        }
+        bodyRows.push(parseMdTableRow(rLine));
+        rj++;
+      }
+
+      const padRow = (cells: string[]) => {
+        const padded = [...cells];
+        while (padded.length < colCount) padded.push('');
+        return padded.slice(0, colCount).join(' & ');
+      };
+
+      const tabularLines = [
+        `\\begin{tabular}{|${colAligns.join('|')}|}`,
+        '\\hline',
+        `${padRow(headerCells)} \\\\`,
+        '\\hline',
+        ...bodyRows.map((row) => `${padRow(row)} \\\\`),
+        '\\hline',
+        '\\end{tabular}',
+      ];
+      outLines.push(tabularLines.join('\n'));
+      li = rj;
+      continue;
+    }
+
+    // Markdown blockquotes (> ...)
+    if (/^[ \t]*>[ \t]?/.test(line)) {
+      const quoteLines: string[] = [];
+      while (li < lines.length && /^[ \t]*>[ \t]?/.test(lines[li])) {
+        const qInner = lines[li].replace(/^[ \t]*>[ \t]?/, '');
+        const qHm = qInner.match(headingRe);
+        if (qHm) {
+          let qTitle = qHm[2].trim();
+          if (/^\*\*[^*][\s\S]*\*\*$/.test(qTitle) && qTitle.slice(2, -2).indexOf('**') === -1) {
+            qTitle = qTitle.slice(2, -2).trim();
+          }
+          const qCmd =
+            qHm[1].length === 1
+              ? '\\section*'
+              : qHm[1].length === 2
+              ? '\\subsection*'
+              : qHm[1].length === 3
+              ? '\\subsubsection*'
+              : '\\paragraph*';
+          quoteLines.push(`${qCmd}{${convertInlineMd(qTitle)}}`);
+        } else {
+          quoteLines.push(convertInlineMd(qInner));
+        }
+        li++;
+      }
+      outLines.push(`\\begin{quote}\n${quoteLines.join('\n')}\n\\end{quote}`);
+      continue;
+    }
+
+    // Markdown bullet lists (* item, + item, or 2+ / prose - item)
+    if (isBulletStart(line)) {
+      const isStarOrPlus = /^[ \t]*[*+][ \t]+/.test(line);
+      const nextIsBullet = li + 1 < lines.length && isBulletStart(lines[li + 1]);
+      const rhsAfterDash = line.replace(/^[ \t]*-[ \t]+/, '').trim();
+      const dashStartsWithProse =
+        !rhsAfterDash.startsWith('\x00MDMATH_') && !/^[A-D][\.\)]\s/.test(rhsAfterDash);
+      if (isStarOrPlus || nextIsBullet || dashStartsWithProse) {
+        const items: string[] = [];
+        while (li < lines.length && isBulletStart(lines[li])) {
+          const itemText = lines[li].replace(/^[ \t]*[-*+][ \t]+/, '').trim();
+          items.push(`\\item ${convertInlineMd(itemText)}`);
+          li++;
+        }
+        outLines.push(`\\begin{itemize}\n${items.join('\n')}\n\\end{itemize}`);
+        continue;
+      }
+    }
+
+    outLines.push(convertInlineMd(line));
+    li++;
+  }
+
+  s = outLines.join('\n');
+
+  // 7. Restore tokens in reverse order
+  for (let idx = starStore.length - 1; idx >= 0; idx--) {
+    s = s.replace(`\x00MDSTAR_${idx}\x00`, () => starStore[idx]);
+  }
+  for (let idx = mathStore.length - 1; idx >= 0; idx--) {
+    s = s.replace(`\x00MDMATH_${idx}\x00`, () => mathStore[idx]);
+  }
+  for (let idx = codeStore.length - 1; idx >= 0; idx--) {
+    s = s.replace(`\x00MDCODE_${idx}\x00`, () => codeStore[idx]);
+  }
+  for (let idx = protStore.length - 1; idx >= 0; idx--) {
+    s = s.replace(`\x00MDPROT_${idx}\x00`, () => protStore[idx]);
+  }
+
+  return s;
 }
 
 function preprocessDocumentAndMacros(raw: string): {
@@ -1299,6 +1821,8 @@ function preprocessDocumentAndMacros(raw: string): {
       normalized
     ) ||
     Object.keys(customTheorems).some((env) => normalized.includes(`\\begin{${env}}`));
+
+  body = normalizeChatGptAndMarkdownBody(body);
 
   return {
     body,
@@ -2381,6 +2905,8 @@ function applyQuestionLabelBold(segments: InlineSegment[]): InlineSegment[] {
 
 function isPureBareLatexLine(trimmed: string): boolean {
   if (!trimmed || trimmed.includes('$')) return false;
+  if (trimmed.includes('\\(') || trimmed.includes('\\[')) return false;
+  if (/^(?:[A-D]\.|[a-d]\))(?:\s|$)/.test(trimmed)) return false;
   if (/#[1-9]/.test(trimmed)) return false;
   if (
     /\\(?:textbf|textit|emph|underline|textcolor|makebox|framebox|parbox|fbox|dotfill|hrulefill|noindent|centering|label|ref|eqref|cite|footnote|includegraphics|url|href|verb|section|subsection|paragraph|count\d*|loop|ifnum|advance|repeat|newcount|par|hfill|vfill)(?![a-zA-Z])/.test(
@@ -2520,7 +3046,7 @@ function tryParseInlineChoiceRow(
       if (braceDepth === 0) {
         const atBoundary = i === 0 || /\s/.test(normalizedLine[i - 1]);
         if (atBoundary) {
-          const m = normalizedLine.slice(i).match(/^([A-D]\.|[a-d]\))(?:\s+|(?=\$))/);
+          const m = normalizedLine.slice(i).match(/^([A-D]\.|[a-d]\))(?:\s+|(?=\$|\\[\(\[]))/);
           if (m) {
             matches.push({
               index: i + m[0].length,
@@ -2838,14 +3364,43 @@ function stripLeadingInlineCommands(line: string): string {
   while (s !== prev && guard < 8) {
     prev = s;
     guard++;
+    const styleCmdM = s.match(
+      /^\\(?:textbf|textit|emph|underline|text|mbox|hbox|centerline|makebox|framebox)(?:\[[^\]]*\])?\s*\{/
+    );
+    if (styleCmdM) {
+      const br = readBalancedBraces(s, styleCmdM[0].length - 1);
+      if (br) {
+        const restAfter = s.slice(br.endIdx + 1);
+        const sep = !restAfter || /^[\s.,;:!?)]/.test(restAfter) ? '' : ' ';
+        s = `${br.content}${sep}${restAfter}`.trim();
+        continue;
+      }
+    }
+    const tcM = s.match(/^\\textcolor\s*\{[^}]*\}\s*\{/);
+    if (tcM) {
+      const br = readBalancedBraces(s, tcM[0].length - 1);
+      if (br) {
+        const restAfter = s.slice(br.endIdx + 1);
+        const sep = !restAfter || /^[\s.,;:!?)]/.test(restAfter) ? '' : ' ';
+        s = `${br.content}${sep}${restAfter}`.trim();
+        continue;
+      }
+    }
     s = s
       .replace(/^\\(?:noindent|indent|centering|raggedright|raggedleft|par)(?![a-zA-Z])\s*/, '')
       .replace(/^\{\s*\\(?:bf|bfseries|it|itshape|em|large|Large|LARGE|normalsize)\b\s*/, '')
-      .replace(/^\\(?:textbf|textit|emph|underline|text|mbox|centerline)\s*\{/, '')
-      .replace(/^\\textcolor\s*\{[^}]*\}\s*\{/, '')
       .trim();
   }
   return s;
+}
+
+function normalizeChoiceMarkerLine(line: string): string {
+  return line
+    .trim()
+    .replace(/^\\textbf\s*\{\s*([A-D]\.|[a-d]\))\s*\}/, '$1')
+    .replace(/^\\textbf\s*\{\s*([A-D]|[a-d])\s*\}\s*([.\)])/, '$1$2')
+    .replace(/^\{\s*\\(?:bf|bfseries)\s+([A-D]\.|[a-d]\))\s*\}/, '$1')
+    .trim();
 }
 
 function isLineBreakBoundary(prevLine: string, nextLine: string): boolean {
@@ -3455,13 +4010,13 @@ function parseBodyBlocks(
 
       if (
         pIdx + 3 < mergedParagraphs.length &&
-        /^A[\.\)]\s+/.test(mergedParagraphs[pIdx]) &&
-        /^B[\.\)]\s+/.test(mergedParagraphs[pIdx + 1]) &&
-        /^C[\.\)]\s+/.test(mergedParagraphs[pIdx + 2]) &&
-        /^D[\.\)]\s+/.test(mergedParagraphs[pIdx + 3])
+        /^A[\.\)](?:\s+|(?=\$|\\[\(\[]))/.test(normalizeChoiceMarkerLine(mergedParagraphs[pIdx])) &&
+        /^B[\.\)](?:\s+|(?=\$|\\[\(\[]))/.test(normalizeChoiceMarkerLine(mergedParagraphs[pIdx + 1])) &&
+        /^C[\.\)](?:\s+|(?=\$|\\[\(\[]))/.test(normalizeChoiceMarkerLine(mergedParagraphs[pIdx + 2])) &&
+        /^D[\.\)](?:\s+|(?=\$|\\[\(\[]))/.test(normalizeChoiceMarkerLine(mergedParagraphs[pIdx + 3]))
       ) {
         const cells: TableCellData[] = [0, 1, 2, 3].map((offset) => {
-          const optText = mergedParagraphs[pIdx + offset];
+          const optText = normalizeChoiceMarkerLine(mergedParagraphs[pIdx + offset]);
           const lm = optText.match(/^([A-D][\.\)])\s*([\s\S]*)$/);
           const segs: InlineSegment[] = lm
             ? [
@@ -4772,6 +5327,26 @@ export function splitTextPreservingInlineMath(
       textBuf += '$';
       i += 2;
       continue;
+    }
+
+    if (normalizedInput.slice(i, i + 3) === '\\\\(') {
+      const closeIdx = normalizedInput.indexOf('\\\\)', i + 3);
+      if (closeIdx !== -1) {
+        flushText();
+        pushMath(unescapeChatGptMathInner(normalizedInput.slice(i + 3, closeIdx), true));
+        i = closeIdx + 3;
+        continue;
+      }
+    }
+
+    if (normalizedInput.slice(i, i + 3) === '\\\\[') {
+      const closeIdx = normalizedInput.indexOf('\\\\]', i + 3);
+      if (closeIdx !== -1) {
+        flushText();
+        pushMath(unescapeChatGptMathInner(normalizedInput.slice(i + 3, closeIdx), false));
+        i = closeIdx + 3;
+        continue;
+      }
     }
 
     if (normalizedInput[i] === '\\' && normalizedInput[i + 1] === '(') {

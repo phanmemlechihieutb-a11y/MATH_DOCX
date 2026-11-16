@@ -701,19 +701,26 @@ export function generateSampleMathWorksheet(): RenderedPage {
   ctx.lineTo(gx + 7, 612);
   ctx.stroke();
 
-  // Parabola y = (x-1)^2 - 1 scaled
+  // Parabola y = (x - 0.8)^2 - 0.8 strictly bounded within the Oxy axes
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(365, 624, 505, 344);
+  ctx.clip();
   ctx.strokeStyle = '#1d4ed8';
   ctx.lineWidth = 3;
   ctx.beginPath();
-  for (let px = -140; px <= 210; px += 2) {
+  const minPx = -69;
+  const maxPx = 181;
+  for (let px = minPx; px <= maxPx; px += 2) {
     const xVal = px / 70;
     const yVal = (xVal - 0.8) * (xVal - 0.8) - 0.8;
     const screenX = gx + px;
     const screenY = gy - yVal * 90;
-    if (px === -140) ctx.moveTo(screenX, screenY);
+    if (px === minPx) ctx.moveTo(screenX, screenY);
     else ctx.lineTo(screenX, screenY);
   }
   ctx.stroke();
+  ctx.restore();
 
   ctx.fillStyle = '#0f172a';
   ctx.font = 'italic 22px "Times New Roman", serif';
