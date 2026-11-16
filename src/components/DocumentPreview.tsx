@@ -1,4 +1,4 @@
-import { useEffect, useState, type CSSProperties } from 'react';
+import { useEffect, useState, type CSSProperties, type MouseEvent } from 'react';
 import {
   AlignCenter,
   AlignJustify,
@@ -64,6 +64,14 @@ interface DocumentPreviewProps {
     kind: 'paragraph' | 'heading' | 'equation'
   ) => void;
   onMoveBlock?: (pageNumber: number, blockIndex: number, direction: -1 | 1) => void;
+  onCtrlDoubleClickBlock?: (info: {
+    pageNumber: number;
+    blockIndex: number;
+    block: DocumentBlock;
+    clickedText: string;
+    clickedMathLatex?: string;
+    blockRenderedText: string;
+  }) => void;
 }
 
 const ALIGN_CLASS_MAP: Record<DocumentBlock['alignment'], string> = {
@@ -132,6 +140,7 @@ function RenderSegments({
                 <span key={idx}>
                   {tabPrefix}
                   <span
+                    data-math-latex={seg.content}
                     style={{
                       fontSize: `${segFontPt * scale * 0.92}px`,
                       color: hex ? `#${hex}` : undefined,
@@ -148,7 +157,11 @@ function RenderSegments({
                 {tabPrefix}
                 <button
                   type="button"
-                  onClick={() => onSelectEquation?.(seg.content, false)}
+                  data-math-latex={seg.content}
+                  onClick={(e) => {
+                    if (e.ctrlKey || e.metaKey) return;
+                    onSelectEquation?.(seg.content, false);
+                  }}
                   title="Công thức Toggle TeX bọc ${...}$ — nhấn để xem chi tiết"
                   style={{
                     fontSize: `${segFontPt * scale * 0.92}px`,
@@ -175,6 +188,7 @@ function RenderSegments({
               <span key={idx}>
                 {tabPrefix}
                 <span
+                  data-math-latex={seg.content}
                   style={{
                     fontSize: `${segFontPt * scale}px`,
                     color: hex ? `#${hex}` : undefined,
@@ -192,7 +206,11 @@ function RenderSegments({
               {tabPrefix}
               <button
                 type="button"
-                onClick={() => onSelectEquation?.(seg.content, false)}
+                data-math-latex={seg.content}
+                onClick={(e) => {
+                  if (e.ctrlKey || e.metaKey) return;
+                  onSelectEquation?.(seg.content, false);
+                }}
                 title="Nhấn để xem mã LaTeX và XML OMML"
                 style={{
                   fontSize: `${segFontPt * scale}px`,
@@ -1075,6 +1093,7 @@ function RenderSingleBlock({
       const latexText = '${' + cleanLatexDelimiters(blk.latex) + '}$';
       return (
         <div
+          data-math-latex={cleanLatexDelimiters(blk.latex)}
           style={{
             marginTop: `${spaceBeforePt * scale}px`,
             paddingLeft:
@@ -1092,7 +1111,11 @@ function RenderSingleBlock({
           ) : (
             <button
               type="button"
-              onClick={() => onSelectEquation?.(blk.latex ?? '', true)}
+              data-math-latex={cleanLatexDelimiters(blk.latex)}
+              onClick={(e) => {
+                if (e.ctrlKey || e.metaKey) return;
+                onSelectEquation?.(blk.latex ?? '', true);
+              }}
               title="Công thức Toggle TeX bọc ${...}$ — nhấn để xem chi tiết"
               className="font-mono px-2 py-1 rounded-md bg-amber-50 text-slate-900 border border-amber-200/80 hover:bg-amber-100/80 transition-colors cursor-pointer"
             >
@@ -1104,6 +1127,7 @@ function RenderSingleBlock({
     }
     return (
       <div
+        data-math-latex={cleanLatexDelimiters(blk.latex)}
         style={{
           marginTop: `${spaceBeforePt * scale}px`,
           paddingLeft: eqAlign === 'center' || indentLeftPt <= 0 ? undefined : `${indentLeftPt * scale}px`,
@@ -1119,7 +1143,11 @@ function RenderSingleBlock({
         ) : (
           <button
             type="button"
-            onClick={() => onSelectEquation?.(blk.latex ?? '', true)}
+            data-math-latex={cleanLatexDelimiters(blk.latex)}
+            onClick={(e) => {
+              if (e.ctrlKey || e.metaKey) return;
+              onSelectEquation?.(blk.latex ?? '', true);
+            }}
             title="Nhấn để xem mã LaTeX và XML OMML"
             className="px-2 py-1 rounded-md hover:bg-blue-50 hover:ring-1 hover:ring-blue-300 transition-colors cursor-pointer"
           >
@@ -1272,6 +1300,7 @@ export function DocumentPreview({
   onDeleteBlock,
   onInsertBlock,
   onMoveBlock,
+  onCtrlDoubleClickBlock,
 }: DocumentPreviewProps) {
   const [editingTarget, setEditingTarget] = useState<{
     pageNumber: number;
@@ -1454,18 +1483,56 @@ export function DocumentPreview({
               />
             );
 
-            if (!editable || !isValidSrc) {
+            if (!isValidSrc || (!editable && !onCtrlDoubleClickBlock)) {
               return content;
+            }
+
+            const handleBlockDoubleClick = (e: React.MouseEvent<HTMLDivElement>) => {
+              if ((e.ctrlKey || e.metaKey) && onCtrlDoubleClickBlock) {
+                e.preventDefault();
+                e.stopPropagation();
+                const targetEl = e.target as HTMLElement | null;
+                const mathEl = targetEl?.closest('[data-math-latex]') as HTMLElement | null;
+                const clickedMathLatex = mathEl?.getAttribute('data-math-latex') || undefined;
+                const selectionText = window.getSelection()?.toString().trim() || '';
+                const blockRenderedText = (
+                  e.currentTarget.innerText ||
+                  e.currentTarget.textContent ||
+                  ''
+                ).trim();
+                onCtrlDoubleClickBlock({
+                  pageNumber: page.pageNumber,
+                  blockIndex: srcIdx,
+                  block: page.blocks[srcIdx],
+                  clickedText: selectionText,
+                  clickedMathLatex,
+                  blockRenderedText,
+                });
+                return;
+              }
+              if (editable) {
+                e.stopPropagation();
+                setEditingTarget({ pageNumber: page.pageNumber, blockIndex: srcIdx });
+              }
+            };
+
+            if (!editable) {
+              return (
+                <div
+                  onDoubleClick={handleBlockDoubleClick}
+                  title="Giữ Ctrl + nhấp đúp chuột để nhảy tới vị trí LaTeX bên trái"
+                  className="rounded transition-colors hover:bg-blue-50/30"
+                >
+                  {content}
+                </div>
+              );
             }
 
             const totalSrcBlocks = page.blocks.length;
 
             return (
               <div
-                onDoubleClick={(e) => {
-                  e.stopPropagation();
-                  setEditingTarget({ pageNumber: page.pageNumber, blockIndex: srcIdx });
-                }}
+                onDoubleClick={handleBlockDoubleClick}
                 onClick={
                   isEditMode
                     ? (e) => {
@@ -1563,8 +1630,13 @@ export function DocumentPreview({
               }}
               className="bg-white border border-slate-200 rounded-lg shadow-xs mx-auto doc-serif text-slate-900"
             >
-              <div className="flex items-center justify-between pb-2.5 mb-4 border-b border-slate-100 font-sans text-xs text-slate-400">
+              <div className="flex items-center justify-between gap-2 pb-2.5 mb-4 border-b border-slate-100 font-sans text-xs text-slate-400">
                 <span>Trang {page.pageNumber}</span>
+                {onCtrlDoubleClickBlock && !editable && (
+                  <span className="text-[11px] text-slate-400 hidden sm:inline">
+                    Giữ Ctrl + nhấp đúp để định vị sửa LaTeX bên trái
+                  </span>
+                )}
                 <span className="tabular-nums">{page.blocks.length} khối nội dung</span>
               </div>
 

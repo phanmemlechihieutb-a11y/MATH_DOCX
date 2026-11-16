@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent } from 'react';
 import {
   AlertCircle,
   CheckCircle2,
@@ -8,7 +8,7 @@ import {
   Download,
   FileImage,
   FileText,
-  Layers,
+  ImagePlus,
   Loader2,
   Play,
   Sparkles,
@@ -26,7 +26,15 @@ import type {
   RenderedPage,
 } from './types/document';
 import { parseDocxFileToPages } from './utils/docxImporter';
-import { normalizePagesInlineMath, parsePastedLatexToPages } from './utils/latexParser';
+import {
+  normalizePagesInlineMath,
+  parsePastedLatexToPages,
+  type EmbeddedFigureAsset,
+} from './utils/latexParser';
+import {
+  findLatexCursorForPreviewClick,
+  pagesToLatexSource,
+} from './utils/latexSerializer';
 import {
   cropFiguresFromPage,
   generateSampleMathWorksheet,
@@ -139,6 +147,8 @@ export default function App() {
 
   const [pendingDocxPages, setPendingDocxPages] = useState<PageExtraction[]>([]);
   const [pastedLatex, setPastedLatex] = useState<string>('');
+  const [figureAssets, setFigureAssets] = useState<Record<string, EmbeddedFigureAsset>>({});
+  const latexTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const [isExportingPaste, setIsExportingPaste] = useState<boolean>(false);
 
   const [isLoadingFile, setIsLoadingFile] = useState<boolean>(false);
@@ -201,13 +211,15 @@ export default function App() {
             'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
         ) {
           const pages = await parseDocxFileToPages(file);
+          const { latex, assets } = pagesToLatexSource(pages);
           setRenderedPages([]);
-          setPastedLatex('');
+          setFigureAssets(assets);
+          setPastedLatex(latex);
           setPendingDocxPages(pages);
           setInputSource('docx');
           setActiveTab('preview');
           setStatusMessage(
-            `Đã đọc ${pages.length} trang từ tệp Word. Nhấn "Bắt đầu chuyển đổi" để xuất file.`
+            `Đã đọc ${pages.length} trang từ tệp Word và hiển thị mã LaTeX bên trái. Có thể sửa LaTeX bên trái hoặc nhấn "Bắt đầu chuyển đổi" để xuất file.`
           );
           return;
         }
@@ -224,6 +236,7 @@ export default function App() {
           }
           setRenderedPages([]);
           setPendingDocxPages([]);
+          setFigureAssets({});
           setPastedLatex(rawText);
           setInputSource('paste');
           setActiveTab('preview');
@@ -235,6 +248,8 @@ export default function App() {
 
         const pages = await loadFileAsPages(file, renderDpi);
         setPendingDocxPages([]);
+        setFigureAssets({});
+        setPastedLatex('');
         setRenderedPages(pages);
         setInputSource('file');
         setSelectedPageNum(1);
@@ -248,6 +263,145 @@ export default function App() {
     },
     [renderDpi, resetResults]
   );
+
+  const handleAppendPastedImage = useCallback(
+    async (file: File) => {
+      resetResults();
+      setIsLoadingFile(true);
+      try {
+        const newPages = await loadFileAsPages(file, renderDpi);
+        if (newPages.length > 0) {
+          setPendingDocxPages([]);
+          setPastedLatex('');
+          setInputSource('file');
+          setActiveTab('original');
+          setRenderedPages((prev) => {
+            const nextStart = prev.length + 1;
+            const appended = newPages.map((pg, idx) => ({
+              ...pg,
+              pageNumber: nextStart + idx,
+            }));
+            const merged = [...prev, ...appended];
+            setSelectedPageNum(merged.length);
+            setSourceFilename(
+              merged.length > 1
+                ? `Anh_dan_${merged.length}_trang`
+                : file.name || 'anh_dan_clipboard.png'
+            );
+            return merged;
+          });
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Không thể đọc ảnh vừa dán.';
+        setErrorMessage(msg);
+      } finally {
+        setIsLoadingFile(false);
+      }
+    },
+    [renderDpi, resetResults]
+  );
+
+  const extractImageFileFromClipboardItems = (
+    items: DataTransferItemList | undefined | null,
+    files: FileList | undefined | null
+  ): File | null => {
+    if (items) {
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.kind === 'file' && item.type.startsWith('image/')) {
+          const f = item.getAsFile();
+          if (f) {
+            const ext = item.type.split('/')[1]?.replace('jpeg', 'jpg') || 'png';
+            const cleanName =
+              f.name && f.name !== 'image.png'
+                ? f.name
+                : `anh_dan_${Date.now()}.${ext}`;
+            return new File([f], cleanName, { type: f.type || 'image/png' });
+          }
+        }
+      }
+    }
+    if (files) {
+      for (let i = 0; i < files.length; i++) {
+        const f = files[i];
+        if (f.type.startsWith('image/')) return f;
+      }
+    }
+    return null;
+  };
+
+  const handlePasteEventForImage = useCallback(
+    (e: ClipboardEvent | ReactClipboardEvent<HTMLElement>, append = false) => {
+      const imgFile = extractImageFileFromClipboardItems(
+        e.clipboardData?.items,
+        e.clipboardData?.files
+      );
+      if (!imgFile) return false;
+      e.preventDefault();
+      if (append && renderedPages.length > 0) {
+        void handleAppendPastedImage(imgFile);
+      } else {
+        void handleFileSelected(imgFile);
+      }
+      return true;
+    },
+    [handleAppendPastedImage, handleFileSelected, renderedPages.length]
+  );
+
+  const handleReadClipboardImage = useCallback(
+    async (append = false) => {
+      setErrorMessage(null);
+      if (!navigator.clipboard || typeof navigator.clipboard.read !== 'function') {
+        setErrorMessage(
+          'Trình duyệt không hỗ trợ đọc Clipboard bằng nút bấm. Hãy nhấn Ctrl+V (hoặc Cmd+V) trực tiếp vào khung bên phải để dán ảnh.'
+        );
+        return;
+      }
+      try {
+        const clipboardItems = await navigator.clipboard.read();
+        for (const item of clipboardItems) {
+          const imgType = item.types.find((t) => t.startsWith('image/'));
+          if (imgType) {
+            const blob = await item.getType(imgType);
+            const ext = imgType.split('/')[1]?.replace('jpeg', 'jpg') || 'png';
+            const imgFile = new File([blob], `anh_dan_${Date.now()}.${ext}`, {
+              type: imgType,
+            });
+            if (append && renderedPages.length > 0) {
+              await handleAppendPastedImage(imgFile);
+            } else {
+              await handleFileSelected(imgFile);
+            }
+            return;
+          }
+        }
+        setErrorMessage(
+          'Không tìm thấy ảnh trong Clipboard. Hãy sao chép ảnh trước hoặc nhấn Ctrl+V để dán.'
+        );
+      } catch {
+        setErrorMessage(
+          'Trình duyệt chưa cấp quyền đọc Clipboard qua nút bấm. Hãy nhấn Ctrl+V (hoặc Cmd+V) trực tiếp để dán ảnh.'
+        );
+      }
+    },
+    [handleAppendPastedImage, handleFileSelected, renderedPages.length]
+  );
+
+  useEffect(() => {
+    const onWindowPaste = (e: ClipboardEvent) => {
+      const activeEl = document.activeElement as HTMLElement | null;
+      const isTextField =
+        activeEl &&
+        (activeEl.tagName === 'TEXTAREA' ||
+          activeEl.tagName === 'INPUT' ||
+          activeEl.isContentEditable);
+      const hasPlainText = Boolean(e.clipboardData?.getData('text/plain'));
+      if (isTextField && hasPlainText) return;
+      handlePasteEventForImage(e, false);
+    };
+    window.addEventListener('paste', onWindowPaste);
+    return () => window.removeEventListener('paste', onWindowPaste);
+  }, [handlePasteEventForImage]);
 
   const svgDataUrlToPngDataUrl = useCallback(
     async (svgUrl: string, fallbackW = 420, fallbackH = 300): Promise<string> => {
@@ -618,7 +772,7 @@ export default function App() {
   };
 
   const handleConvertPastedLatex = async (targetFormat: MathOutputFormat = mathFormat) => {
-    const pages = editedPages ?? parsePastedLatexToPages(pastedLatex, 'auto');
+    const pages = editedPages ?? parsePastedLatexToPages(pastedLatex, 'auto', figureAssets);
     if (pages.length === 0) {
       setErrorMessage(
         'Vui lòng dán hoặc tải lên nội dung có công thức Toán ($...$ hoặc LaTeX căn bản) trước khi chuyển đổi.'
@@ -638,6 +792,8 @@ export default function App() {
   const handleUseSampleWorksheet = () => {
     resetResults();
     setPendingDocxPages([]);
+    setFigureAssets({});
+    setPastedLatex('');
     setInputSource('file');
     const sample = generateSampleMathWorksheet();
     setSourceFilename('De_on_tap_Toan_mau.png');
@@ -864,6 +1020,10 @@ export default function App() {
         rebuildDocxExport(finalPages, sourceFilename, addPageBreaks, choiceLayout, mathFormat),
       ]);
 
+      const { latex: generatedLatex, assets: generatedAssets } = pagesToLatexSource(finalPages);
+      setFigureAssets(generatedAssets);
+      setPastedLatex(generatedLatex);
+
       setProgressPct(100);
       setStatusMessage('Hoàn tất chuyển đổi! File Word đã sẵn sàng để tải xuống.');
       setActiveTab('preview');
@@ -879,11 +1039,11 @@ export default function App() {
   const liveLatexPreviewPages = useMemo<PageExtraction[]>(() => {
     if (inputSource !== 'paste' || !pastedLatex.trim()) return [];
     try {
-      return normalizePagesInlineMath(parsePastedLatexToPages(pastedLatex, 'auto'));
+      return normalizePagesInlineMath(parsePastedLatexToPages(pastedLatex, 'auto', figureAssets));
     } catch {
       return [];
     }
-  }, [inputSource, pastedLatex]);
+  }, [figureAssets, inputSource, pastedLatex]);
 
   const basePreviewPages = useMemo<PageExtraction[]>(() => {
     if (inputSource === 'file' && extractedPages.length > 0) return extractedPages;
@@ -894,6 +1054,88 @@ export default function App() {
   }, [extractedPages, inputSource, liveLatexPreviewPages, pendingDocxPages]);
 
   const displayPreviewPages = editedPages ?? basePreviewPages;
+
+  const handleJumpToLatexFromPreview = useCallback(
+    (info: {
+      pageNumber: number;
+      blockIndex: number;
+      block: DocumentBlock;
+      clickedText: string;
+      clickedMathLatex?: string;
+      blockRenderedText: string;
+    }) => {
+      const ta = latexTextareaRef.current;
+      if (!ta) return;
+
+      let activeLatex = pastedLatex;
+      if (!activeLatex.trim() && displayPreviewPages.length > 0) {
+        const { latex, assets } = pagesToLatexSource(displayPreviewPages);
+        if (Object.keys(assets).length > 0) setFigureAssets(assets);
+        setPastedLatex(latex);
+        activeLatex = latex;
+      }
+      if (!activeLatex) return;
+
+      let flatIndex = 0;
+      let totalBlocks = 0;
+      for (const pg of displayPreviewPages) {
+        if (pg.pageNumber === info.pageNumber) {
+          flatIndex = totalBlocks + info.blockIndex;
+        }
+        totalBlocks += pg.blocks.length;
+      }
+
+      const match = findLatexCursorForPreviewClick({
+        latexSource: activeLatex,
+        block: info.block,
+        blockFlatIndex: flatIndex,
+        totalBlocks: Math.max(1, totalBlocks),
+        clickedText: info.clickedText,
+        clickedMathLatex: info.clickedMathLatex,
+        blockRenderedText: info.blockRenderedText,
+      });
+
+      const selectStart = match ? match.start : 0;
+      const selectEnd = match ? match.end : 0;
+
+      ta.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      requestAnimationFrame(() => {
+        ta.focus({ preventScroll: true });
+        ta.setSelectionRange(selectStart, selectEnd);
+
+        // Measure exact pixel offset inside textarea using a temporary mirror div
+        const cs = window.getComputedStyle(ta);
+        const mirror = document.createElement('div');
+        mirror.style.position = 'absolute';
+        mirror.style.visibility = 'hidden';
+        mirror.style.pointerEvents = 'none';
+        mirror.style.whiteSpace = 'pre-wrap';
+        mirror.style.wordWrap = 'break-word';
+        mirror.style.overflowWrap = 'break-word';
+        mirror.style.boxSizing = cs.boxSizing;
+        mirror.style.width = `${ta.clientWidth}px`;
+        mirror.style.fontFamily = cs.fontFamily;
+        mirror.style.fontSize = cs.fontSize;
+        mirror.style.fontWeight = cs.fontWeight;
+        mirror.style.lineHeight = cs.lineHeight;
+        mirror.style.letterSpacing = cs.letterSpacing;
+        mirror.style.paddingTop = cs.paddingTop;
+        mirror.style.paddingRight = cs.paddingRight;
+        mirror.style.paddingBottom = cs.paddingBottom;
+        mirror.style.paddingLeft = cs.paddingLeft;
+        mirror.textContent = activeLatex.slice(0, selectStart);
+        const marker = document.createElement('span');
+        marker.textContent = '\u200b';
+        mirror.appendChild(marker);
+        document.body.appendChild(mirror);
+        const targetTop = marker.offsetTop;
+        document.body.removeChild(mirror);
+
+        ta.scrollTop = Math.max(0, targetTop - ta.clientHeight * 0.35);
+      });
+    },
+    [displayPreviewPages, pastedLatex]
+  );
 
   const applyEditedPagesChange = useCallback(
     (nextPages: PageExtraction[]) => {
@@ -1140,7 +1382,7 @@ export default function App() {
           </nav>
 
           <div className="flex items-center shrink-0">
-            {docxDownloadUrl ? (
+            {docxDownloadUrl && (
               <a
                 href={docxDownloadUrl}
                 download={docxFileName}
@@ -1149,15 +1391,6 @@ export default function App() {
                 <Download className="w-4 h-4" />
                 Tải xuống file Word
               </a>
-            ) : (
-              <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                className="hidden"
-              >
-                <Upload className="w-4 h-4" />
-                Chọn tài liệu
-              </button>
             )}
           </div>
         </div>
@@ -1166,10 +1399,10 @@ export default function App() {
       {/* Main Split Workspace: Left Controls/Options/Formatting — Right Content Display */}
       <main id="top" className="flex-1 flex flex-col md:flex-row w-full max-w-[1600px] mx-auto">
         {/* Left Sidebar: Sticky Controls, Options & Formatting */}
-        <aside className="w-full md:w-[340px] lg:w-[370px] shrink-0 bg-white border-b md:border-b-0 md:border-r border-slate-200 md:sticky md:top-16 md:h-[calc(100vh-4rem)] md:overflow-y-auto divide-y divide-slate-200">
-          {/* 1. Tài liệu đầu vào */}
-          <section className="p-5">
-            <div className="flex items-center justify-between mb-3">
+        <aside className="w-full md:w-[400px] lg:w-[460px] shrink-0 bg-white border-b md:border-b-0 md:border-r border-slate-200 md:sticky md:top-16 md:h-[calc(100vh-4rem)] md:overflow-y-auto divide-y divide-slate-200">
+          {/* 1. Tài liệu đầu vào (nhỏ gọn bên trái) */}
+          <section className="p-4 space-y-2.5">
+            <div className="flex items-center justify-between gap-2">
               <h2 className="text-sm font-semibold text-slate-900">1. Tài liệu đầu vào</h2>
               <button
                 type="button"
@@ -1177,21 +1410,9 @@ export default function App() {
                 disabled={isConverting || isLoadingFile}
                 className="text-xs font-medium text-blue-700 hover:text-blue-800 hover:underline disabled:opacity-50 cursor-pointer whitespace-nowrap"
               >
-                Dùng đề toán mẫu
+                Dùng đề mẫu
               </button>
             </div>
-
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".pdf,.docx,.txt,.tex,.ltx,.png,.jpg,.jpeg,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain,text/x-tex,image/png,image/jpeg"
-              className="hidden"
-              onChange={(e) => {
-                const file = e.target.files?.[0];
-                if (file) void handleFileSelected(file);
-                e.target.value = '';
-              }}
-            />
 
             <div
               role="button"
@@ -1208,44 +1429,33 @@ export default function App() {
                 const file = e.dataTransfer.files?.[0];
                 if (file) void handleFileSelected(file);
               }}
-              className="border border-dashed border-slate-300 hover:border-blue-500 hover:bg-blue-50/40 rounded-lg p-5 text-center transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-600"
+              className="flex items-center justify-between gap-2.5 px-3 py-2.5 border border-dashed border-slate-300 hover:border-blue-500 hover:bg-blue-50/40 rounded-lg transition-colors cursor-pointer"
             >
               {isLoadingFile ? (
-                <div className="flex flex-col items-center gap-2 py-2">
-                  <Loader2 className="w-6 h-6 text-blue-700 animate-spin" />
-                  <span className="text-sm font-medium text-slate-700">
-                    Đang đọc nội dung tài liệu...
-                  </span>
+                <div className="flex items-center gap-2 text-xs text-slate-700">
+                  <Loader2 className="w-4 h-4 text-blue-700 animate-spin shrink-0" />
+                  <span>Đang đọc tài liệu...</span>
                 </div>
               ) : (
-                <div className="flex flex-col items-center gap-1.5">
-                  <Upload className="w-6 h-6 text-slate-500" />
-                  <div className="text-sm font-medium text-slate-800">
-                    Kéo thả hoặc nhấn để chọn PDF, Docx, TXT, TEX, Ảnh
+                <>
+                  <div className="flex items-center gap-2 min-w-0">
+                    <Upload className="w-4 h-4 text-slate-500 shrink-0" />
+                    <div className="min-w-0">
+                      <div className="text-xs font-medium text-slate-800 truncate">
+                        {sourceFilename || 'Chọn file PDF, Docx, TXT, TEX, Ảnh'}
+                      </div>
+                      <div className="text-[11px] text-slate-500 truncate">
+                        {renderedPages.length > 0
+                          ? `${renderedPages.length} trang sẵn sàng`
+                          : pendingDocxPages.length > 0
+                          ? `${pendingDocxPages.length} trang Docx`
+                          : 'Kéo thả hoặc nhấn để tải tệp'}
+                      </div>
+                    </div>
                   </div>
-                  <div className="text-xs text-slate-500">
-                    Hỗ trợ PDF, Docx (.docx), .txt, .tex, PNG, JPG, JPEG
-                  </div>
-                </div>
+                </>
               )}
             </div>
-
-            {sourceFilename && (
-              <div className="mt-3 pt-3 border-t border-slate-100 flex items-center justify-between text-xs text-slate-600">
-                <span className="font-medium text-slate-800 truncate max-w-[210px]">
-                  {sourceFilename}
-                </span>
-                <span className="tabular-nums shrink-0 text-slate-500">
-                  {renderedPages.length > 0
-                    ? `${renderedPages.length} trang`
-                    : pendingDocxPages.length > 0
-                    ? `${pendingDocxPages.length} trang Docx`
-                    : pastedLatex.trim()
-                    ? `${pastedLatex.split('\n').length} dòng`
-                    : 'Đã chọn'}
-                </span>
-              </div>
-            )}
           </section>
 
           {/* Dán công thức Toán (LaTeX bọc $...$ hoặc LaTeX căn bản) */}
@@ -1258,23 +1468,30 @@ export default function App() {
             </div>
 
             <textarea
+              ref={latexTextareaRef}
               value={pastedLatex}
               onChange={(e) => {
                 const nextVal = e.target.value;
-                if (extractedPages.length > 0 || editedPages !== null || docxDownloadUrl) {
-                  resetResults();
+                if (editedPages !== null || docxDownloadUrl) {
+                  setEditedPages(null);
+                  setIsPreviewEditMode(false);
+                  setProgressPct(0);
+                  setStatusMessage('');
+                  setErrorMessage(null);
+                  setDocxDownloadUrl((prev) => {
+                    if (prev) URL.revokeObjectURL(prev);
+                    return null;
+                  });
                 }
-                setRenderedPages([]);
-                setPendingDocxPages([]);
                 setPastedLatex(nextVal);
                 setInputSource('paste');
                 setActiveTab('preview');
               }}
-              rows={5}
+              rows={20}
               placeholder={
                 'Dán văn bản Toán học có công thức bọc $...$, $$...$$, \\(...\\), \\[...\\] hoặc mã LaTeX căn bản tại đây...'
               }
-              className="w-full p-3 text-xs font-mono text-slate-800 bg-slate-50/70 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-600 focus:bg-white resize-y"
+              className="w-full min-h-[420px] p-3 text-xs leading-relaxed font-mono text-slate-800 bg-slate-50/70 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-600 focus:bg-white resize-y"
             />
           </section>
 
@@ -1649,40 +1866,131 @@ export default function App() {
               )}
             </div>
 
+            {/* Hidden File Input shared across right-side dropzone & toolbar */}
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".pdf,.docx,.txt,.tex,.ltx,.png,.jpg,.jpeg,.webp,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain,text/x-tex,image/png,image/jpeg,image/webp"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) void handleFileSelected(file);
+                e.target.value = '';
+              }}
+            />
+
             {/* Viewport Content */}
             {renderedPages.length === 0 &&
             pendingDocxPages.length === 0 &&
             !pastedLatex.trim() &&
             displayPreviewPages.length === 0 ? (
-              <div className="bg-white border border-slate-200 rounded-xl p-12 text-center">
-                <Layers className="w-10 h-10 text-slate-400 mx-auto mb-3" />
-                <h3 className="text-base font-semibold text-slate-900">
-                  Chưa có tài liệu nào được tải lên
-                </h3>
-                <p className="mt-1.5 text-sm text-slate-600 max-w-md mx-auto">
-                  Hãy chọn file PDF, Docx (.docx), .txt, .tex hoặc ảnh chụp bài toán bên trái, hoặc
-                  dán trực tiếp mã LaTeX vào khung bên trái.
-                </p>
-                <div className="mt-5 flex flex-wrap items-center justify-center gap-3">
-                  <button
-                    type="button"
-                    onClick={() => fileInputRef.current?.click()}
-                    className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors cursor-pointer"
-                  >
-                    <Upload className="w-4 h-4" />
-                    Tải file PDF, Docx, TXT, TEX, Ảnh
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleUseSampleWorksheet}
-                    className="hidden"
-                  >
-                    <Sparkles className="w-4 h-4" />
-                    Dùng đề toán mẫu
-                  </button>
+              <section
+                className="w-full min-h-[420px] md:min-h-[520px] flex flex-col bg-white border border-slate-200 rounded-xl p-6 md:p-10"
+                onPaste={(e) => {
+                  handlePasteEventForImage(e, false);
+                }}
+              >
+                <div
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => fileInputRef.current?.click()}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') fileInputRef.current?.click();
+                  }}
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    const file = e.dataTransfer.files?.[0];
+                    if (file) void handleFileSelected(file);
+                  }}
+                  className="flex-1 flex flex-col items-center justify-center border-2 border-dashed border-slate-300 hover:border-blue-500 hover:bg-blue-50/40 rounded-xl p-10 md:p-16 text-center transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-600"
+                >
+                  {isLoadingFile ? (
+                    <div className="flex flex-col items-center gap-2 py-3">
+                      <Loader2 className="w-7 h-7 text-blue-700 animate-spin" />
+                      <span className="text-sm font-medium text-slate-700">
+                        Đang đọc nội dung tài liệu...
+                      </span>
+                    </div>
+                  ) : (
+                    <div className="flex flex-col items-center gap-2">
+                      <Upload className="w-8 h-8 text-slate-500" />
+                      <div className="text-sm md:text-base font-medium text-slate-800">
+                        Kéo thả, nhấn để chọn file hoặc nhấn <kbd className="px-1.5 py-0.5 text-xs font-mono bg-slate-100 border border-slate-300 rounded">Ctrl+V</kbd> để dán ảnh
+                      </div>
+                      <div className="text-xs text-slate-500">
+                        Hỗ trợ PDF, Docx (.docx), .txt, .tex, PNG, JPG, JPEG, WEBP
+                      </div>
+                    </div>
+                  )}
                 </div>
-              </div>
-            ) : activeTab === 'original' ? (
+              </section>
+            ) : (
+              <>
+                {/* Compact right-side input bar when a document/image is loaded */}
+                <section
+                  className="bg-white border border-slate-200 rounded-xl px-4 py-3 flex flex-wrap items-center justify-between gap-3"
+                  onDragOver={(e) => e.preventDefault()}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    const file = e.dataTransfer.files?.[0];
+                    if (file) void handleFileSelected(file);
+                  }}
+                  onPaste={(e) => {
+                    handlePasteEventForImage(e, false);
+                  }}
+                >
+                  <div className="flex items-center gap-2 min-w-0 text-xs text-slate-600">
+                    <span className="font-medium text-slate-800 truncate max-w-[260px]">
+                      {sourceFilename || (pastedLatex.trim() ? 'Mã LaTeX đã dán' : 'Đã chọn')}
+                    </span>
+                    <span className="tabular-nums shrink-0 text-slate-500">
+                      ·{' '}
+                      {renderedPages.length > 0
+                        ? `${renderedPages.length} trang`
+                        : pendingDocxPages.length > 0
+                        ? `${pendingDocxPages.length} trang Docx`
+                        : pastedLatex.trim()
+                        ? `${pastedLatex.split('\n').length} dòng`
+                        : 'Sẵn sàng'}
+                    </span>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => fileInputRef.current?.click()}
+                      disabled={isConverting || isLoadingFile}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 disabled:opacity-50 rounded-lg transition-colors cursor-pointer"
+                    >
+                      <Upload className="w-3.5 h-3.5" />
+                      Chọn tệp khác
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleReadClipboardImage(false)}
+                      disabled={isConverting || isLoadingFile}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 disabled:opacity-50 rounded-lg transition-colors cursor-pointer"
+                    >
+                      <ImagePlus className="w-3.5 h-3.5" />
+                      Dán ảnh (Ctrl+V)
+                    </button>
+                    {renderedPages.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => void handleReadClipboardImage(true)}
+                        disabled={isConverting || isLoadingFile}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 disabled:opacity-50 rounded-lg transition-colors cursor-pointer"
+                      >
+                        <ImagePlus className="w-3.5 h-3.5" />
+                        + Dán thêm trang ảnh
+                      </button>
+                    )}
+                  </div>
+                </section>
+                {activeTab === 'original' ? (
               renderedPages.length > 0 ? (
                 <div className="bg-white border border-slate-200 rounded-xl p-5">
                   {currentOriginalPage && (
@@ -1731,18 +2039,8 @@ export default function App() {
                   choiceLayout={choiceLayout}
                   mathFormat={mathFormat}
                   onSelectEquation={handleInspectEquation}
-                  editable={!isConverting && !isExportingPaste}
-                  isEditMode={isPreviewEditMode}
-                  onToggleEditMode={() => setIsPreviewEditMode((v) => !v)}
-                  hasEdits={editedPages !== null}
-                  onResetEdits={handleResetPreviewEdits}
-                  onSyncWord={handleSyncPreviewWord}
-                  isSyncingWord={isSyncingEditedWord}
-                  hasWordOutput={Boolean(docxDownloadUrl)}
-                  onUpdateBlock={handleUpdatePreviewBlock}
-                  onDeleteBlock={handleDeletePreviewBlock}
-                  onInsertBlock={handleInsertPreviewBlock}
-                  onMoveBlock={handleMovePreviewBlock}
+                  editable={false}
+                  onCtrlDoubleClickBlock={handleJumpToLatexFromPreview}
                 />
               ) : (
                 <div className="bg-white border border-slate-200 rounded-xl p-10 text-center">
@@ -1838,6 +2136,8 @@ export default function App() {
                 )}
               </div>
             )}
+              </>
+            )}
           </section>
 
           {/* Technical OMML Explanation Section */}
@@ -1862,35 +2162,16 @@ export default function App() {
                 <h3 className="font-semibold text-slate-900">
                   01. Bóc tách cấu trúc & LaTeX
                 </h3>
-                <p className="mt-1.5 text-slate-600 leading-relaxed">
-                  Mỗi trang PDF được render ở độ phân giải cao (200–300 DPI). AI Vision nhận diện văn
-                  bản, căn lề, định dạng đậm/nghiêng, tách công thức thành mã LaTeX chuẩn xác và trả
-                  về tọa độ chuẩn hóa để cắt hình vẽ/đồ thị.
-                </p>
               </div>
               <div>
                 <h3 className="font-semibold text-slate-900">
                   02. LaTeX → MathML → XML OMML
                 </h3>
-                <p className="mt-1.5 text-slate-600 leading-relaxed">
-                  Máy chủ biên dịch LaTeX sang cây MathML XML rồi dịch đệ quy sang các thẻ OMML chuẩn
-                  Word: phân số (<code className="text-xs">m:f</code>), căn thức (
-                  <code className="text-xs">m:rad</code>), tích phân/tổng (
-                  <code className="text-xs">m:nary</code>), chỉ số (<code className="text-xs">m:sSubSup</code>)
-                  và hệ phương trình/ma trận (<code className="text-xs">m:d</code>,{' '}
-                  <code className="text-xs">m:m</code>).
-                </p>
               </div>
               <div>
                 <h3 className="font-semibold text-slate-900">
                   03. Đóng gói OOXML (.docx)
                 </h3>
-                <p className="mt-1.5 text-slate-600 leading-relaxed">
-                  Mọi node <code className="text-xs">&lt;m:oMath&gt;</code> (cùng dòng) và{' '}
-                  <code className="text-xs">&lt;m:oMathPara&gt;</code> (độc lập) được nhúng trực tiếp
-                  vào <code className="text-xs">word/document.xml</code> kèm font{' '}
-                  <em>Cambria Math</em>, văn bản <em>Times New Roman</em> và các hình PNG đã cắt.
-                </p>
               </div>
             </div>
           </section>

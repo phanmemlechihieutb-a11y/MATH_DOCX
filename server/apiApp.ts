@@ -246,7 +246,18 @@ function isDailyQuotaError(msg: string): boolean {
 
 function isTransientServerError(err: unknown, msg: string): boolean {
   const status = (err as { status?: number })?.status;
-  return status === 503 || msg.includes('503') || msg.includes('UNAVAILABLE');
+  const lower = msg.toLowerCase();
+  return (
+    status === 500 ||
+    status === 502 ||
+    status === 503 ||
+    status === 504 ||
+    msg.includes('503') ||
+    msg.includes('UNAVAILABLE') ||
+    lower.includes('high demand') ||
+    lower.includes('overloaded') ||
+    lower.includes('temporarily unavailable')
+  );
 }
 
 async function generateOcrWithModelFallback(
@@ -264,7 +275,7 @@ async function generateOcrWithModelFallback(
   let lastError: unknown;
 
   for (const model of modelsToTry) {
-    const maxRetries = 1;
+    const maxRetries = 2;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
         const thinkingLevel = ThinkingLevel.LOW;
@@ -300,15 +311,19 @@ async function generateOcrWithModelFallback(
             break;
           }
           if (attempt < maxRetries) {
-            await new Promise((r) => setTimeout(r, 600));
+            await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
             continue;
           }
           break;
         }
 
-        if (isTransientServerError(err, msg) && attempt < maxRetries) {
-          await new Promise((r) => setTimeout(r, 500));
-          continue;
+        if (isTransientServerError(err, msg)) {
+          if (attempt < maxRetries) {
+            await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
+            continue;
+          }
+          // Exhausted retries on this model -> break to try the next fallback model
+          break;
         }
 
         throw err;
@@ -416,6 +431,13 @@ export async function handleOcrPage(req: RequestWithOptionalBody, res: ServerRes
       sendJson(res, 429, {
         error:
           'Đã vượt quá hạn mức miễn phí (Quota 429) của Gemini API trên tất cả model khả dụng. Vui lòng thử lại sau ít phút hoặc dùng API Key có bật thanh toán (Billing).',
+      });
+      return;
+    }
+    if (isTransientServerError(err, message)) {
+      sendJson(res, 503, {
+        error:
+          'Máy chủ AI đang quá tải tạm thời (503). Hệ thống đã tự thử chuyển model dự phòng nhưng chưa thành công — vui lòng nhấn "Bắt đầu chuyển đổi" lại sau vài giây.',
       });
       return;
     }

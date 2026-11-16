@@ -98,6 +98,13 @@ interface CustomTheoremDef {
   sharedCounter?: string;
 }
 
+export interface EmbeddedFigureAsset {
+  dataUrl: string;
+  widthPx: number;
+  heightPx: number;
+  caption?: string | null;
+}
+
 interface ParserContext {
   sectionCount: number;
   subsectionCount: number;
@@ -112,11 +119,15 @@ interface ParserContext {
   lastNumberedKind: string | null;
   customTheorems: Record<string, CustomTheoremDef>;
   customColors: Record<string, string>;
+  figureAssets?: Record<string, EmbeddedFigureAsset>;
 }
 
 function createParserContext(
   initial?: Partial<
-    Pick<ParserContext, 'isVietnamese' | 'labels' | 'labelKinds' | 'cites' | 'customTheorems' | 'customColors'>
+    Pick<
+      ParserContext,
+      'isVietnamese' | 'labels' | 'labelKinds' | 'cites' | 'customTheorems' | 'customColors' | 'figureAssets'
+    >
   >
 ): ParserContext {
   return {
@@ -133,6 +144,7 @@ function createParserContext(
     lastNumberedKind: null,
     customTheorems: initial?.customTheorems ?? {},
     customColors: initial?.customColors ?? {},
+    figureAssets: initial?.figureAssets,
   };
 }
 
@@ -4260,6 +4272,33 @@ function parseBodyBlocks(
         }
       }
 
+      // Standalone \includegraphics[opts]{assetKey} when matching an extracted PDF/Docx figure asset
+      const incGraphMatch = rest.match(/^\\includegraphics\*?(?:\s*\[[^\]]*\])?\s*\{/);
+      if (incGraphMatch && isOnlySpacesBeforeOnLine(src, i)) {
+        const br = readBalancedBraces(src, i + incGraphMatch[0].length - 1);
+        if (br) {
+          const assetKey = br.content.trim();
+          const asset = ctx.figureAssets?.[assetKey];
+          if (asset) {
+            flushTextSlice(i);
+            pushBlock({
+              block_type: 'figure',
+              alignment:
+                opts.defaultAlign === 'left' || opts.defaultAlign === 'right'
+                  ? opts.defaultAlign
+                  : 'center',
+              croppedImageDataUrl: asset.dataUrl,
+              croppedWidthPx: asset.widthPx,
+              croppedHeightPx: asset.heightPx,
+              ...(asset.caption ? { caption: asset.caption } : {}),
+            });
+            i = br.endIdx + 1;
+            textStart = i;
+            continue;
+          }
+        }
+      }
+
       // \tikz[opts]{...}
       const tikzInlineHead = rest.match(/^\\tikz(?![a-zA-Z])/);
       if (tikzInlineHead) {
@@ -5740,7 +5779,8 @@ export function normalizePagesInlineMath(pages: PageExtraction[]): PageExtractio
 
 export function parsePastedLatexToPages(
   rawText: string,
-  mode: LatexPasteMode = 'auto'
+  mode: LatexPasteMode = 'auto',
+  figureAssets?: Record<string, EmbeddedFigureAsset>
 ): PageExtraction[] {
   if (!rawText || !rawText.trim()) return [];
 
@@ -5760,6 +5800,7 @@ export function parsePastedLatexToPages(
     isVietnamese,
     customTheorems,
     customColors,
+    figureAssets,
   };
   const parseOpts: BlockParseOptions = {
     defaultAlign: 'left',
