@@ -9,6 +9,11 @@ interface Point2D {
   y: number;
 }
 
+interface CustomMathFunc {
+  params: string[];
+  bodyExpr: string;
+}
+
 interface DrawStyle {
   stroke: string;
   strokeWidth: number;
@@ -25,6 +30,7 @@ interface DrawStyle {
   fontStyle?: string;
   align?: string;
   anchor?: string;
+  anchorDist?: number;
   pos?: number;
   shiftX?: number;
   shiftY?: number;
@@ -34,6 +40,8 @@ interface DrawStyle {
   circle?: boolean;
   innerSep?: number;
   roundedCorners?: number;
+  customFuncs?: Record<string, CustomMathFunc>;
+  trigRad?: boolean;
 }
 
 interface SvgItem {
@@ -58,6 +66,9 @@ interface TikzScopeState {
   fillOpacity: number;
   clipId?: string;
   clipBounds?: { minX: number; minY: number; maxX: number; maxY: number };
+  vars?: Record<string, number>;
+  customFuncs?: Record<string, CustomMathFunc>;
+  trigRad?: boolean;
 }
 
 const COLOR_MAP: Record<string, string> = {
@@ -235,32 +246,149 @@ function parseLengthToPx(raw: string, unitPx = 42): number | null {
   return val * unitPx;
 }
 
+function replaceBalancedLatexMathOps(src: string): string {
+  let out = src;
+  for (let pass = 0; pass < 6; pass++) {
+    let changed = false;
+
+    // \frac{a}{b}, \dfrac{a}{b}, \tfrac{a}{b} (supports nested braces or single tokens)
+    const fracMatch = /\\(?:d|t)?frac(?![a-zA-Z])/.exec(out);
+    if (fracMatch) {
+      let p = fracMatch.index + fracMatch[0].length;
+      const readTokenOrBrace = (): { val: string; nextIdx: number } | null => {
+        while (p < out.length && /\s/.test(out[p])) p++;
+        if (p >= out.length) return null;
+        if (out[p] === '{') {
+          const br = readBalanced(out, p, '{', '}');
+          if (!br) return null;
+          return { val: br.content, nextIdx: br.endIdx + 1 };
+        }
+        if (out[p] === '\\') {
+          const cmd = out.slice(p).match(/^\\[a-zA-Z]+/);
+          if (cmd) return { val: cmd[0], nextIdx: p + cmd[0].length };
+        }
+        return { val: out[p], nextIdx: p + 1 };
+      };
+      const num = readTokenOrBrace();
+      if (num) {
+        p = num.nextIdx;
+        const den = readTokenOrBrace();
+        if (den) {
+          out =
+            out.slice(0, fracMatch.index) +
+            `((${num.val})/(${den.val}))` +
+            out.slice(den.nextIdx);
+          changed = true;
+          continue;
+        }
+      }
+    }
+
+    // \sqrt[n]{a} or \sqrt{a}
+    const sqrtMatch = /\\sqrt(?![a-zA-Z])/.exec(out);
+    if (sqrtMatch) {
+      let p = sqrtMatch.index + sqrtMatch[0].length;
+      while (p < out.length && /\s/.test(out[p])) p++;
+      let degStr: string | null = null;
+      if (out[p] === '[') {
+        const degBr = readBalanced(out, p, '[', ']');
+        if (degBr) {
+          degStr = degBr.content.trim();
+          p = degBr.endIdx + 1;
+          while (p < out.length && /\s/.test(out[p])) p++;
+        }
+      }
+      let argVal: string | null = null;
+      let nextIdx = p;
+      if (out[p] === '{') {
+        const br = readBalanced(out, p, '{', '}');
+        if (br) {
+          argVal = br.content;
+          nextIdx = br.endIdx + 1;
+        }
+      } else if (out[p] === '\\') {
+        const cmd = out.slice(p).match(/^\\[a-zA-Z]+/);
+        if (cmd) {
+          argVal = cmd[0];
+          nextIdx = p + cmd[0].length;
+        }
+      } else if (p < out.length) {
+        argVal = out[p];
+        nextIdx = p + 1;
+      }
+      if (argVal !== null) {
+        const repl = degStr ? `((${argVal})^(1/(${degStr})))` : `sqrt(${argVal})`;
+        out = out.slice(0, sqrtMatch.index) + repl + out.slice(nextIdx);
+        changed = true;
+        continue;
+      }
+    }
+
+    if (!changed) break;
+  }
+  return out;
+}
+
+function parseDeclareFunctionsSpec(
+  spec: string,
+  target: Record<string, CustomMathFunc>
+): void {
+  const statements = splitTopLevel(spec, ';');
+  for (const raw of statements) {
+    const st = raw.trim();
+    if (!st) continue;
+    const m = st.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s*\(([^)]*)\)\s*=\s*([\s\S]+)$/);
+    if (!m) continue;
+    const fnName = m[1].trim();
+    const params = m[2]
+      .split(',')
+      .map((p) => p.trim().replace(/^\\/, ''))
+      .filter(Boolean);
+    const bodyExpr = m[3].trim();
+    if (fnName && params.length > 0 && bodyExpr) {
+      target[fnName] = { params, bodyExpr };
+    }
+  }
+}
+
 // Safe recursive-descent math expression evaluator
 function evalMathExpr(
   rawExpr: string,
   vars: Record<string, number> = {},
-  trigRadDefault = false
+  trigRadDefault = false,
+  customFuncs: Record<string, CustomMathFunc> = {},
+  evalDepth = 0
 ): number | null {
+  if (evalDepth > 8) return null;
   let expr = rawExpr.trim();
   if (!expr) return null;
 
   // Replace common LaTeX math constructs inside expressions
-  expr = expr
+  expr = replaceBalancedLatexMathOps(expr)
     .replace(/\*\*/g, '^')
     .replace(/\\left\s*\(/g, '(')
     .replace(/\\right\s*\)/g, ')')
     .replace(/\\cdot|\\times/g, '*')
     .replace(/\\div/g, '/')
     .replace(/\\pi(?![a-zA-Z])/g, 'pi')
-    .replace(/\\(?:d|t)?frac(?:\s*\{([^}]+)\}|\s*([0-9a-zA-Z]))(?:\s*\{([^}]+)\}|\s*([0-9a-zA-Z]))/g, (_m, a1, a2, b1, b2) => `((${a1 ?? a2})/(${b1 ?? b2}))`)
-    .replace(/\\sqrt(?:\s*\{([^}]+)\}|\s*([0-9a-zA-Z]))/g, (_m, a1, a2) => `sqrt(${a1 ?? a2})`)
+    .replace(/\\arcsin(?![a-zA-Z])/g, 'asin')
+    .replace(/\\arccos(?![a-zA-Z])/g, 'acos')
+    .replace(/\\arctan(?![a-zA-Z])/g, 'atan')
     .replace(/\\sin(?![a-zA-Z])/g, 'sin')
     .replace(/\\cos(?![a-zA-Z])/g, 'cos')
     .replace(/\\tan(?![a-zA-Z])/g, 'tan')
+    .replace(/\\cot(?![a-zA-Z])/g, 'cot')
+    .replace(/\\sec(?![a-zA-Z])/g, 'sec')
+    .replace(/\\csc(?![a-zA-Z])/g, 'csc')
+    .replace(/\\sinh(?![a-zA-Z])/g, 'sinh')
+    .replace(/\\cosh(?![a-zA-Z])/g, 'cosh')
+    .replace(/\\tanh(?![a-zA-Z])/g, 'tanh')
     .replace(/\\ln(?![a-zA-Z])/g, 'ln')
     .replace(/\\log(?![a-zA-Z])/g, 'log10')
     .replace(/\\exp(?![a-zA-Z])/g, 'exp')
     .replace(/\\abs(?![a-zA-Z])/g, 'abs')
+    .replace(/\\floor(?![a-zA-Z])/g, 'floor')
+    .replace(/\\ceil(?![a-zA-Z])/g, 'ceil')
     .replace(/\{/g, '(')
     .replace(/\}/g, ')');
 
@@ -271,11 +399,11 @@ function evalMathExpr(
       expr = expr.replace(new RegExp(`\\\\${cleanName}(?![a-zA-Z])`, 'g'), cleanName);
     }
   }
+  // Also normalize any custom function calls written as \f(...) to f(...)
+  for (const fnName of Object.keys(customFuncs)) {
+    expr = expr.replace(new RegExp(`\\\\${fnName}(?![a-zA-Z])`, 'g'), fnName);
+  }
 
-  // Handle TikZ radian suffix like (x r) or (\x r) or 2 r -> (x)*(180/pi) if trig is degrees,
-  // or directly treat 'r' postfix as *1 when trigRadDefault is handled cleanly:
-  // Actually simpler: pass `rad` conversion by replacing `(\w|\))\s+r\b` with `($1)*57.29577951308232` when !trigRadDefault,
-  // or better yet: handle `r` suffix directly in tokenizer so `sin(\x r)` works in both modes!
   const cleanVars: Record<string, number> = { pi: Math.PI, e: Math.E };
   for (const [k, v] of Object.entries(vars)) {
     cleanVars[k.replace(/^\\/, '')] = v;
@@ -285,6 +413,8 @@ function evalMathExpr(
     | { type: 'num'; v: number }
     | { type: 'id'; v: string }
     | { type: 'op'; v: string }
+    | { type: 'qmark' }
+    | { type: 'colon' }
     | { type: 'lp' }
     | { type: 'rp' }
     | { type: 'comma' };
@@ -333,8 +463,24 @@ function evalMathExpr(
       i = j;
       continue;
     }
-    if ('+-*/^'.includes(ch)) {
+    const two = expr.slice(i, i + 2);
+    if (two === '<=' || two === '>=' || two === '==' || two === '!=') {
+      tokens.push({ type: 'op', v: two });
+      i += 2;
+      continue;
+    }
+    if ('+-*/^<>'.includes(ch)) {
       tokens.push({ type: 'op', v: ch });
+      i++;
+      continue;
+    }
+    if (ch === '?') {
+      tokens.push({ type: 'qmark' });
+      i++;
+      continue;
+    }
+    if (ch === ':') {
+      tokens.push({ type: 'colon' });
       i++;
       continue;
     }
@@ -362,6 +508,8 @@ function evalMathExpr(
     'sin', 'cos', 'tan', 'cot', 'sec', 'csc', 'asin', 'acos', 'atan', 'atan2',
     'sinh', 'cosh', 'tanh', 'exp', 'ln', 'log', 'log10', 'log2', 'sqrt', 'abs',
     'floor', 'ceil', 'round', 'min', 'max', 'pow', 'sign', 'mod', 'deg', 'rad',
+    'ifthenelse',
+    ...Object.keys(customFuncs),
   ]);
   for (let idx = 0; idx < tokens.length; idx++) {
     const cur = tokens[idx];
@@ -382,6 +530,36 @@ function evalMathExpr(
 
   const toRad = (degOrRad: number) => (trigRadDefault ? degOrRad : (degOrRad * Math.PI) / 180);
   const fromRad = (rad: number) => (trigRadDefault ? rad : (rad * 180) / Math.PI);
+
+  function parseTernary(): number {
+    const cond = parseCmp();
+    if (peek()?.type === 'qmark') {
+      consume();
+      const thenVal = parseTernary();
+      if (peek()?.type === 'colon') consume();
+      const elseVal = parseTernary();
+      return cond !== 0 ? thenVal : elseVal;
+    }
+    return cond;
+  }
+
+  function parseCmp(): number {
+    let left = parseAdd();
+    while (
+      peek()?.type === 'op' &&
+      (peek() as { type: 'op'; v: string }).v in { '<': 1, '<=': 1, '>': 1, '>=': 1, '==': 1, '!=': 1 }
+    ) {
+      const op = (consume() as { type: 'op'; v: string }).v;
+      const right = parseAdd();
+      if (op === '<') left = left < right ? 1 : 0;
+      else if (op === '<=') left = left <= right ? 1 : 0;
+      else if (op === '>') left = left > right ? 1 : 0;
+      else if (op === '>=') left = left >= right ? 1 : 0;
+      else if (op === '==') left = Math.abs(left - right) < 1e-12 ? 1 : 0;
+      else left = Math.abs(left - right) >= 1e-12 ? 1 : 0;
+    }
+    return left;
+  }
 
   function parseAdd(): number {
     let left = parseMul();
@@ -432,7 +610,7 @@ function evalMathExpr(
     }
     if (t.type === 'lp') {
       consume();
-      const v = parseAdd();
+      const v = parseTernary();
       if (peek()?.type === 'rp') consume();
       return v;
     }
@@ -443,15 +621,25 @@ function evalMathExpr(
         consume();
         const args: number[] = [];
         if (peek()?.type !== 'rp') {
-          args.push(parseAdd());
+          args.push(parseTernary());
           while (peek()?.type === 'comma') {
             consume();
-            args.push(parseAdd());
+            args.push(parseTernary());
           }
         }
         if (peek()?.type === 'rp') consume();
+        if (name in customFuncs) {
+          const cf = customFuncs[name];
+          const localVars: Record<string, number> = { ...cleanVars };
+          cf.params.forEach((pName, idx) => {
+            if (idx < args.length) localVars[pName] = args[idx];
+          });
+          const res = evalMathExpr(cf.bodyExpr, localVars, trigRadDefault, customFuncs, evalDepth + 1);
+          return res === null ? NaN : res;
+        }
         const a0 = args[0] ?? 0;
         const a1 = args[1] ?? 0;
+        const a2 = args[2] ?? 0;
         switch (name) {
           case 'sin': return Math.sin(toRad(a0));
           case 'cos': return Math.cos(toRad(a0));
@@ -483,6 +671,7 @@ function evalMathExpr(
           case 'mod': return a0 % a1;
           case 'deg': return (a0 * 180) / Math.PI;
           case 'rad': return (a0 * Math.PI) / 180;
+          case 'ifthenelse': return a0 !== 0 ? a1 : a2;
           default: return NaN;
         }
       }
@@ -493,12 +682,20 @@ function evalMathExpr(
   }
 
   try {
-    const out = parseAdd();
+    const out = parseTernary();
     if (pos !== expanded.length || !Number.isFinite(out)) return null;
     return out;
   } catch {
     return null;
   }
+}
+
+export function evaluateTikzMathExpr(
+  rawExpr: string,
+  vars: Record<string, number> = {},
+  trigRadDefault = false
+): number | null {
+  return evalMathExpr(rawExpr, vars, trigRadDefault);
 }
 
 interface FormattedLabel {
@@ -705,7 +902,8 @@ function formatTikzLabelToSvg(rawLabel: string, baseFontSize = 13): FormattedLab
 
 function expandForeachLoops(
   src: string,
-  vars: Record<string, number> = {}
+  vars: Record<string, number> = {},
+  customFuncs: Record<string, CustomMathFunc> = {}
 ): string {
   let out = src;
   const re = /\\foreach\s+(\\[a-zA-Z]+(?:\s*\/\s*\\[a-zA-Z]+)*)\s*(?:\[[^\]]*\])?\s*in\s*\{/;
@@ -742,9 +940,9 @@ function expandForeachLoops(
     // Expand `a, b, ..., c` or `a, ..., c`
     for (let idx = 0; idx < rawItems.length; idx++) {
       if (rawItems[idx] === '...' && idx > 0 && idx + 1 < rawItems.length) {
-        const endVal = evalMathExpr(rawItems[idx + 1], vars);
-        const startVal = evalMathExpr(rawItems[idx - 1], vars);
-        const prevVal = idx >= 2 ? evalMathExpr(rawItems[idx - 2], vars) : null;
+        const endVal = evalMathExpr(rawItems[idx + 1], vars, false, customFuncs);
+        const startVal = evalMathExpr(rawItems[idx - 1], vars, false, customFuncs);
+        const prevVal = idx >= 2 ? evalMathExpr(rawItems[idx - 2], vars, false, customFuncs) : null;
         if (startVal !== null && endVal !== null) {
           const step =
             prevVal !== null && startVal !== prevVal
@@ -773,7 +971,7 @@ function expandForeachLoops(
 
     let expanded = '';
     for (const item of items) {
-      const vals = item.split('/').map((v) => v.trim());
+      const vals = splitTopLevel(item, '/').map((v) => v.trim());
       let rep = bodyStr;
       varNames.forEach((vn, vIdx) => {
         const val = vals[vIdx] ?? vals[0] ?? '';
@@ -793,7 +991,9 @@ function parseOptionsString(
   rawOpts: string,
   base: TikzScopeState,
   customColors: Record<string, string>,
-  unitPx = 42
+  unitPx = 42,
+  vars: Record<string, number> = {},
+  customFuncs: Record<string, CustomMathFunc> = {}
 ): DrawStyle & {
   scaleX?: number;
   scaleY?: number;
@@ -854,7 +1054,12 @@ function parseOptionsString(
     else if (key === 'loosely dotted') style.dashArray = '1.8,5.5';
     else if (key === 'solid') style.dashArray = undefined;
     else if (key === 'circle') style.circle = true;
-    else if (key === 'color' && cleanVal) {
+    else if (key === 'declare function' && cleanVal) {
+      if (!style.customFuncs) style.customFuncs = {};
+      parseDeclareFunctionsSpec(cleanVal, style.customFuncs);
+    } else if ((key === 'trig format' || key === 'trig format plots') && cleanVal === 'rad') {
+      style.trigRad = true;
+    } else if (key === 'color' && cleanVal) {
       const c = resolveTikzColor(cleanVal, customColors);
       if (c) style.stroke = c;
     } else if (key === 'draw' && cleanVal) {
@@ -887,25 +1092,25 @@ function parseOptionsString(
       const u = parseLengthToTikzUnits(cleanVal, unitPx);
       if (u !== null && u > 0) style.scaleY = (style.scaleY ?? 1) * u;
     } else if (key === 'scale' && cleanVal) {
-      const sc = parseFloat(cleanVal);
-      if (Number.isFinite(sc)) {
+      const sc = evalMathExpr(cleanVal, vars, false, customFuncs);
+      if (sc !== null && Number.isFinite(sc)) {
         style.scaleX = (style.scaleX ?? 1) * sc;
         style.scaleY = (style.scaleY ?? 1) * sc;
       }
     } else if (key === 'xscale' && cleanVal) {
-      const sc = parseFloat(cleanVal);
-      if (Number.isFinite(sc)) style.scaleX = (style.scaleX ?? 1) * sc;
+      const sc = evalMathExpr(cleanVal, vars, false, customFuncs);
+      if (sc !== null && Number.isFinite(sc)) style.scaleX = (style.scaleX ?? 1) * sc;
     } else if (key === 'yscale' && cleanVal) {
-      const sc = parseFloat(cleanVal);
-      if (Number.isFinite(sc)) style.scaleY = (style.scaleY ?? 1) * sc;
+      const sc = evalMathExpr(cleanVal, vars, false, customFuncs);
+      if (sc !== null && Number.isFinite(sc)) style.scaleY = (style.scaleY ?? 1) * sc;
     } else if (key === 'rotate' && cleanVal) {
-      const deg = parseFloat(cleanVal);
-      if (Number.isFinite(deg)) style.rotateDeg = (style.rotateDeg ?? 0) + deg;
+      const deg = evalMathExpr(cleanVal, vars, false, customFuncs);
+      if (deg !== null && Number.isFinite(deg)) style.rotateDeg = (style.rotateDeg ?? 0) + deg;
     } else if (key === 'domain' && cleanVal) {
-      const dParts = cleanVal.split(':');
+      const dParts = splitTopLevel(cleanVal, ':');
       if (dParts.length === 2) {
-        const d0 = evalMathExpr(dParts[0]);
-        const d1 = evalMathExpr(dParts[1]);
+        const d0 = evalMathExpr(dParts[0], vars, false, customFuncs);
+        const d1 = evalMathExpr(dParts[1], vars, false, customFuncs);
         if (d0 !== null && d1 !== null) style.domain = [d0, d1];
       }
     } else if (key === 'samples' && cleanVal) {
@@ -933,6 +1138,10 @@ function parseOptionsString(
       key === 'below right'
     ) {
       style.anchor = key;
+      if (cleanVal) {
+        const dPx = parseLengthToPx(cleanVal, unitPx);
+        if (dPx !== null && Number.isFinite(dPx)) style.anchorDist = dPx;
+      }
     } else if (key === 'anchor' && cleanVal) {
       const anchorMap: Record<string, string> = {
         north: 'below',
@@ -956,10 +1165,11 @@ function parseOptionsString(
       if (px !== null) style.shiftYPx = (style.shiftYPx ?? 0) - px;
     } else if (key === 'shift' && cleanVal) {
       if (cleanVal.startsWith('(') && cleanVal.endsWith(')')) {
-        const coords = splitTopLevel(cleanVal.slice(1, -1), ',');
+        const innerShift = cleanVal.slice(1, -1).trim();
+        const coords = splitTopLevel(innerShift, ',');
         if (coords.length === 2) {
-          const sx = parseLengthToTikzUnits(coords[0], unitPx) ?? evalMathExpr(coords[0]);
-          const sy = parseLengthToTikzUnits(coords[1], unitPx) ?? evalMathExpr(coords[1]);
+          const sx = parseLengthToTikzUnits(coords[0], unitPx) ?? evalMathExpr(coords[0], vars, false, customFuncs);
+          const sy = parseLengthToTikzUnits(coords[1], unitPx) ?? evalMathExpr(coords[1], vars, false, customFuncs);
           if (sx !== null && sy !== null) {
             style.shiftX = (style.shiftX ?? 0) + sx;
             style.shiftY = (style.shiftY ?? 0) + sy;
@@ -992,7 +1202,8 @@ function resolveCoordinateExpr(
   namedCoords: Record<string, Point2D>,
   prevPoint: Point2D,
   isRelativeMove: boolean,
-  vars: Record<string, number>
+  vars: Record<string, number>,
+  customFuncs: Record<string, CustomMathFunc> = {}
 ): Point2D | null {
   let s = rawCoord.trim();
   if (s.startsWith('axis cs:')) s = s.slice('axis cs:'.length).trim();
@@ -1005,8 +1216,8 @@ function resolveCoordinateExpr(
   // Orthogonal intersection: (A |- B) -> (A.x, B.y), (A -| B) -> (B.x, A.y)
   const orthoM = s.match(/^(.+?)\s*(\|-|-\|)\s*(.+)$/);
   if (orthoM) {
-    const p1 = resolveCoordinateExpr(orthoM[1], namedCoords, prevPoint, false, vars);
-    const p2 = resolveCoordinateExpr(orthoM[3], namedCoords, prevPoint, false, vars);
+    const p1 = resolveCoordinateExpr(orthoM[1], namedCoords, prevPoint, false, vars, customFuncs);
+    const p2 = resolveCoordinateExpr(orthoM[3], namedCoords, prevPoint, false, vars, customFuncs);
     if (p1 && p2) {
       return orthoM[2] === '|-' ? { x: p1.x, y: p2.y } : { x: p2.x, y: p1.y };
     }
@@ -1017,9 +1228,9 @@ function resolveCoordinateExpr(
     const inner = s.slice(1, -1).trim();
     const interpM = inner.match(/^\(([^)]+)\)!([^!]+)!\(([^)]+)\)$/);
     if (interpM) {
-      const p1 = resolveCoordinateExpr(interpM[1], namedCoords, prevPoint, false, vars);
-      const p2 = resolveCoordinateExpr(interpM[3], namedCoords, prevPoint, false, vars);
-      const t = evalMathExpr(interpM[2], vars);
+      const p1 = resolveCoordinateExpr(interpM[1], namedCoords, prevPoint, false, vars, customFuncs);
+      const p2 = resolveCoordinateExpr(interpM[3], namedCoords, prevPoint, false, vars, customFuncs);
+      const t = evalMathExpr(interpM[2], vars, false, customFuncs);
       if (p1 && p2 && t !== null) {
         return { x: p1.x + (p2.x - p1.x) * t, y: p1.y + (p2.y - p1.y) * t };
       }
@@ -1027,9 +1238,9 @@ function resolveCoordinateExpr(
     // Projection $(A)!(P)!(B)$
     const projM = inner.match(/^\(([^)]+)\)!\(([^)]+)\)!\(([^)]+)\)$/);
     if (projM) {
-      const a = resolveCoordinateExpr(projM[1], namedCoords, prevPoint, false, vars);
-      const p = resolveCoordinateExpr(projM[2], namedCoords, prevPoint, false, vars);
-      const b = resolveCoordinateExpr(projM[3], namedCoords, prevPoint, false, vars);
+      const a = resolveCoordinateExpr(projM[1], namedCoords, prevPoint, false, vars, customFuncs);
+      const p = resolveCoordinateExpr(projM[2], namedCoords, prevPoint, false, vars, customFuncs);
+      const b = resolveCoordinateExpr(projM[3], namedCoords, prevPoint, false, vars, customFuncs);
       if (a && p && b) {
         const dx = b.x - a.x;
         const dy = b.y - a.y;
@@ -1043,8 +1254,8 @@ function resolveCoordinateExpr(
     // Sum/diff of coordinates: $(A)+(B)$ or $(A)+(1,2)$
     const addM = inner.match(/^\(([^)]+)\)\s*([+-])\s*(?:(\d+(?:\.\d+)?)\s*\*\s*)?\(([^)]+)\)$/);
     if (addM) {
-      const p1 = resolveCoordinateExpr(addM[1], namedCoords, prevPoint, false, vars);
-      const p2 = resolveCoordinateExpr(addM[4], namedCoords, prevPoint, false, vars);
+      const p1 = resolveCoordinateExpr(addM[1], namedCoords, prevPoint, false, vars, customFuncs);
+      const p2 = resolveCoordinateExpr(addM[4], namedCoords, prevPoint, false, vars, customFuncs);
       const factor = addM[3] ? parseFloat(addM[3]) : 1;
       const sign = addM[2] === '-' ? -1 : 1;
       if (p1 && p2) {
@@ -1056,9 +1267,9 @@ function resolveCoordinateExpr(
   // Polar: (angle:radius)
   const colonParts = splitTopLevel(s, ':');
   if (colonParts.length === 2) {
-    const angDeg = evalMathExpr(colonParts[0], vars);
+    const angDeg = evalMathExpr(colonParts[0], vars, false, customFuncs);
     const rad =
-      parseLengthToTikzUnits(colonParts[1]) ?? evalMathExpr(colonParts[1], vars);
+      parseLengthToTikzUnits(colonParts[1]) ?? evalMathExpr(colonParts[1], vars, false, customFuncs);
     if (angDeg !== null && rad !== null) {
       const radAngle = (angDeg * Math.PI) / 180;
       const pt = { x: rad * Math.cos(radAngle), y: rad * Math.sin(radAngle) };
@@ -1069,8 +1280,8 @@ function resolveCoordinateExpr(
   // Cartesian: (x, y)
   const xyParts = splitTopLevel(s, ',');
   if (xyParts.length === 2) {
-    const x = parseLengthToTikzUnits(xyParts[0]) ?? evalMathExpr(xyParts[0], vars);
-    const y = parseLengthToTikzUnits(xyParts[1]) ?? evalMathExpr(xyParts[1], vars);
+    const x = parseLengthToTikzUnits(xyParts[0]) ?? evalMathExpr(xyParts[0], vars, false, customFuncs);
+    const y = parseLengthToTikzUnits(xyParts[1]) ?? evalMathExpr(xyParts[1], vars, false, customFuncs);
     if (x !== null && y !== null) {
       return isRelativeMove ? { x: prevPoint.x + x, y: prevPoint.y + y } : { x, y };
     }
@@ -1079,12 +1290,11 @@ function resolveCoordinateExpr(
   return null;
 }
 
-function getAnchorOffsets(anchor: string | undefined, w: number, h: number): {
+function getAnchorOffsets(anchor: string | undefined, w: number, h: number, pad = 7): {
   dx: number;
   dy: number;
   textAnchor: 'start' | 'middle' | 'end';
 } {
-  const pad = 7;
   switch (anchor) {
     case 'above':
       return { dx: 0, dy: -pad - 3, textAnchor: 'middle' };
@@ -1107,14 +1317,128 @@ function getAnchorOffsets(anchor: string | undefined, w: number, h: number): {
   }
 }
 
+function sampleFunctionPlotSegments(
+  dmn: [number, number],
+  initialSamples: number,
+  evalPoint: (t: number) => { x: number; y: number; sp: Point2D } | null,
+  yMinPx: number,
+  yMaxPx: number,
+  spanYPx: number
+): Point2D[][] {
+  const segs: Point2D[][] = [];
+  let curSeg: Point2D[] = [];
+
+  const flushSeg = () => {
+    if (curSeg.length >= 2) segs.push(curSeg);
+    curSeg = [];
+  };
+
+  const rawSamples: Array<{ t: number; pt: { x: number; y: number; sp: Point2D } | null }> = [];
+  for (let k = 0; k <= initialSamples; k++) {
+    const t = dmn[0] + ((dmn[1] - dmn[0]) * k) / initialSamples;
+    rawSamples.push({ t, pt: evalPoint(t) });
+  }
+
+  // Adaptively subdivide any step where vertical SVG motion is steep or crosses clip edge / asymptote
+  const refined: Array<{ t: number; pt: { x: number; y: number; sp: Point2D } | null }> = [];
+  const subdivide = (
+    a: { t: number; pt: { x: number; y: number; sp: Point2D } | null },
+    b: { t: number; pt: { x: number; y: number; sp: Point2D } | null },
+    depth: number
+  ) => {
+    if (depth < 4 && a.pt && b.pt) {
+      const dyPx = Math.abs(b.pt.sp.y - a.pt.sp.y);
+      const aIn = a.pt.sp.y >= yMinPx && a.pt.sp.y <= yMaxPx;
+      const bIn = b.pt.sp.y >= yMinPx && b.pt.sp.y <= yMaxPx;
+      if ((aIn || bIn) && (dyPx > 28 || aIn !== bIn)) {
+        const midT = (a.t + b.t) * 0.5;
+        const mid = { t: midT, pt: evalPoint(midT) };
+        subdivide(a, mid, depth + 1);
+        subdivide(mid, b, depth + 1);
+        return;
+      }
+    }
+    refined.push(a);
+  };
+
+  for (let k = 0; k < rawSamples.length - 1; k++) {
+    subdivide(rawSamples[k], rawSamples[k + 1], 0);
+  }
+  if (rawSamples.length > 0) refined.push(rawSamples[rawSamples.length - 1]);
+
+  let prevPt: { x: number; y: number; sp: Point2D } | null = null;
+  for (const sample of refined) {
+    const pt = sample.pt;
+    if (!pt || Math.abs(pt.sp.y) > 50000 || Math.abs(pt.sp.x) > 50000) {
+      flushSeg();
+      prevPt = null;
+      continue;
+    }
+
+    const dSvgY = prevPt ? Math.abs(pt.sp.y - prevPt.sp.y) : 0;
+    const isAsymptoteJump =
+      prevPt !== null &&
+      ((prevPt.y * pt.y < 0 && dSvgY > spanYPx * 0.42) || dSvgY > spanYPx * 0.85);
+
+    if (isAsymptoteJump) {
+      flushSeg();
+      prevPt = pt;
+      const spInRange = pt.sp.y >= yMinPx && pt.sp.y <= yMaxPx;
+      if (spInRange) curSeg.push(pt.sp);
+      continue;
+    }
+
+    const spInRange = pt.sp.y >= yMinPx && pt.sp.y <= yMaxPx;
+    if (!spInRange) {
+      if (curSeg.length > 0 && prevPt && prevPt.sp.y >= yMinPx && prevPt.sp.y <= yMaxPx) {
+        const edgeY = pt.sp.y < yMinPx ? yMinPx : yMaxPx;
+        const denom = pt.sp.y - prevPt.sp.y;
+        if (Math.abs(denom) > 1e-6) {
+          const frac = (edgeY - prevPt.sp.y) / denom;
+          curSeg.push({
+            x: prevPt.sp.x + (pt.sp.x - prevPt.sp.x) * frac,
+            y: edgeY,
+          });
+        }
+      }
+      flushSeg();
+      prevPt = pt;
+      continue;
+    }
+
+    if (curSeg.length === 0 && prevPt && (prevPt.sp.y < yMinPx || prevPt.sp.y > yMaxPx)) {
+      const edgeY = prevPt.sp.y < yMinPx ? yMinPx : yMaxPx;
+      const denom = pt.sp.y - prevPt.sp.y;
+      if (Math.abs(denom) > 1e-6) {
+        const frac = (edgeY - prevPt.sp.y) / denom;
+        curSeg.push({
+          x: prevPt.sp.x + (pt.sp.x - prevPt.sp.x) * frac,
+          y: edgeY,
+        });
+      }
+    }
+
+    curSeg.push(pt.sp);
+    prevPt = pt;
+  }
+  flushSeg();
+  return segs;
+}
+
 function renderAxisEnvToItems(
   axisOptsRaw: string,
   axisBody: string,
   unitPx: number,
   customColors: Record<string, string>,
   items: SvgItem[],
-  arrowMarkerIds: Map<string, string>
+  arrowMarkerIds: Map<string, string>,
+  patternsUsed: Map<string, string>,
+  parentVars: Record<string, number> = {},
+  parentCustomFuncs: Record<string, CustomMathFunc> = {}
 ): void {
+  const vars: Record<string, number> = { ...parentVars };
+  const customFuncs: Record<string, CustomMathFunc> = { ...parentCustomFuncs };
+
   const opts: Record<string, string> = {};
   for (const part of splitTopLevel(axisOptsRaw, ',')) {
     const eq = part.indexOf('=');
@@ -1128,10 +1452,14 @@ function renderAxisEnvToItems(
     }
   }
 
-  let xmin = opts.xmin ? evalMathExpr(opts.xmin) ?? -5 : -5;
-  let xmax = opts.xmax ? evalMathExpr(opts.xmax) ?? 5 : 5;
-  let ymin = opts.ymin ? evalMathExpr(opts.ymin) ?? -5 : -5;
-  let ymax = opts.ymax ? evalMathExpr(opts.ymax) ?? 5 : 5;
+  if (opts['declare function']) {
+    parseDeclareFunctionsSpec(opts['declare function'], customFuncs);
+  }
+
+  let xmin = opts.xmin ? evalMathExpr(opts.xmin, vars, false, customFuncs) ?? -5 : -5;
+  let xmax = opts.xmax ? evalMathExpr(opts.xmax, vars, false, customFuncs) ?? 5 : 5;
+  let ymin = opts.ymin ? evalMathExpr(opts.ymin, vars, false, customFuncs) ?? -5 : -5;
+  let ymax = opts.ymax ? evalMathExpr(opts.ymax, vars, false, customFuncs) ?? 5 : 5;
   if (xmax <= xmin) xmax = xmin + 10;
   if (ymax <= ymin) ymax = ymin + 10;
 
@@ -1207,11 +1535,11 @@ function renderAxisEnvToItems(
 
   // Ticks
   const parseTicks = (spec: string | undefined, minV: number, maxV: number): number[] => {
-    if (spec === '\\empty' || spec === 'none') return [];
+    if (spec === '' || spec === '\\empty' || spec === 'none') return [];
     if (spec && spec !== 'true') {
       const out: number[] = [];
       for (const tok of spec.split(',')) {
-        const v = evalMathExpr(tok);
+        const v = evalMathExpr(tok, vars, false, customFuncs);
         if (v !== null && v >= minV - 1e-6 && v <= maxV + 1e-6) out.push(v);
       }
       if (out.length > 0) return out;
@@ -1229,7 +1557,10 @@ function renderAxisEnvToItems(
     return ticks;
   };
 
-  for (const xv of parseTicks(opts.xtick, xmin, xmax)) {
+  const xTickLabels = opts.xticklabels ? splitTopLevel(opts.xticklabels, ',').map((s) => s.trim()) : null;
+  const yTickLabels = opts.yticklabels ? splitTopLevel(opts.yticklabels, ',').map((s) => s.trim()) : null;
+
+  parseTicks(opts.xtick, xmin, xmax).forEach((xv, idx) => {
     const sx = toSvgX(xv);
     const ty = isMiddle && ymin <= 0 && ymax >= 0 ? axisX : plotH;
     items.push({
@@ -1237,14 +1568,18 @@ function renderAxisEnvToItems(
       svg: `<line x1="${sx.toFixed(1)}" y1="${(ty - 3).toFixed(1)}" x2="${sx.toFixed(1)}" y2="${(ty + 3).toFixed(1)}" stroke="#0F172A" stroke-width="0.9"/>`,
       bounds: { minX: sx, minY: ty - 3, maxX: sx, maxY: ty + 3 },
     });
+    const customLbl = xTickLabels?.[idx];
+    const lblTspans = customLbl
+      ? formatTikzLabelToSvg(customLbl, 11).tspans
+      : escapeXmlAttr(String(xv).replace('-', '−'));
     items.push({
       kind: 'text',
-      svg: `<text x="${sx.toFixed(1)}" y="${(ty + 15).toFixed(1)}" font-size="11" font-family="Times New Roman, serif" text-anchor="middle" fill="#0F172A">${escapeXmlAttr(String(xv).replace('-', '−'))}</text>`,
+      svg: `<text x="${sx.toFixed(1)}" y="${(ty + 15).toFixed(1)}" font-size="11" font-family="Times New Roman, serif" text-anchor="middle" fill="#0F172A">${lblTspans}</text>`,
       bounds: { minX: sx - 12, minY: ty + 4, maxX: sx + 12, maxY: ty + 18 },
     });
-  }
+  });
 
-  for (const yv of parseTicks(opts.ytick, ymin, ymax)) {
+  parseTicks(opts.ytick, ymin, ymax).forEach((yv, idx) => {
     const sy = toSvgY(yv);
     const tx = isMiddle && xmin <= 0 && xmax >= 0 ? axisY : 0;
     items.push({
@@ -1252,12 +1587,16 @@ function renderAxisEnvToItems(
       svg: `<line x1="${(tx - 3).toFixed(1)}" y1="${sy.toFixed(1)}" x2="${(tx + 3).toFixed(1)}" y2="${sy.toFixed(1)}" stroke="#0F172A" stroke-width="0.9"/>`,
       bounds: { minX: tx - 3, minY: sy, maxX: tx + 3, maxY: sy },
     });
+    const customLbl = yTickLabels?.[idx];
+    const lblTspans = customLbl
+      ? formatTikzLabelToSvg(customLbl, 11).tspans
+      : escapeXmlAttr(String(yv).replace('-', '−'));
     items.push({
       kind: 'text',
-      svg: `<text x="${(tx - 7).toFixed(1)}" y="${(sy + 4).toFixed(1)}" font-size="11" font-family="Times New Roman, serif" text-anchor="end" fill="#0F172A">${escapeXmlAttr(String(yv).replace('-', '−'))}</text>`,
+      svg: `<text x="${(tx - 7).toFixed(1)}" y="${(sy + 4).toFixed(1)}" font-size="11" font-family="Times New Roman, serif" text-anchor="end" fill="#0F172A">${lblTspans}</text>`,
       bounds: { minX: tx - 26, minY: sy - 7, maxX: tx - 4, maxY: sy + 6 },
     });
-  }
+  });
 
   // Axis labels & title
   if (opts.xlabel) {
@@ -1289,24 +1628,24 @@ function renderAxisEnvToItems(
     });
   }
 
-  // Parse statements inside axis (\addplot, \draw, \node)
+  // Parse statements inside axis (\addplot, \draw, \fill, \coordinate, \node)
   const trigRad = opts['trig format plots'] === 'rad' || opts['trig format'] === 'rad';
   const defaultDomain: [number, number] = (() => {
     if (opts.domain) {
       const dp = opts.domain.split(':');
       if (dp.length === 2) {
-        const a = evalMathExpr(dp[0]);
-        const b = evalMathExpr(dp[1]);
+        const a = evalMathExpr(dp[0], vars, false, customFuncs);
+        const b = evalMathExpr(dp[1], vars, false, customFuncs);
         if (a !== null && b !== null) return [a, b];
       }
     }
     return [xmin, xmax];
   })();
-  const defaultSamples = opts.samples ? Math.max(10, Math.min(300, parseInt(opts.samples, 10) || 80)) : 80;
+  const defaultSamples = opts.samples ? Math.max(10, Math.min(300, parseInt(opts.samples, 10) || 140)) : 140;
   const palette = ['#2563EB', '#DC2626', '#16A34A', '#9333EA', '#EA580C'];
   let plotCount = 0;
 
-  const stmts = splitTopLevel(expandForeachLoops(axisBody), ';');
+  const stmts = splitTopLevel(expandForeachLoops(axisBody, vars, customFuncs), ';');
   const clipId = `axis_clip_${items.length + 1}`;
   let clipRegistered = false;
   const ensureClip = () => {
@@ -1320,6 +1659,8 @@ function renderAxisEnvToItems(
     }
     return clipId;
   };
+
+  const nonPlotStmts: string[] = [];
 
   for (const rawStmt of stmts) {
     const stmt = rawStmt.trim();
@@ -1341,10 +1682,10 @@ function renderAxisEnvToItems(
         fillOpacity: 1,
       };
       plotCount++;
-      const pStyle = parseOptionsString(pOptsRaw, baseState, customColors);
+      const pStyle = parseOptionsString(pOptsRaw, baseState, customColors, unitPx, vars, customFuncs);
       const dmn = pStyle.domain ?? defaultDomain;
-      const smp = pStyle.samples ?? defaultSamples;
-      const ptsList: Point2D[][] = [];
+      const smp = Math.max(40, pStyle.samples ?? defaultSamples);
+      let ptsList: Point2D[][] = [];
 
       if (/^coordinates\s*\{/.test(pBody)) {
         const br = readBalanced(pBody, pBody.indexOf('{'), '{', '}');
@@ -1353,9 +1694,9 @@ function renderAxisEnvToItems(
           const coordRe = /\(([^,]+),([^)]+)\)/g;
           let cm: RegExpExecArray | null;
           while ((cm = coordRe.exec(br.content)) !== null) {
-            const px = evalMathExpr(cm[1]);
-            const py = evalMathExpr(cm[2]);
-            if (px !== null && py !== null) cur.push({ x: px, y: py });
+            const px = evalMathExpr(cm[1], vars, false, customFuncs);
+            const py = evalMathExpr(cm[2], vars, false, customFuncs);
+            if (px !== null && py !== null) cur.push({ x: toSvgX(px), y: toSvgY(py) });
           }
           if (cur.length > 0) ptsList.push(cur);
         }
@@ -1364,33 +1705,25 @@ function renderAxisEnvToItems(
         if (exprStr.startsWith('{') && exprStr.endsWith('}')) {
           exprStr = exprStr.slice(1, -1).trim();
         }
-        let segment: Point2D[] = [];
-        const spanY = ymax - ymin;
-        let prevY: number | null = null;
-        for (let k = 0; k <= smp; k++) {
-          const x = dmn[0] + ((dmn[1] - dmn[0]) * k) / smp;
-          const y = evalMathExpr(exprStr, { x }, trigRad);
-          if (y === null || !Number.isFinite(y) || Math.abs(y) > Math.max(Math.abs(ymax), Math.abs(ymin)) * 10 + 50) {
-            if (segment.length >= 2) ptsList.push(segment);
-            segment = [];
-            prevY = null;
-            continue;
-          }
-          if (prevY !== null && Math.abs(y - prevY) > spanY * 1.8) {
-            if (segment.length >= 2) ptsList.push(segment);
-            segment = [];
-          }
-          segment.push({ x, y });
-          prevY = y;
-        }
-        if (segment.length >= 2) ptsList.push(segment);
+        ptsList = sampleFunctionPlotSegments(
+          dmn,
+          smp,
+          (t) => {
+            const y = evalMathExpr(exprStr, { ...vars, x: t, t }, trigRad || Boolean(pStyle.trigRad), customFuncs);
+            if (y === null || !Number.isFinite(y)) return null;
+            return { x: t, y, sp: { x: toSvgX(t), y: toSvgY(y) } };
+          },
+          -15,
+          plotH + 15,
+          plotH
+        );
       }
 
       const cid = ensureClip();
       const dashAttr = pStyle.dashArray ? ` stroke-dasharray="${pStyle.dashArray}"` : '';
       for (const seg of ptsList) {
         const dStr = seg
-          .map((p, idx) => `${idx === 0 ? 'M' : 'L'} ${toSvgX(p.x).toFixed(2)} ${toSvgY(p.y).toFixed(2)}`)
+          .map((p, idx) => `${idx === 0 ? 'M' : 'L'} ${p.x.toFixed(2)} ${p.y.toFixed(2)}`)
           .join(' ');
         items.push({
           kind: 'path',
@@ -1401,50 +1734,37 @@ function renderAxisEnvToItems(
       continue;
     }
 
-    // \draw or \node inside axis using (x,y) or (axis cs:x,y)
-    const nodeM = stmt.match(/^\\node(?:\s*\[([^\]]*)\])?\s*(?:\(([^)]+)\))?\s*at\s*\(([^)]+)\)\s*\{/);
-    if (nodeM) {
-      const br = readBalanced(stmt, stmt.indexOf('{', nodeM[0].length - 1), '{', '}');
-      if (br) {
-        const rawC = nodeM[3].replace(/^axis cs:/, '').trim();
-        const xy = splitTopLevel(rawC, ',');
-        const nx = xy.length === 2 ? evalMathExpr(xy[0]) : null;
-        const ny = xy.length === 2 ? evalMathExpr(xy[1]) : null;
-        if (nx !== null && ny !== null) {
-          const sx = toSvgX(nx);
-          const sy = toSvgY(ny);
-          const st = parseOptionsString(
-            nodeM[1] || '',
-            {
-              scaleX: 1,
-              scaleY: 1,
-              shiftX: 0,
-              shiftY: 0,
-              rotateDeg: 0,
-              color: '#0F172A',
-              lineWidth: 1,
-              fill: 'none',
-              fillOpacity: 1,
-            },
-            customColors
-          );
-          const f = formatTikzLabelToSvg(br.content, st.fontSize ?? 12);
-          const off = getAnchorOffsets(st.anchor, 14, 14);
-          items.push({
-            kind: 'text',
-            svg: `<text x="${(sx + off.dx).toFixed(1)}" y="${(sy + off.dy).toFixed(1)}" font-size="${st.fontSize ?? 12}" font-family="Times New Roman, serif" text-anchor="${off.textAnchor}" fill="${st.stroke}">${f.tspans}</text>`,
-            bounds: {
-              minX: sx + off.dx - f.plainLength * 4,
-              minY: sy + off.dy - 12,
-              maxX: sx + off.dx + f.plainLength * 4,
-              maxY: sy + off.dy + 4,
-            },
-          });
-        }
-      }
-    }
+    nonPlotStmts.push(`${stmt};`);
   }
-  void unitPx;
+
+  if (nonPlotStmts.length > 0) {
+    const axScaleX = plotW / ((xmax - xmin) * unitPx);
+    const axScaleY = plotH / ((ymax - ymin) * unitPx);
+    const axisScope: TikzScopeState = {
+      scaleX: axScaleX,
+      scaleY: axScaleY,
+      shiftX: -xmin * axScaleX,
+      shiftY: -ymax * axScaleY,
+      rotateDeg: 0,
+      color: '#0F172A',
+      lineWidth: 1.2,
+      fill: 'none',
+      fillOpacity: 1,
+      vars,
+      customFuncs,
+      trigRad,
+    };
+    executeTikzStatements(
+      nonPlotStmts.join('\n'),
+      axisScope,
+      {},
+      customColors,
+      items,
+      arrowMarkerIds,
+      patternsUsed,
+      unitPx
+    );
+  }
 }
 
 function renderTkzTabToItems(
@@ -1558,15 +1878,20 @@ function renderTkzTabToItems(
         bounds: { minX: 4, minY: rY, maxX: labelColW - 4, maxY: rY + rowH },
       });
 
-      const tokens = splitTopLevel(br.content, ',').map((t) => t.trim());
-      // tkzTabLine format: token 0 is before x0, token 1 is at x0, token 2 is between x0 and x1, token 3 is at x1...
+      const tokens = splitTopLevel(br.content, ',').map((t) => {
+        const s = t.trim();
+        return s.startsWith('{') && s.endsWith('}') ? s.slice(1, -1).trim() : s;
+      });
+      // tkzTabLine format: even indices (0, 2, 4, ...) sit at x_0, x_1, x_2, ...;
+      // odd indices (1, 3, 5, ...) sit in the interval between x_k and x_{k+1}.
       tokens.forEach((tok, idx) => {
         if (!tok) return;
-        const isAtNode = idx % 2 === 1;
-        const k = Math.floor((idx - 1) / 2);
-        const cx = isAtNode ? colX(k) : idx === 0 ? labelColW + 14 : (colX(k) + colX(k + 1)) / 2;
+        const isAtNode = idx % 2 === 0;
+        const k = Math.floor(idx / 2);
+        if (k >= numCols || (!isAtNode && k + 1 >= numCols)) return;
+        const cx = isAtNode ? colX(k) : (colX(k) + colX(k + 1)) / 2;
 
-        if (tok === 'd' || tok === '||') {
+        if (tok === 'd' || tok === 'D' || tok === '||' || tok === '\\|\\|') {
           items.push({
             kind: 'line',
             svg: `<line x1="${(cx - 2).toFixed(1)}" y1="${rY}" x2="${(cx - 2).toFixed(1)}" y2="${rY + rowH}" stroke="#0F172A" stroke-width="1.1"/><line x1="${(cx + 2).toFixed(1)}" y1="${rY}" x2="${(cx + 2).toFixed(1)}" y2="${rY + rowH}" stroke="#0F172A" stroke-width="1.1"/>`,
@@ -1595,8 +1920,20 @@ function renderTkzTabToItems(
             bounds: { minX: cx, minY: rY, maxX: cx, maxY: rY + rowH },
           });
         } else if (tok === 'h') {
-          const xStart = idx === 0 ? labelColW : colX(Math.max(0, k));
-          const xEnd = idx === 0 ? colX(0) : colX(Math.min(numCols - 1, k + 1));
+          const xStart = isAtNode
+            ? k === 0
+              ? labelColW
+              : colX(k) - 6
+            : k === 0 && !tokens[0]
+            ? labelColW
+            : colX(k);
+          const xEnd = isAtNode
+            ? k === numCols - 1
+              ? totalW
+              : colX(k) + 6
+            : k === numCols - 2 && !tokens[2 * (numCols - 1)]
+            ? totalW
+            : colX(k + 1);
           items.push({
             kind: 'rect',
             svg: `<rect x="${xStart.toFixed(1)}" y="${rY}" width="${Math.max(10, xEnd - xStart).toFixed(1)}" height="${rowH}" fill="url(#pat_ne)" stroke="none"/>`,
@@ -1916,14 +2253,26 @@ function preprocessTkzEuclide(body: string): {
   );
 
   // Support tkz-fct commands (\tkzInit, \tkzClip, \tkzAxeXY, \tkzDrawX, \tkzDrawY, \tkzFct)
-  let tkzBounds = { xmin: -4, xmax: 4, ymin: -4, ymax: 4 };
+  const localVars: Record<string, number> = {};
+  const initVarRe = /\\(?:(?:g|e|x)?def\\([a-zA-Z]+)\s*\{([^}]*)\}|pgfmath(?:set|truncate)macro\s*\{\\([a-zA-Z]+)\}\s*\{([^}]*)\})/g;
+  let vm: RegExpExecArray | null;
+  while ((vm = initVarRe.exec(out)) !== null) {
+    const vName = vm[1] || vm[3];
+    const vExpr = vm[2] ?? vm[4];
+    if (vName && vExpr !== undefined) {
+      const val = evalMathExpr(vExpr, localVars);
+      if (val !== null) localVars[vName] = val;
+    }
+  }
+
+  const tkzBounds = { xmin: -4, xmax: 4, ymin: -4, ymax: 4 };
   out = out.replace(/\\tkzInit(?:\s*\[([^\]]*)\])?\s*;?/g, (_m, optsRaw: string | undefined) => {
     if (optsRaw) {
       for (const part of splitTopLevel(optsRaw, ',')) {
         const eq = part.indexOf('=');
         if (eq === -1) continue;
         const k = part.slice(0, eq).trim();
-        const v = evalMathExpr(part.slice(eq + 1).trim());
+        const v = evalMathExpr(part.slice(eq + 1).trim(), localVars);
         if (v !== null) {
           if (k === 'xmin') tkzBounds.xmin = v;
           else if (k === 'xmax') tkzBounds.xmax = v;
@@ -1940,7 +2289,7 @@ function preprocessTkzEuclide(body: string): {
   );
   out = out.replace(
     /\\tkzDrawX(?:\s*\[[^\]]*\])?\s*;?/g,
-    () => `\\draw[->] (${tkzBounds.xmin},0) -- (${tkzBounds.xmax},0) node[below]{$x$};`
+    () => `\\draw[->] (${tkzBounds.xmin},0) -- (${tkzBounds.xmax},0) node[above left]{$x$};`
   );
   out = out.replace(
     /\\tkzDrawY(?:\s*\[[^\]]*\])?\s*;?/g,
@@ -1948,20 +2297,35 @@ function preprocessTkzEuclide(body: string): {
   );
   out = out.replace(/\\tkzAxeXY(?:\s*\[[^\]]*\])?\s*;?/g, () => {
     const cmds = [
-      `\\draw[->] (${tkzBounds.xmin},0) -- (${tkzBounds.xmax},0) node[below]{$x$};`,
+      `\\draw[->] (${tkzBounds.xmin},0) -- (${tkzBounds.xmax},0) node[above left]{$x$};`,
       `\\draw[->] (0,${tkzBounds.ymin}) -- (0,${tkzBounds.ymax}) node[left]{$y$};`,
       `\\node[below left] at (0,0) {$O$};`,
     ];
     return cmds.join('\n');
   });
-  out = out.replace(
-    /\\tkzFct(?:\s*\[([^\]]*)\])?\s*\{([^}]*)\}\s*;?/g,
-    (_m, optsRaw: string | undefined, expr: string) => {
-      const o = optsRaw ? `${optsRaw},domain=${tkzBounds.xmin}:${tkzBounds.xmax}` : `domain=${tkzBounds.xmin}:${tkzBounds.xmax}`;
-      const normExpr = expr.replace(/\\x\b/g, 'x').replace(/\bx\b/g, '\\x');
-      return `\\draw[${o}] plot(\\x, {${normExpr}});`;
-    }
-  );
+
+  // Replace \tkzFct[opts]{expr} using balanced brace reader so nested braces inside {expr} work
+  const tkzFctRe = /\\tkzFct(?:\s*\[([^\]]*)\])?\s*\{/;
+  let fctMatch: RegExpExecArray | null;
+  let fctGuard = 0;
+  while ((fctMatch = tkzFctRe.exec(out)) !== null && fctGuard < 60) {
+    fctGuard++;
+    const braceStart = fctMatch.index + fctMatch[0].length - 1;
+    const exprBr = readBalanced(out, braceStart, '{', '}');
+    if (!exprBr) break;
+    let endPos = exprBr.endIdx + 1;
+    while (endPos < out.length && (out[endPos] === ' ' || out[endPos] === '\t')) endPos++;
+    if (out[endPos] === ';') endPos++;
+    const optsRaw = fctMatch[1]?.trim() || '';
+    const hasExplicitDomain = /\bdomain\s*=/.test(optsRaw);
+    const o = hasExplicitDomain
+      ? optsRaw
+      : optsRaw
+      ? `${optsRaw},domain=${tkzBounds.xmin}:${tkzBounds.xmax}`
+      : `domain=${tkzBounds.xmin}:${tkzBounds.xmax}`;
+    const normExpr = exprBr.content.replace(/\\x\b/g, 'x').replace(/\bx\b/g, '\\x');
+    out = out.slice(0, fctMatch.index) + `\\draw[${o}] plot(\\x, {${normExpr}});` + out.slice(endPos);
+  }
 
   return { body: out, presetCoords };
 }
@@ -1976,82 +2340,8 @@ function executeTikzStatements(
   patternsUsed: Map<string, string>,
   unitPx: number
 ): void {
-  const expandedBody = expandForeachLoops(rawBody);
-
-  // Extract \begin{axis}...\end{axis} first
-  let body = expandedBody;
-  const axisRe = /\\begin\{axis\}\s*(?:\[([^\]]*)\])?/;
-  let axisM: RegExpExecArray | null;
-  while ((axisM = axisRe.exec(body)) !== null) {
-    const startInner = axisM.index + axisM[0].length;
-    const endIdx = body.indexOf('\\end{axis}', startInner);
-    if (endIdx === -1) break;
-    renderAxisEnvToItems(
-      axisM[1] || '',
-      body.slice(startInner, endIdx),
-      unitPx,
-      customColors,
-      items,
-      arrowMarkerIds
-    );
-    body = body.slice(0, axisM.index) + body.slice(endIdx + '\\end{axis}'.length);
-  }
-
-  // Handle \begin{scope}...\end{scope} recursively
-  const scopeRe = /\\begin\{scope\}\s*(?:\[([^\]]*)\])?/;
-  let scopeM: RegExpExecArray | null;
-  while ((scopeM = scopeRe.exec(body)) !== null) {
-    const startInner = scopeM.index + scopeM[0].length;
-    // Find matching \end{scope}
-    let depth = 1;
-    let cursor = startInner;
-    let foundEnd = -1;
-    while (cursor < body.length) {
-      if (body.startsWith('\\begin{scope}', cursor)) {
-        depth++;
-        cursor += 13;
-        continue;
-      }
-      if (body.startsWith('\\end{scope}', cursor)) {
-        depth--;
-        if (depth === 0) {
-          foundEnd = cursor;
-          break;
-        }
-        cursor += 11;
-        continue;
-      }
-      cursor++;
-    }
-    if (foundEnd === -1) break;
-    const st = parseOptionsString(scopeM[1] || '', scope, customColors, unitPx);
-    const childScope: TikzScopeState = {
-      ...scope,
-      scaleX: scope.scaleX * (st.scaleX ?? 1),
-      scaleY: scope.scaleY * (st.scaleY ?? 1),
-      shiftX: scope.shiftX + (st.shiftX ?? 0),
-      shiftY: scope.shiftY + (st.shiftY ?? 0),
-      shiftXPx: (scope.shiftXPx ?? 0) + (st.shiftXPx ?? 0),
-      shiftYPx: (scope.shiftYPx ?? 0) + (st.shiftYPx ?? 0),
-      rotateDeg: scope.rotateDeg + (st.rotateDeg ?? 0),
-      color: st.stroke,
-      lineWidth: st.strokeWidth,
-      dashArray: st.dashArray,
-      fill: st.fill,
-      fillOpacity: st.fillOpacity,
-    };
-    executeTikzStatements(
-      body.slice(startInner, foundEnd),
-      childScope,
-      namedCoords,
-      customColors,
-      items,
-      arrowMarkerIds,
-      patternsUsed,
-      unitPx
-    );
-    body = body.slice(0, scopeM.index) + body.slice(foundEnd + '\\end{scope}'.length);
-  }
+  if (!scope.vars) scope.vars = {};
+  if (!scope.customFuncs) scope.customFuncs = {};
 
   const scopeToSvgPt = (pt: Point2D, sc: TikzScopeState): Point2D => {
     let x = pt.x * sc.scaleX + sc.shiftX;
@@ -2085,9 +2375,384 @@ function executeTikzStatements(
     return patternsUsed.get(key)!;
   };
 
-  const statements = splitTopLevel(body, ';');
-  for (const rawStmt of statements) {
-    const stmt = rawStmt.trim();
+  const emitNodeItem = (
+    rawContent: string,
+    nStyle: ReturnType<typeof parseOptionsString>,
+    anchorPt: Point2D,
+    toSvg: (pt: Point2D) => Point2D,
+    targetList: SvgItem[] = items
+  ) => {
+    const sp = toSvg(anchorPt);
+    const fs = nStyle.fontSize ?? 13;
+    const f = formatTikzLabelToSvg(rawContent, fs);
+    const anchorPad =
+      nStyle.anchorDist !== undefined ? 2 + nStyle.anchorDist + (nStyle.innerSep ?? 1.5) : 7;
+    const off = getAnchorOffsets(nStyle.anchor, fs, fs, anchorPad);
+    const tx = sp.x + off.dx + (nStyle.shiftXPx ?? 0) + (nStyle.shiftX ?? 0) * unitPx;
+    const ty = sp.y + off.dy + (nStyle.shiftYPx ?? 0) - (nStyle.shiftY ?? 0) * unitPx;
+    const fw = nStyle.fontWeight ? ` font-weight="${nStyle.fontWeight}"` : '';
+    const textW = Math.max(8, f.plainLength * fs * 0.56);
+    const minTextX =
+      off.textAnchor === 'middle'
+        ? tx - textW / 2
+        : off.textAnchor === 'end'
+        ? tx - textW
+        : tx;
+    const maxTextX = minTextX + textW;
+    const minTextY = ty - fs * 0.85;
+    const maxTextY = ty + fs * 0.25;
+
+    if (nStyle.fill && nStyle.fill !== 'none') {
+      const boxPad = nStyle.innerSep ?? 2;
+      const rx = minTextX - boxPad;
+      const ry = minTextY - boxPad;
+      const rw = textW + boxPad * 2;
+      const rh = maxTextY - minTextY + boxPad * 2;
+      const rxAttr = nStyle.roundedCorners ? ` rx="${nStyle.roundedCorners.toFixed(1)}"` : '';
+      targetList.push({
+        kind: 'rect',
+        svg: `<rect x="${rx.toFixed(1)}" y="${ry.toFixed(1)}" width="${rw.toFixed(1)}" height="${rh.toFixed(1)}" fill="${nStyle.fill}" stroke="none"${rxAttr}/>`,
+        bounds: { minX: rx, minY: ry, maxX: rx + rw, maxY: ry + rh },
+      });
+    }
+
+    targetList.push({
+      kind: 'text',
+      svg: `<text x="${tx.toFixed(1)}" y="${ty.toFixed(1)}" font-size="${fs}" font-family="Times New Roman, serif"${fw} text-anchor="${off.textAnchor}" fill="${nStyle.stroke}">${f.tspans}</text>`,
+      bounds: {
+        minX: minTextX,
+        minY: minTextY - 1,
+        maxX: maxTextX,
+        maxY: maxTextY + 1,
+      },
+    });
+  };
+
+  // Parse flexible TikZ node header: any order of [opts], (name), at (coord) before {text}
+  const parseNodeHeader = (
+    str: string,
+    afterKeywordIdx: number
+  ): { opts: string; name?: string; atCoord?: string; text: string; endIdx: number } | null => {
+    let p = afterKeywordIdx;
+    const optParts: string[] = [];
+    let name: string | undefined;
+    let atCoord: string | undefined;
+    while (p < str.length) {
+      while (p < str.length && /\s/.test(str[p])) p++;
+      if (str[p] === '[') {
+        const brk = readBalanced(str, p, '[', ']');
+        if (!brk) return null;
+        optParts.push(brk.content);
+        p = brk.endIdx + 1;
+        continue;
+      }
+      if (str.startsWith('at', p) && !/[a-zA-Z0-9_]/.test(str[p + 2] || '')) {
+        let q = p + 2;
+        while (q < str.length && /\s/.test(str[q])) q++;
+        if (str[q] === '(') {
+          const par = readBalanced(str, q, '(', ')');
+          if (!par) return null;
+          atCoord = par.content;
+          p = par.endIdx + 1;
+          continue;
+        }
+      }
+      if (str[p] === '(') {
+        const par = readBalanced(str, p, '(', ')');
+        if (!par) return null;
+        name = par.content.trim();
+        p = par.endIdx + 1;
+        continue;
+      }
+      break;
+    }
+    while (p < str.length && /\s/.test(str[p])) p++;
+    if (str[p] !== '{') return null;
+    const textBr = readBalanced(str, p, '{', '}');
+    if (!textBr) return null;
+    return {
+      opts: optParts.join(', '),
+      name,
+      atCoord,
+      text: textBr.content,
+      endIdx: textBr.endIdx,
+    };
+  };
+
+  // Sequential source-order execution over blocks (axis, scope, {...}), loops (\foreach),
+  // local definitions (\def, \pgfmathsetmacro, \tikzset), and `;`-terminated statements.
+  let src = rawBody;
+  let cursor = 0;
+  let loopSafety = 0;
+
+  while (cursor < src.length && loopSafety < 800) {
+    loopSafety++;
+    while (cursor < src.length && (/\s/.test(src[cursor]) || src[cursor] === ';')) cursor++;
+    if (cursor >= src.length) break;
+
+    const rest = src.slice(cursor);
+
+    // 1. \begin{axis}[opts] ... \end{axis}
+    const axisM = rest.match(/^\\begin\{axis\}\s*(?:\[([^\]]*)\])?/);
+    if (axisM) {
+      const startInner = cursor + axisM[0].length;
+      const endIdx = src.indexOf('\\end{axis}', startInner);
+      if (endIdx !== -1) {
+        renderAxisEnvToItems(
+          axisM[1] || '',
+          src.slice(startInner, endIdx),
+          unitPx,
+          customColors,
+          items,
+          arrowMarkerIds,
+          patternsUsed,
+          scope.vars,
+          scope.customFuncs
+        );
+        cursor = endIdx + '\\end{axis}'.length;
+        continue;
+      }
+    }
+
+    // 2. \begin{scope}[opts] ... \end{scope}
+    const scopeM = rest.match(/^\\begin\{scope\}\s*(?:\[([^\]]*)\])?/);
+    if (scopeM) {
+      const startInner = cursor + scopeM[0].length;
+      let depth = 1;
+      let scan = startInner;
+      let foundEnd = -1;
+      while (scan < src.length) {
+        if (src.startsWith('\\begin{scope}', scan)) {
+          depth++;
+          scan += 13;
+          continue;
+        }
+        if (src.startsWith('\\end{scope}', scan)) {
+          depth--;
+          if (depth === 0) {
+            foundEnd = scan;
+            break;
+          }
+          scan += 11;
+          continue;
+        }
+        scan++;
+      }
+      if (foundEnd !== -1) {
+        const st = parseOptionsString(scopeM[1] || '', scope, customColors, unitPx, scope.vars, scope.customFuncs);
+        const childCustomFuncs = {
+          ...(scope.customFuncs || {}),
+          ...(st.customFuncs || {}),
+        };
+        const childScope: TikzScopeState = {
+          ...scope,
+          scaleX: scope.scaleX * (st.scaleX ?? 1),
+          scaleY: scope.scaleY * (st.scaleY ?? 1),
+          shiftX: scope.shiftX + (st.shiftX ?? 0),
+          shiftY: scope.shiftY + (st.shiftY ?? 0),
+          shiftXPx: (scope.shiftXPx ?? 0) + (st.shiftXPx ?? 0),
+          shiftYPx: (scope.shiftYPx ?? 0) + (st.shiftYPx ?? 0),
+          rotateDeg: scope.rotateDeg + (st.rotateDeg ?? 0),
+          color: st.stroke,
+          lineWidth: st.strokeWidth,
+          dashArray: st.dashArray,
+          fill: st.fill,
+          fillOpacity: st.fillOpacity,
+          vars: { ...(scope.vars || {}) },
+          customFuncs: childCustomFuncs,
+          trigRad: st.trigRad ?? scope.trigRad,
+        };
+        executeTikzStatements(
+          src.slice(startInner, foundEnd),
+          childScope,
+          namedCoords,
+          customColors,
+          items,
+          arrowMarkerIds,
+          patternsUsed,
+          unitPx
+        );
+        cursor = foundEnd + '\\end{scope}'.length;
+        continue;
+      }
+    }
+
+    // 3. Bare `{ ... }` grouping block
+    if (src[cursor] === '{') {
+      const grp = readBalanced(src, cursor, '{', '}');
+      if (grp) {
+        const childScope: TikzScopeState = {
+          ...scope,
+          vars: { ...(scope.vars || {}) },
+          customFuncs: { ...(scope.customFuncs || {}) },
+        };
+        executeTikzStatements(
+          grp.content,
+          childScope,
+          namedCoords,
+          customColors,
+          items,
+          arrowMarkerIds,
+          patternsUsed,
+          unitPx
+        );
+        cursor = grp.endIdx + 1;
+        continue;
+      }
+    }
+
+    // 4. \foreach loop (expand in place using active scope vars, then continue executing)
+    const foreachM = rest.match(/^\\foreach\s+(\\[a-zA-Z]+(?:\s*\/\s*\\[a-zA-Z]+)*)\s*(?:\[[^\]]*\])?\s*in\s*\{/);
+    if (foreachM) {
+      const listBr = readBalanced(src, cursor + foreachM[0].length - 1, '{', '}');
+      if (listBr) {
+        let endLoopPos = listBr.endIdx + 1;
+        while (endLoopPos < src.length && /\s/.test(src[endLoopPos])) endLoopPos++;
+        if (src[endLoopPos] === '{') {
+          const bBr = readBalanced(src, endLoopPos, '{', '}');
+          if (bBr) endLoopPos = bBr.endIdx + 1;
+        } else {
+          let semiPos = endLoopPos;
+          let bDepth = 0;
+          let pDepth = 0;
+          let kDepth = 0;
+          let inMath = false;
+          while (semiPos < src.length) {
+            const c = src[semiPos];
+            if (c === '\\' && semiPos + 1 < src.length) {
+              semiPos += 2;
+              continue;
+            }
+            if (c === '$') inMath = !inMath;
+            else if (!inMath) {
+              if (c === '{') bDepth++;
+              else if (c === '}') bDepth = Math.max(0, bDepth - 1);
+              else if (c === '(') pDepth++;
+              else if (c === ')') pDepth = Math.max(0, pDepth - 1);
+              else if (c === '[') kDepth++;
+              else if (c === ']') kDepth = Math.max(0, kDepth - 1);
+              else if (c === ';' && bDepth === 0 && pDepth === 0 && kDepth === 0) {
+                semiPos++;
+                break;
+              }
+            }
+            semiPos++;
+          }
+          endLoopPos = semiPos;
+        }
+        const chunkToExpand = src.slice(cursor, endLoopPos);
+        const expandedChunk = expandForeachLoops(chunkToExpand, scope.vars, scope.customFuncs);
+        src = src.slice(0, cursor) + expandedChunk + src.slice(endLoopPos);
+        continue;
+      }
+    }
+
+    // 5. Local function / variable definitions (\def\f(#1){...}, \pgfmathsetmacro, \pgfmathdeclarefunction, \tikzset)
+    const defFnM = rest.match(/^\\(?:g|e|x)?def\s*\\([a-zA-Z]+)\s*\(([^)]*)\)\s*\{/);
+    if (defFnM) {
+      const fnBr = readBalanced(src, cursor + defFnM[0].length - 1, '{', '}');
+      if (fnBr) {
+        const rawParams = defFnM[2]
+          .split(',')
+          .map((p) => p.trim().replace(/^#/, 'p'))
+          .filter(Boolean);
+        let bodyExpr = fnBr.content.trim();
+        defFnM[2]
+          .split(',')
+          .map((p) => p.trim())
+          .filter(Boolean)
+          .forEach((rawP, idx) => {
+            const paramName = rawParams[idx];
+            if (rawP.startsWith('#')) {
+              bodyExpr = bodyExpr.replace(new RegExp(rawP.replace('#', '#'), 'g'), paramName);
+            }
+          });
+        scope.customFuncs[defFnM[1]] = { params: rawParams, bodyExpr };
+        cursor = fnBr.endIdx + 1;
+        continue;
+      }
+    }
+
+    const pgfMacroM = rest.match(/^\\pgfmath(set|truncate)macro\s*(?:\{\\([a-zA-Z]+)\}|\\([a-zA-Z]+))\s*\{/);
+    if (pgfMacroM) {
+      const valBr = readBalanced(src, cursor + pgfMacroM[0].length - 1, '{', '}');
+      if (valBr) {
+        const varName = pgfMacroM[2] || pgfMacroM[3];
+        let val = evalMathExpr(valBr.content, scope.vars, Boolean(scope.trigRad), scope.customFuncs);
+        if (val !== null) {
+          if (pgfMacroM[1] === 'truncate') val = Math.trunc(val);
+          scope.vars[varName] = val;
+        }
+        cursor = valBr.endIdx + 1;
+        continue;
+      }
+    }
+
+    const pgfDeclM = rest.match(/^\\pgfmathdeclarefunction\s*\{([^}]+)\}\s*\{(\d+)\}\s*\{/);
+    if (pgfDeclM) {
+      const bodyBr = readBalanced(src, cursor + pgfDeclM[0].length - 1, '{', '}');
+      if (bodyBr) {
+        const nArgs = Math.max(1, Math.min(4, parseInt(pgfDeclM[2], 10) || 1));
+        const params = Array.from({ length: nArgs }, (_, idx) => `p${idx + 1}`);
+        let bodyExpr = bodyBr.content.trim().replace(/\\pgfmathparse\s*\{([\s\S]*)\}$/, '$1');
+        for (let k = 1; k <= nArgs; k++) {
+          bodyExpr = bodyExpr.replace(new RegExp(`#${k}`, 'g'), `p${k}`);
+        }
+        scope.customFuncs[pgfDeclM[1].trim()] = { params, bodyExpr };
+        cursor = bodyBr.endIdx + 1;
+        continue;
+      }
+    }
+
+    const defVarM = rest.match(/^\\(?:g|e|x)?def\s*\\([a-zA-Z]+)\s*\{/);
+    if (defVarM) {
+      const valBr = readBalanced(src, cursor + defVarM[0].length - 1, '{', '}');
+      if (valBr) {
+        const val = evalMathExpr(valBr.content, scope.vars, Boolean(scope.trigRad), scope.customFuncs);
+        if (val !== null) scope.vars[defVarM[1]] = val;
+        cursor = valBr.endIdx + 1;
+        continue;
+      }
+    }
+
+    const tikzSetM = rest.match(/^\\tikzset\s*\{/);
+    if (tikzSetM) {
+      const tsBr = readBalanced(src, cursor + tikzSetM[0].length - 1, '{', '}');
+      if (tsBr) {
+        const st = parseOptionsString(tsBr.content, scope, customColors, unitPx, scope.vars, scope.customFuncs);
+        if (st.customFuncs) Object.assign(scope.customFuncs, st.customFuncs);
+        if (st.trigRad !== undefined) scope.trigRad = st.trigRad;
+        cursor = tsBr.endIdx + 1;
+        continue;
+      }
+    }
+
+    // 6. Read single `;`-terminated TikZ statement
+    let endStmt = cursor;
+    let brace = 0;
+    let bracket = 0;
+    let paren = 0;
+    let inMath = false;
+    while (endStmt < src.length) {
+      const ch = src[endStmt];
+      if (ch === '\\' && endStmt + 1 < src.length) {
+        endStmt += 2;
+        continue;
+      }
+      if (ch === '$') inMath = !inMath;
+      else if (!inMath) {
+        if (ch === '{') brace++;
+        else if (ch === '}') brace = Math.max(0, brace - 1);
+        else if (ch === '[') bracket++;
+        else if (ch === ']') bracket = Math.max(0, bracket - 1);
+        else if (ch === '(') paren++;
+        else if (ch === ')') paren = Math.max(0, paren - 1);
+        else if (ch === ';' && brace === 0 && bracket === 0 && paren === 0) break;
+      }
+      endStmt++;
+    }
+    const stmt = src.slice(cursor, endStmt).trim();
+    cursor = endStmt < src.length ? endStmt + 1 : src.length;
     if (!stmt) continue;
 
     // \coordinate[opts] (name) at (x,y)
@@ -2095,11 +2760,11 @@ function executeTikzStatements(
       /^\\coordinate(?:\s*\[([^\]]*)\])?\s*\(([^)]+)\)\s*at\s*\(([^)]+)\)$/
     );
     if (coordM) {
-      const pt = resolveCoordinateExpr(coordM[3], namedCoords, { x: 0, y: 0 }, false, {});
+      const pt = resolveCoordinateExpr(coordM[3], namedCoords, { x: 0, y: 0 }, false, scope.vars, scope.customFuncs);
       if (pt) {
         namedCoords[coordM[2].trim()] = pt;
         if (coordM[1]) {
-          const st = parseOptionsString(coordM[1], scope, customColors);
+          const st = parseOptionsString(coordM[1], scope, customColors, unitPx, scope.vars, scope.customFuncs);
           if (st.labelSpec) {
             const sp = toSvgPt(pt);
             const parts = st.labelSpec.split(':');
@@ -2123,47 +2788,18 @@ function executeTikzStatements(
       continue;
     }
 
-    // \node[opts] (name)? at (x,y) {text}
-    const nodeM = stmt.match(
-      /^\\node(?:\s*\[([^\]]*)\])?\s*(?:\(([^)]+)\))?\s*(?:at\s*\(([^)]+)\))?\s*\{/
-    );
-    if (nodeM) {
-      const braceIdx = stmt.indexOf('{', nodeM[0].length - 1);
-      const br = readBalanced(stmt, braceIdx, '{', '}');
-      if (br) {
-        const pt = nodeM[3]
-          ? resolveCoordinateExpr(nodeM[3], namedCoords, { x: 0, y: 0 }, false, {})
+    // \node[opts] (name)? at (x,y) {text} (supports options/at/name in any order)
+    if (/^\\node(?![a-zA-Z])/.test(stmt)) {
+      const parsedNode = parseNodeHeader(stmt, 5);
+      if (parsedNode) {
+        const pt = parsedNode.atCoord
+          ? resolveCoordinateExpr(parsedNode.atCoord, namedCoords, { x: 0, y: 0 }, false, scope.vars, scope.customFuncs)
           : { x: 0, y: 0 };
         if (pt) {
-          if (nodeM[2]) namedCoords[nodeM[2].trim()] = pt;
-          const st = parseOptionsString(nodeM[1] || '', scope, customColors, unitPx);
-          const sp = toSvgPt(pt);
-          const f = formatTikzLabelToSvg(br.content, st.fontSize ?? 13);
-          const off = getAnchorOffsets(st.anchor, 14, 14);
-          const tx = sp.x + off.dx + (st.shiftXPx ?? 0) + (st.shiftX ?? 0) * unitPx;
-          const ty = sp.y + off.dy + (st.shiftYPx ?? 0) - (st.shiftY ?? 0) * unitPx;
-          const fw = st.fontWeight ? ` font-weight="${st.fontWeight}"` : '';
-          const halfW = Math.max(8, f.plainLength * 4.5);
-          items.push({
-            kind: 'text',
-            svg: `<text x="${tx.toFixed(1)}" y="${ty.toFixed(1)}" font-size="${st.fontSize ?? 13}" font-family="Times New Roman, serif"${fw} text-anchor="${off.textAnchor}" fill="${st.stroke}">${f.tspans}</text>`,
-            bounds: {
-              minX:
-                off.textAnchor === 'middle'
-                  ? tx - halfW
-                  : off.textAnchor === 'end'
-                  ? tx - halfW * 2
-                  : tx,
-              minY: ty - 14,
-              maxX:
-                off.textAnchor === 'middle'
-                  ? tx + halfW
-                  : off.textAnchor === 'start'
-                  ? tx + halfW * 2
-                  : tx,
-              maxY: ty + 5,
-            },
-          });
+          if (parsedNode.name) namedCoords[parsedNode.name] = pt;
+          const nodeBase: TikzScopeState = { ...scope, fill: 'none' };
+          const st = parseOptionsString(parsedNode.opts, nodeBase, customColors, unitPx, scope.vars, scope.customFuncs);
+          emitNodeItem(parsedNode.text, st, pt, toSvgPt);
         }
       }
       continue;
@@ -2176,7 +2812,7 @@ function executeTikzStatements(
     if (!drawM) continue;
 
     const cmd = drawM[1];
-    const st = parseOptionsString(drawM[2] || '', scope, customColors, unitPx);
+    const st = parseOptionsString(drawM[2] || '', scope, customColors, unitPx, scope.vars, scope.customFuncs);
     const isClipStmt = cmd === 'clip' || Boolean(st.isClip);
     if (cmd === 'fill' || cmd === 'filldraw' || cmd === 'shadedraw' || cmd === 'shade') {
       if (st.fill === 'none') st.fill = st.stroke;
@@ -2207,7 +2843,9 @@ function executeTikzStatements(
     let curPt: Point2D = { x: 0, y: 0 };
     let startPt: Point2D = { x: 0, y: 0 };
     let hasSubpath = false;
-    let dCmds: string[] = [];
+    const dCmds: string[] = [];
+    const deferredNodeItems: SvgItem[] = [];
+    const nodeBaseScope: TikzScopeState = { ...drawScope, fill: 'none' };
     let minX = Infinity;
     let minY = Infinity;
     let maxX = -Infinity;
@@ -2242,7 +2880,7 @@ function executeTikzStatements(
       if (pathStr[idx] === '(') {
         const paren = readBalanced(pathStr, idx, '(', ')');
         if (!paren) break;
-        const pt = resolveCoordinateExpr(paren.content, namedCoords, curPt, relMode, {});
+        const pt = resolveCoordinateExpr(paren.content, namedCoords, curPt, relMode, scope.vars, scope.customFuncs);
         idx = paren.endIdx + 1;
         if (pt) {
           const sp = localToSvgPt(pt);
@@ -2273,9 +2911,33 @@ function executeTikzStatements(
         idx += 2;
         while (idx < pathStr.length && /\s/.test(pathStr[idx])) idx++;
 
+        // Support inline `node[opts]{text}` placed between `--` and `(nextPt)`
+        const pendingMidNodes: Array<{ opts: string; text: string }> = [];
+        while (pathStr.startsWith('node', idx) && !/[a-zA-Z]/.test(pathStr[idx + 4] || '')) {
+          const parsedMid = parseNodeHeader(pathStr, idx + 4);
+          if (!parsedMid) break;
+          pendingMidNodes.push({ opts: parsedMid.opts, text: parsedMid.text });
+          idx = parsedMid.endIdx + 1;
+          while (idx < pathStr.length && /\s/.test(pathStr[idx])) idx++;
+        }
+
         if (pathStr.startsWith('cycle', idx)) {
           idx += 5;
           dCmds.push('Z');
+          for (const pn of pendingMidNodes) {
+            const nStyle = parseOptionsString(pn.opts, nodeBaseScope, customColors, unitPx, scope.vars, scope.customFuncs);
+            const tPos = nStyle.pos ?? 0.5;
+            emitNodeItem(
+              pn.text,
+              nStyle,
+              {
+                x: curPt.x + (startPt.x - curPt.x) * tPos,
+                y: curPt.y + (startPt.y - curPt.y) * tPos,
+              },
+              localToSvgPt,
+              deferredNodeItems
+            );
+          }
           curPt = startPt;
           continue;
         }
@@ -2295,7 +2957,7 @@ function executeTikzStatements(
         if (pathStr[idx] === '(') {
           const paren = readBalanced(pathStr, idx, '(', ')');
           if (!paren) break;
-          const nextPt = resolveCoordinateExpr(paren.content, namedCoords, curPt, rMode, {});
+          const nextPt = resolveCoordinateExpr(paren.content, namedCoords, curPt, rMode, scope.vars, scope.customFuncs);
           idx = paren.endIdx + 1;
           if (nextPt) {
             if (conn === '|-') {
@@ -2312,6 +2974,20 @@ function executeTikzStatements(
             dCmds.push(`L ${sp.x.toFixed(2)} ${sp.y.toFixed(2)}`);
             lastSegFrom = curPt;
             lastSegTo = nextPt;
+            for (const pn of pendingMidNodes) {
+              const nStyle = parseOptionsString(pn.opts, nodeBaseScope, customColors, unitPx, scope.vars, scope.customFuncs);
+              const tPos = nStyle.pos ?? 0.5;
+              emitNodeItem(
+                pn.text,
+                nStyle,
+                {
+                  x: lastSegFrom.x + (lastSegTo.x - lastSegFrom.x) * tPos,
+                  y: lastSegFrom.y + (lastSegTo.y - lastSegFrom.y) * tPos,
+                },
+                localToSvgPt,
+                deferredNodeItems
+              );
+            }
             if (uCur) curPt = nextPt;
           }
         }
@@ -2326,16 +3002,17 @@ function executeTikzStatements(
             /^\.\.\s*controls\s*\(([^)]+)\)\s*(?:and\s*\(([^)]+)\)\s*)?\.\.\s*(?:(\+\+|\+))?\s*\(([^)]+)\)/
           );
         if (ctrlM) {
-          const c1 = resolveCoordinateExpr(ctrlM[1], namedCoords, curPt, false, {});
+          const c1 = resolveCoordinateExpr(ctrlM[1], namedCoords, curPt, false, scope.vars, scope.customFuncs);
           const c2 = ctrlM[2]
-            ? resolveCoordinateExpr(ctrlM[2], namedCoords, curPt, false, {})
+            ? resolveCoordinateExpr(ctrlM[2], namedCoords, curPt, false, scope.vars, scope.customFuncs)
             : c1;
           const endPt = resolveCoordinateExpr(
             ctrlM[4],
             namedCoords,
             curPt,
             Boolean(ctrlM[3]),
-            {}
+            scope.vars,
+            scope.customFuncs
           );
           if (c1 && c2 && endPt) {
             const sc1 = localToSvgPt(c1);
@@ -2363,7 +3040,7 @@ function executeTikzStatements(
         if (parenIdx !== -1 && restR.startsWith('(')) {
           const paren = readBalanced(pathStr, parenIdx, '(', ')');
           if (paren) {
-            const p2 = resolveCoordinateExpr(paren.content, namedCoords, curPt, false, {});
+            const p2 = resolveCoordinateExpr(paren.content, namedCoords, curPt, false, scope.vars, scope.customFuncs);
             if (p2) {
               const s1 = localToSvgPt(curPt);
               const s2 = localToSvgPt(p2);
@@ -2386,15 +3063,28 @@ function executeTikzStatements(
 
       // circle (r) or circle [radius=r]
       if (pathStr.startsWith('circle', idx)) {
+        const parseCircleRadiusPx = (rawExpr: string): number | null => {
+          const trimmed = rawExpr.trim();
+          const unitM = trimmed.match(/^(-?\d+(?:\.\d+)?)\s*(cm|mm|pt|em|ex|in|px)$/i);
+          const sc = Math.abs(drawScope.scaleX);
+          if (unitM) {
+            const basePx = parseLengthToPx(trimmed, unitPx);
+            if (basePx === null) return null;
+            const scaled = basePx * sc;
+            return unitM[2].toLowerCase() === 'pt' && parseFloat(unitM[1]) >= 1
+              ? Math.max(1.5, scaled)
+              : scaled;
+          }
+          const unitless = evalMathExpr(trimmed, scope.vars, false, scope.customFuncs);
+          return unitless !== null ? unitless * unitPx * sc : null;
+        };
         let rPx: number | null = null;
         let nextIdx = idx + 6;
         while (nextIdx < pathStr.length && /\s/.test(pathStr[nextIdx])) nextIdx++;
         if (pathStr[nextIdx] === '(') {
           const paren = readBalanced(pathStr, nextIdx, '(', ')');
           if (paren) {
-            rPx =
-              parseLengthToPx(paren.content, unitPx * Math.abs(drawScope.scaleX)) ??
-              (evalMathExpr(paren.content) ?? 0) * unitPx * Math.abs(drawScope.scaleX);
+            rPx = parseCircleRadiusPx(paren.content);
             nextIdx = paren.endIdx + 1;
           }
         } else if (pathStr[nextIdx] === '[') {
@@ -2402,9 +3092,7 @@ function executeTikzStatements(
           if (brk) {
             const radM = brk.content.match(/radius\s*=\s*([^,\]]+)/);
             if (radM) {
-              rPx =
-                parseLengthToPx(radM[1], unitPx * Math.abs(drawScope.scaleX)) ??
-                (evalMathExpr(radM[1]) ?? 0) * unitPx * Math.abs(drawScope.scaleX);
+              rPx = parseCircleRadiusPx(radM[1]);
             }
             nextIdx = brk.endIdx + 1;
           }
@@ -2434,9 +3122,9 @@ function executeTikzStatements(
           if (paren) {
             const parts = paren.content.split(':');
             if (parts.length === 3) {
-              aStart = evalMathExpr(parts[0]);
-              aEnd = evalMathExpr(parts[1]);
-              rUnits = parseLengthToTikzUnits(parts[2], unitPx) ?? evalMathExpr(parts[2]);
+              aStart = evalMathExpr(parts[0], scope.vars, false, scope.customFuncs);
+              aEnd = evalMathExpr(parts[1], scope.vars, false, scope.customFuncs);
+              rUnits = parseLengthToTikzUnits(parts[2], unitPx) ?? evalMathExpr(parts[2], scope.vars, false, scope.customFuncs);
             }
             nextIdx = paren.endIdx + 1;
           }
@@ -2447,9 +3135,9 @@ function executeTikzStatements(
             const em = brk.content.match(/end angle\s*=\s*([^,\]]+)/);
             const rm = brk.content.match(/radius\s*=\s*([^,\]]+)/);
             if (sm && em && rm) {
-              aStart = evalMathExpr(sm[1]);
-              aEnd = evalMathExpr(em[1]);
-              rUnits = parseLengthToTikzUnits(rm[1], unitPx) ?? evalMathExpr(rm[1]);
+              aStart = evalMathExpr(sm[1], scope.vars, false, scope.customFuncs);
+              aEnd = evalMathExpr(em[1], scope.vars, false, scope.customFuncs);
+              rUnits = parseLengthToTikzUnits(rm[1], unitPx) ?? evalMathExpr(rm[1], scope.vars, false, scope.customFuncs);
             }
             nextIdx = brk.endIdx + 1;
           }
@@ -2488,7 +3176,7 @@ function executeTikzStatements(
         if (pathStr[nextIdx] === '(') {
           const paren = readBalanced(pathStr, nextIdx, '(', ')');
           if (paren) {
-            const p2 = resolveCoordinateExpr(paren.content, namedCoords, curPt, false, {});
+            const p2 = resolveCoordinateExpr(paren.content, namedCoords, curPt, false, scope.vars, scope.customFuncs);
             if (p2) {
               const step = st.step ?? 1;
               const x0 = Math.min(curPt.x, p2.x);
@@ -2528,7 +3216,18 @@ function executeTikzStatements(
             nextIdx = brk.endIdx + 1;
           }
         }
-        const pStyle = parseOptionsString(plotOptsRaw, drawScope, customColors, unitPx);
+        const pStyle = parseOptionsString(plotOptsRaw, drawScope, customColors, unitPx, scope.vars, scope.customFuncs);
+        const plotScope: TikzScopeState = {
+          ...drawScope,
+          scaleX: drawScope.scaleX * (pStyle.scaleX ?? 1),
+          scaleY: drawScope.scaleY * (pStyle.scaleY ?? 1),
+          shiftX: drawScope.shiftX + (pStyle.shiftX ?? 0),
+          shiftY: drawScope.shiftY + (pStyle.shiftY ?? 0),
+          shiftXPx: (drawScope.shiftXPx ?? 0) + (pStyle.shiftXPx ?? 0),
+          shiftYPx: (drawScope.shiftYPx ?? 0) + (pStyle.shiftYPx ?? 0),
+          rotateDeg: drawScope.rotateDeg + (pStyle.rotateDeg ?? 0),
+        };
+        const plotToSvgPt = (pt: Point2D): Point2D => scopeToSvgPt(pt, plotScope);
         while (nextIdx < pathStr.length && /\s/.test(pathStr[nextIdx])) nextIdx++;
         if (pathStr.startsWith('coordinates', nextIdx)) {
           const braceIdx = pathStr.indexOf('{', nextIdx);
@@ -2539,10 +3238,10 @@ function executeTikzStatements(
               let cm: RegExpExecArray | null;
               let first = true;
               while ((cm = coordRe.exec(br.content)) !== null) {
-                const px = evalMathExpr(cm[1]);
-                const py = evalMathExpr(cm[2]);
+                const px = evalMathExpr(cm[1], scope.vars, Boolean(scope.trigRad), scope.customFuncs);
+                const py = evalMathExpr(cm[2], scope.vars, Boolean(scope.trigRad), scope.customFuncs);
                 if (px !== null && py !== null) {
-                  const sp = localToSvgPt({ x: px, y: py });
+                  const sp = plotToSvgPt({ x: px, y: py });
                   expandBBox(sp.x, sp.y);
                   dCmds.push(`${first ? 'M' : 'L'} ${sp.x.toFixed(2)} ${sp.y.toFixed(2)}`);
                   first = false;
@@ -2560,70 +3259,32 @@ function executeTikzStatements(
               const varMatch = xy[0].match(/\\[a-zA-Z]+/);
               const varName = varMatch ? varMatch[0] : 'x';
               const dmn = pStyle.domain ?? st.domain ?? [-3, 3];
-              const smp = Math.max(80, pStyle.samples ?? st.samples ?? 120);
+              const smp = Math.max(60, pStyle.samples ?? st.samples ?? 180);
               const cb = scope.clipBounds;
-              const yMinPx = cb ? cb.minY - 40 : -650;
-              const yMaxPx = cb ? cb.maxY + 40 : 650;
-              const maxAbsY = cb ? 400 : Math.max(16, Math.abs(dmn[1] - dmn[0]) * 2.5);
+              const yMinPx = cb ? cb.minY - 40 : -1200;
+              const yMaxPx = cb ? cb.maxY + 40 : 1200;
+              const spanYPx = cb ? Math.max(80, cb.maxY - cb.minY) : 320;
+              const useRad = Boolean(scope.trigRad || st.trigRad || pStyle.trigRad);
 
-              let first = true;
-              let prevY: number | null = null;
-              let prevSp: Point2D | null = null;
-              for (let k = 0; k <= smp; k++) {
-                const t = dmn[0] + ((dmn[1] - dmn[0]) * k) / smp;
-                const vars = { [varName]: t, x: t, t };
-                const px = evalMathExpr(xy[0], vars);
-                const py = evalMathExpr(xy[1], vars);
-                if (px === null || py === null || !Number.isFinite(py) || Math.abs(py) > maxAbsY) {
-                  first = true;
-                  prevY = null;
-                  prevSp = null;
-                  continue;
-                }
-                const sp = localToSvgPt({ x: px, y: py });
-                const isAsymptoteJump =
-                  prevY !== null &&
-                  (Math.abs(py - prevY) > 15 || (prevY * py < 0 && Math.abs(py - prevY) > 6));
-                if (isAsymptoteJump) {
-                  first = true;
-                  prevSp = null;
-                }
-
-                const spInRange = sp.y >= yMinPx && sp.y <= yMaxPx;
-                if (!spInRange) {
-                  if (!first && prevSp && prevSp.y >= yMinPx && prevSp.y <= yMaxPx) {
-                    const edgeY = sp.y < yMinPx ? yMinPx : yMaxPx;
-                    const denom = sp.y - prevSp.y;
-                    if (Math.abs(denom) > 1e-6) {
-                      const frac = (edgeY - prevSp.y) / denom;
-                      const edgeX = prevSp.x + (sp.x - prevSp.x) * frac;
-                      expandBBox(edgeX, edgeY);
-                      dCmds.push(`L ${edgeX.toFixed(2)} ${edgeY.toFixed(2)}`);
-                    }
-                  }
-                  first = true;
-                  prevY = py;
-                  prevSp = sp;
-                  continue;
-                }
-
-                if (first && prevSp && (prevSp.y < yMinPx || prevSp.y > yMaxPx) && !isAsymptoteJump) {
-                  const edgeY = prevSp.y < yMinPx ? yMinPx : yMaxPx;
-                  const denom = sp.y - prevSp.y;
-                  if (Math.abs(denom) > 1e-6) {
-                    const frac = (edgeY - prevSp.y) / denom;
-                    const edgeX = prevSp.x + (sp.x - prevSp.x) * frac;
-                    expandBBox(edgeX, edgeY);
-                    dCmds.push(`M ${edgeX.toFixed(2)} ${edgeY.toFixed(2)}`);
-                    first = false;
-                  }
-                }
-
-                expandBBox(sp.x, sp.y);
-                dCmds.push(`${first ? 'M' : 'L'} ${sp.x.toFixed(2)} ${sp.y.toFixed(2)}`);
-                first = false;
-                prevY = py;
-                prevSp = sp;
+              const segs = sampleFunctionPlotSegments(
+                dmn,
+                smp,
+                (t) => {
+                  const vars = { ...(scope.vars || {}), [varName]: t, x: t, t };
+                  const px = evalMathExpr(xy[0], vars, useRad, scope.customFuncs);
+                  const py = evalMathExpr(xy[1], vars, useRad, scope.customFuncs);
+                  if (px === null || py === null || !Number.isFinite(py)) return null;
+                  return { x: px, y: py, sp: plotToSvgPt({ x: px, y: py }) };
+                },
+                yMinPx,
+                yMaxPx,
+                spanYPx
+              );
+              for (const seg of segs) {
+                seg.forEach((sp, sIdx) => {
+                  expandBBox(sp.x, sp.y);
+                  dCmds.push(`${sIdx === 0 ? 'M' : 'L'} ${sp.x.toFixed(2)} ${sp.y.toFixed(2)}`);
+                });
               }
             }
             idx = paren.endIdx + 1;
@@ -2633,51 +3294,22 @@ function executeTikzStatements(
       }
 
       // Inline node[...] {...} along path
-      if (pathStr.startsWith('node', idx)) {
-        const restN = pathStr.slice(idx);
-        const nm = restN.match(/^node(?:\s*\[([^\]]*)\])?\s*(?:\(([^)]+)\))?\s*\{/);
-        if (nm) {
-          const braceIdx = idx + nm[0].length - 1;
-          const br = readBalanced(pathStr, braceIdx, '{', '}');
-          if (br) {
-            const nStyle = parseOptionsString(nm[1] || '', drawScope, customColors, unitPx);
-            const tPos = nStyle.pos ?? 1;
-            const anchorPt: Point2D =
-              nStyle.pos !== undefined
-                ? {
-                    x: lastSegFrom.x + (lastSegTo.x - lastSegFrom.x) * tPos,
-                    y: lastSegFrom.y + (lastSegTo.y - lastSegFrom.y) * tPos,
-                  }
-                : curPt;
-            const sp = localToSvgPt(anchorPt);
-            const f = formatTikzLabelToSvg(br.content, nStyle.fontSize ?? 13);
-            const off = getAnchorOffsets(nStyle.anchor, 14, 14);
-            const tx = sp.x + off.dx + (nStyle.shiftXPx ?? 0) + (nStyle.shiftX ?? 0) * unitPx;
-            const ty = sp.y + off.dy + (nStyle.shiftYPx ?? 0) - (nStyle.shiftY ?? 0) * unitPx;
-            const halfW = Math.max(8, f.plainLength * 4.5);
-            items.push({
-              kind: 'text',
-              svg: `<text x="${tx.toFixed(1)}" y="${ty.toFixed(1)}" font-size="${nStyle.fontSize ?? 13}" font-family="Times New Roman, serif" text-anchor="${off.textAnchor}" fill="${nStyle.stroke}">${f.tspans}</text>`,
-              bounds: {
-                minX:
-                  off.textAnchor === 'middle'
-                    ? tx - halfW
-                    : off.textAnchor === 'end'
-                    ? tx - halfW * 2
-                    : tx,
-                minY: ty - 14,
-                maxX:
-                  off.textAnchor === 'middle'
-                    ? tx + halfW
-                    : off.textAnchor === 'start'
-                    ? tx + halfW * 2
-                    : tx,
-                maxY: ty + 5,
-              },
-            });
-            idx = br.endIdx + 1;
-            continue;
-          }
+      if (pathStr.startsWith('node', idx) && !/[a-zA-Z]/.test(pathStr[idx + 4] || '')) {
+        const parsedInline = parseNodeHeader(pathStr, idx + 4);
+        if (parsedInline) {
+          const nStyle = parseOptionsString(parsedInline.opts, nodeBaseScope, customColors, unitPx, scope.vars, scope.customFuncs);
+          const tPos = nStyle.pos ?? 1;
+          const anchorPt: Point2D = parsedInline.atCoord
+            ? resolveCoordinateExpr(parsedInline.atCoord, namedCoords, curPt, false, scope.vars, scope.customFuncs) ?? curPt
+            : nStyle.pos !== undefined
+            ? {
+                x: lastSegFrom.x + (lastSegTo.x - lastSegFrom.x) * tPos,
+                y: lastSegFrom.y + (lastSegTo.y - lastSegFrom.y) * tPos,
+              }
+            : curPt;
+          emitNodeItem(parsedInline.text, nStyle, anchorPt, localToSvgPt, deferredNodeItems);
+          idx = parsedInline.endIdx + 1;
+          continue;
         }
       }
 
@@ -2710,7 +3342,7 @@ function executeTikzStatements(
         if (pathStr[nextIdx] === '(') {
           const paren = readBalanced(pathStr, nextIdx, '(', ')');
           if (paren) {
-            const nextPt = resolveCoordinateExpr(paren.content, namedCoords, curPt, false, {});
+            const nextPt = resolveCoordinateExpr(paren.content, namedCoords, curPt, false, scope.vars, scope.customFuncs);
             if (nextPt) {
             const s1 = localToSvgPt(curPt);
             const s2 = localToSvgPt(nextPt);
@@ -2772,6 +3404,7 @@ function executeTikzStatements(
           maxX: maxX + arrowPad,
           maxY: maxY + arrowPad,
         };
+        let clippedOut = false;
         if (scope.clipBounds && !isClipStmt) {
           const cb = scope.clipBounds;
           itemBounds = {
@@ -2781,35 +3414,40 @@ function executeTikzStatements(
             maxY: Math.min(cb.maxY, itemBounds.maxY),
           };
           if (itemBounds.minX > itemBounds.maxX || itemBounds.minY > itemBounds.maxY) {
-            continue;
+            clippedOut = true;
           }
         }
-        let fillAttr = 'none';
-        let fillOpAttr = '';
-        if (doFill && !isClipStmt) {
-          if (st.pattern) {
-            const patId = ensurePattern(st.pattern, st.patternColor ?? st.stroke);
-            fillAttr = `url(#${patId})`;
-          } else {
-            fillAttr = st.fill;
-            if (st.fillOpacity < 1) fillOpAttr = ` fill-opacity="${st.fillOpacity}"`;
+        if (!clippedOut) {
+          let fillAttr = 'none';
+          let fillOpAttr = '';
+          if (doFill && !isClipStmt) {
+            if (st.pattern) {
+              const patId = ensurePattern(st.pattern, st.patternColor ?? st.stroke);
+              fillAttr = `url(#${patId})`;
+            } else {
+              fillAttr = st.fill;
+              if (st.fillOpacity < 1) fillOpAttr = ` fill-opacity="${st.fillOpacity}"`;
+            }
           }
-        }
-        const strokeAttr = doStroke ? st.stroke : 'none';
-        const dashAttr = st.dashArray ? ` stroke-dasharray="${st.dashArray}"` : '';
-        const opAttr = st.strokeOpacity < 1 ? ` stroke-opacity="${st.strokeOpacity}"` : '';
-        const mStart =
-          doStroke && st.arrowStart ? ` marker-start="url(#${ensureArrow(st.stroke)})"` : '';
-        const mEnd =
-          doStroke && st.arrowEnd ? ` marker-end="url(#${ensureArrow(st.stroke)})"` : '';
-        const clipAttr = scope.clipId && !isClipStmt ? ` clip-path="url(#${scope.clipId})"` : '';
+          const strokeAttr = doStroke ? st.stroke : 'none';
+          const dashAttr = st.dashArray ? ` stroke-dasharray="${st.dashArray}"` : '';
+          const opAttr = st.strokeOpacity < 1 ? ` stroke-opacity="${st.strokeOpacity}"` : '';
+          const mStart =
+            doStroke && st.arrowStart ? ` marker-start="url(#${ensureArrow(st.stroke)})"` : '';
+          const mEnd =
+            doStroke && st.arrowEnd ? ` marker-end="url(#${ensureArrow(st.stroke)})"` : '';
+          const clipAttr = scope.clipId && !isClipStmt ? ` clip-path="url(#${scope.clipId})"` : '';
 
-        items.push({
-          kind: 'path',
-          svg: `<path d="${dStr}" fill="${fillAttr}"${fillOpAttr} stroke="${strokeAttr}" stroke-width="${st.strokeWidth}"${dashAttr}${opAttr} stroke-linecap="round" stroke-linejoin="round"${mStart}${mEnd}${clipAttr}/>`,
-          bounds: itemBounds,
-        });
+          items.push({
+            kind: 'path',
+            svg: `<path d="${dStr}" fill="${fillAttr}"${fillOpAttr} stroke="${strokeAttr}" stroke-width="${st.strokeWidth}"${dashAttr}${opAttr} stroke-linecap="round" stroke-linejoin="round"${mStart}${mEnd}${clipAttr}/>`,
+            bounds: itemBounds,
+          });
+        }
       }
+    }
+    if (deferredNodeItems.length > 0) {
+      items.push(...deferredNodeItems);
     }
   }
 }
@@ -2962,6 +3600,8 @@ export function renderLatexPictureToSvgDataUrl(
       baseScope.color = st.stroke;
       baseScope.lineWidth = st.strokeWidth;
       baseScope.dashArray = st.dashArray;
+      if (st.customFuncs) baseScope.customFuncs = st.customFuncs;
+      if (st.trigRad !== undefined) baseScope.trigRad = st.trigRad;
     }
 
     if (/\\tkzTab(?:Init|Line|Var)/.test(body)) {

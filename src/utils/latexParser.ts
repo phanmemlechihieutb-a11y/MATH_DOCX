@@ -5,7 +5,7 @@ import type {
   PageExtraction,
   TableCellData,
 } from '../types/document.ts';
-import { renderLatexPictureToSvgDataUrl } from './tikzRenderer.ts';
+import { evaluateTikzMathExpr, renderLatexPictureToSvgDataUrl } from './tikzRenderer.ts';
 
 export type LatexPasteMode = 'auto' | 'bare_latex';
 
@@ -412,56 +412,138 @@ function preprocessDocumentAndMacros(raw: string): {
   body = stripBalancedCommand(body, /\\institute(?![a-zA-Z])/, 1, true);
   body = stripBalancedCommand(body, /\\affiliation(?![a-zA-Z])/, 1, true);
 
-  const macros: ExtractedMacro[] = [];
+  const preambleMacros = new Map<string, ExtractedMacro>();
   const envMacros: ExtractedEnvMacro[] = [];
   const customTheorems: Record<string, CustomTheoremDef> = {};
   const customColors: Record<string, string> = {};
 
+  const parseMacrosIntoMap = (src: string, target: Map<string, ExtractedMacro>) => {
+    // Collect preamble macros in source order (excluding \def\f(#1){...} TikZ function defs)
+    const tokenRe = /\\(?:(?:re|provide)?newcommand\*?|DeclareRobustCommand\*?|DeclareMathOperator\*?|(?:g|e|x)?def|pgfmath(?:set|truncate)macro)(?![a-zA-Z])/g;
+    let m: RegExpExecArray | null;
+    while ((m = tokenRe.exec(src)) !== null) {
+      const cmdRaw = m[0];
+      let pos = skipSpaces(src, m.index + cmdRaw.length);
+
+      if (cmdRaw.startsWith('\\DeclareMathOperator')) {
+        const starred = cmdRaw.endsWith('*');
+        if (src[pos] === '{') {
+          const nameBr = readBalancedBraces(src, pos);
+          if (nameBr && nameBr.content.trim().startsWith('\\')) {
+            const name = nameBr.content.trim().slice(1);
+            pos = skipSpaces(src, nameBr.endIdx + 1);
+            if (src[pos] === '{') {
+              const bodyBr = readBalancedBraces(src, pos);
+              if (bodyBr) {
+                target.set(name, {
+                  name,
+                  argCount: 0,
+                  body: starred ? `\\operatorname*{${bodyBr.content}}` : `\\operatorname{${bodyBr.content}}`,
+                });
+              }
+            }
+          }
+        }
+        continue;
+      }
+
+      if (cmdRaw.startsWith('\\pgfmath')) {
+        let name: string | null = null;
+        if (src[pos] === '{') {
+          const nb = readBalancedBraces(src, pos);
+          if (nb && /^\\[a-zA-Z]+$/.test(nb.content.trim())) {
+            name = nb.content.trim().slice(1);
+            pos = skipSpaces(src, nb.endIdx + 1);
+          }
+        } else if (src[pos] === '\\') {
+          const nm = src.slice(pos).match(/^\\([a-zA-Z]+)/);
+          if (nm) {
+            name = nm[1];
+            pos = skipSpaces(src, pos + nm[0].length);
+          }
+        }
+        if (name && src[pos] === '{') {
+          const vb = readBalancedBraces(src, pos);
+          if (vb) {
+            const val = evaluateTikzMathExpr(vb.content);
+            if (val !== null) {
+              const finalVal = cmdRaw.includes('truncate') ? Math.trunc(val) : val;
+              target.set(name, { name, argCount: 0, body: String(Math.round(finalVal * 1e8) / 1e8) });
+            } else {
+              target.set(name, { name, argCount: 0, body: vb.content });
+            }
+          }
+        }
+        continue;
+      }
+
+      if (/^\\(?:g|e|x)?def$/.test(cmdRaw)) {
+        const nm = src.slice(pos).match(/^\\([a-zA-Z]+)\s*((?:#[1-9]\s*)*)/);
+        if (nm) {
+          const name = nm[1];
+          const afterNm = skipSpaces(src, pos + nm[0].length);
+          if (src[afterNm] === '{') {
+            const params = nm[2] ? nm[2].match(/#[1-9]/g) ?? [] : [];
+            const argCount = Math.min(9, params.length);
+            const br = readBalancedBraces(src, afterNm);
+            if (br) {
+              target.set(name, { name, argCount, body: br.content });
+            }
+          }
+        }
+        continue;
+      }
+
+      // \newcommand / \renewcommand / \providecommand / \DeclareRobustCommand
+      let name: string | null = null;
+      if (src[pos] === '{') {
+        const nb = readBalancedBraces(src, pos);
+        if (nb && /^\\[a-zA-Z]+$/.test(nb.content.trim())) {
+          name = nb.content.trim().slice(1);
+          pos = skipSpaces(src, nb.endIdx + 1);
+        }
+      } else if (src[pos] === '\\') {
+        const nm = src.slice(pos).match(/^\\([a-zA-Z]+)/);
+        if (nm) {
+          name = nm[1];
+          pos = skipSpaces(src, pos + nm[0].length);
+        }
+      }
+      if (!name) continue;
+      let argCount = 0;
+      let defaultOpt: string | undefined;
+      if (src[pos] === '[') {
+        const brk = readBalancedBrackets(src, pos);
+        if (brk) {
+          argCount = Math.max(0, Math.min(9, parseInt(brk.content.trim(), 10) || 0));
+          pos = skipSpaces(src, brk.endIdx + 1);
+        }
+      }
+      if (src[pos] === '[') {
+        const defOpt = readBalancedBrackets(src, pos);
+        if (defOpt) {
+          defaultOpt = defOpt.content;
+          pos = skipSpaces(src, defOpt.endIdx + 1);
+        }
+      }
+      if (src[pos] === '{') {
+        const br = readBalancedBraces(src, pos);
+        if (br) {
+          const isProvide = cmdRaw.startsWith('\\providecommand');
+          if (!isProvide || !target.has(name)) {
+            target.set(name, { name, argCount, defaultOpt, body: br.content });
+          }
+        }
+      }
+    }
+  };
+
+  if (preamble) {
+    parseMacrosIntoMap(preamble, preambleMacros);
+  }
+
   const macroSrc = preamble ? `${preamble}\n${body}` : body;
-
-  // Parse \newcommand / \renewcommand / \providecommand / \DeclareRobustCommand (0..9 args)
-  // Supports both \newcommand{\name}[n]{body} and \newcommand\name[n]{body}
-  const cmdRe = /\\(?:(?:re|provide)?newcommand|DeclareRobustCommand)\*?\s*(?:\{\\([a-zA-Z]+)\}|\\([a-zA-Z]+))/g;
   let m: RegExpExecArray | null;
-  while ((m = cmdRe.exec(macroSrc)) !== null) {
-    const name = m[1] || m[2];
-    if (!name) continue;
-    let pos = skipSpaces(macroSrc, m.index + m[0].length);
-    let argCount = 0;
-    let defaultOpt: string | undefined;
-    if (macroSrc[pos] === '[') {
-      const brk = readBalancedBrackets(macroSrc, pos);
-      if (brk) {
-        argCount = Math.max(0, Math.min(9, parseInt(brk.content.trim(), 10) || 0));
-        pos = skipSpaces(macroSrc, brk.endIdx + 1);
-      }
-    }
-    if (macroSrc[pos] === '[') {
-      const defOpt = readBalancedBrackets(macroSrc, pos);
-      if (defOpt) {
-        defaultOpt = defOpt.content;
-        pos = skipSpaces(macroSrc, defOpt.endIdx + 1);
-      }
-    }
-    if (macroSrc[pos] === '{') {
-      const br = readBalancedBraces(macroSrc, pos);
-      if (br) {
-        macros.push({ name, argCount, defaultOpt, body: br.content });
-      }
-    }
-  }
-
-  // Parse \def\name#1#2...{body}
-  const defRe = /\\(?:g|e|x)?def\\([a-zA-Z]+)\s*((?:#[1-9]\s*)*)\{/g;
-  while ((m = defRe.exec(macroSrc)) !== null) {
-    const name = m[1];
-    const params = m[2] ? m[2].match(/#[1-9]/g) ?? [] : [];
-    const argCount = Math.min(9, params.length);
-    const br = readBalancedBraces(macroSrc, m.index + m[0].length - 1);
-    if (br) {
-      macros.push({ name, argCount, body: br.content });
-    }
-  }
 
   // Parse \newenvironment(*)?{env}[n]{begin}{end}
   const envDefRe = /\\(?:re)?newenvironment\*?\s*\{([^}]+)\}/g;
@@ -496,21 +578,6 @@ function preprocessDocumentAndMacros(raw: string): {
           }
         }
       }
-    }
-  }
-
-  // Parse \DeclareMathOperator(*)?{\op}{text}
-  const opRe = /\\DeclareMathOperator(\*?)\s*\{\\([a-zA-Z]+)\}\s*\{/g;
-  while ((m = opRe.exec(macroSrc)) !== null) {
-    const starred = Boolean(m[1]);
-    const name = m[2];
-    const br = readBalancedBraces(macroSrc, m.index + m[0].length - 1);
-    if (br) {
-      macros.push({
-        name,
-        argCount: 0,
-        body: starred ? `\\operatorname*{${br.content}}` : `\\operatorname{${br.content}}`,
-      });
     }
   }
 
@@ -567,17 +634,17 @@ function preprocessDocumentAndMacros(raw: string): {
     }
   }
 
-  // Safely strip preamble-only commands with balanced braces so nested braces never leak
+  // Safely strip non-macro preamble commands with balanced braces
+  // (macro definitions are processed sequentially in scoped order below so per-figure \def/\pgfmathsetmacro never leaks globally)
   const preambleThreeArgCmds = /\\(?:definecolor|DeclareMathAlphabet|SetMathAlphabet)(?![a-zA-Z])/;
   const preambleTwoArgCmds =
-    /\\(?:setlength|addtolength|setcounter|addtocounter|numberwithin|DeclareMathOperator\*?|renewcommand\*?|newcommand\*?|providecommand\*?|DeclareRobustCommand\*?|colorlet|fontsize|lstdefinestyle|DeclareTColorBox|newtcbox)(?![a-zA-Z])/;
+    /\\(?:setlength|addtolength|setcounter|addtocounter|numberwithin|colorlet|fontsize|lstdefinestyle|DeclareTColorBox|newtcbox|inputansbox|inputans)(?![a-zA-Z])/;
   const preambleOneArgCmds =
-    /\\(?:documentclass|usepackage|RequirePackage|geometry|hypersetup|lstset|tikzset|pgfplotsset|tcbset|tcbuselibrary|setlist|pagestyle|thispagestyle|pagenumbering|bibliographystyle|bibliography|addbibresource|linespread|theoremstyle|newtheoremstyle|graphicspath|DeclareUnicodeCharacter|sisetup|captionsetup|AtBeginDocument|fancyhf|fancyhead|fancyfoot|rhead|lhead|chead|rfoot|lfoot|cfoot|setmainfont|setsansfont|setmonofont|newfontfamily|selectlanguage|usetikzlibrary|usepgfplotslibrary|tkzSetUpPoint|tkzSetUpLine|tkzSetUpLabel|tkzSetUpStyle|tkzTabSetup|titleformat|titlespacing|newtheorem\*?|input|include|allowdisplaybreaks|qedsymbol)(?![a-zA-Z])/;
+    /\\(?:documentclass|usepackage|RequirePackage|geometry|hypersetup|lstset|tikzset|pgfplotsset|tcbset|tcbuselibrary|setlist|pagestyle|thispagestyle|pagenumbering|bibliographystyle|bibliography|addbibresource|linespread|theoremstyle|newtheoremstyle|graphicspath|DeclareUnicodeCharacter|sisetup|captionsetup|AtBeginDocument|fancyhf|fancyhead|fancyfoot|rhead|lhead|chead|rfoot|lfoot|cfoot|setmainfont|setsansfont|setmonofont|newfontfamily|selectlanguage|usetikzlibrary|usepgfplotslibrary|tkzSetUpPoint|tkzSetUpLine|tkzSetUpLabel|tkzSetUpStyle|tkzTabSetup|titleformat|titlespacing|newtheorem\*?|input|include|allowdisplaybreaks|qedsymbol|showansEX|showans|hideansEX|hideans|ansEX|Opensolutionfile|Closesolutionfile|writelist)(?![a-zA-Z])/;
   const preambleZeroArgCmds =
-    /\\(?:onehalfspacing|doublespacing|singlespacing|frenchspacing|makeatletter|makeatother|tableofcontents|listoffigures|listoftables|printbibliography|phantomsection|frontmatter|mainmatter|backmatter|sloppy|fussy|raggedbottom|flushbottom|selectfont)(?![a-zA-Z])\s*/g;
+    /\\(?:onehalfspacing|doublespacing|singlespacing|frenchspacing|makeatletter|makeatother|tableofcontents|listoffigures|listoftables|printbibliography|phantomsection|frontmatter|mainmatter|backmatter|sloppy|fussy|raggedbottom|flushbottom|selectfont|hidesolution|showsolution)(?![a-zA-Z])\s*/g;
 
   body = stripBalancedCommand(body, /\\(?:re)?newenvironment\*?(?![a-zA-Z])/, 3, true);
-  body = stripBalancedCommand(body, /\\(?:g|e|x)?def(?![a-zA-Z])/, 2, false, true);
   body = stripBalancedCommand(body, preambleThreeArgCmds, 3, true);
   body = stripBalancedCommand(body, preambleTwoArgCmds, 2, true);
   body = stripBalancedCommand(body, preambleOneArgCmds, 1, true);
@@ -616,7 +683,7 @@ function preprocessDocumentAndMacros(raw: string): {
     }
   }
 
-  // Expand collected macros (up to 4 passes for nested macros, supporting 0..9 args + optional [default])
+  // Expand macros sequentially respecting LaTeX scope/group boundaries ({...} and \begin{env}...\end{env})
   const builtinCmdNames = new Set([
     'textbf', 'textit', 'emph', 'underline', 'textrm', 'textsf', 'texttt', 'textsc',
     'textsl', 'textnormal', 'textup', 'sout', 'uline', 'text', 'mbox', 'hbox', 'makebox',
@@ -624,40 +691,459 @@ function preprocessDocumentAndMacros(raw: string): {
     'subsubsection', 'paragraph', 'title', 'author', 'date', 'caption', 'label',
     'ref', 'eqref', 'cite', 'frac', 'dfrac', 'tfrac', 'sqrt', 'begin', 'end', 'tikz',
   ]);
+  const mathReservedCmds = new Set([
+    'x', 'y', 't', 'pi', 'e', 'sin', 'cos', 'tan', 'cot', 'sec', 'csc', 'arcsin', 'arccos',
+    'arctan', 'sinh', 'cosh', 'tanh', 'ln', 'log', 'exp', 'sqrt', 'abs', 'floor', 'ceil',
+    'frac', 'dfrac', 'tfrac', 'cdot', 'times', 'div', 'left', 'right',
+  ]);
 
-  for (let pass = 0; pass < 4; pass++) {
-    let changedInPass = false;
-    for (const macro of macros) {
-      if (builtinCmdNames.has(macro.name)) continue;
-      if (macro.argCount === 0) {
-        const re = new RegExp(`\\\\${macro.name}(?![a-zA-Z])`, 'g');
-        const endsWithLetter = /[a-zA-Z]$/.test(macro.body);
-        const nextBody = body.replace(re, (_full, offset: number) => {
-          changedInPass = true;
-          const nextCh = body[offset + 1 + macro.name.length] ?? '';
-          return endsWithLetter && /[a-zA-Z0-9]/.test(nextCh) ? `${macro.body} ` : macro.body;
+  const expandMacrosScoped = (
+    input: string,
+    initialMap: Map<string, ExtractedMacro>,
+    maxOps = 40000
+  ): string => {
+    const verbatimHolders: string[] = [];
+    const safeInput = input.replace(
+      /\\begin\{(verbatim\*?|lstlisting|minted)\}([\s\S]*?)\\end\{\1\}/g,
+      (full) => {
+        const tok = `\x00VERBSC_${verbatimHolders.length}\x00`;
+        verbatimHolders.push(full);
+        return tok;
+      }
+    );
+
+    type ScopeFrame = {
+      kind: 'root' | 'brace' | 'group' | 'env';
+      envName?: string;
+      macros: Map<string, ExtractedMacro>;
+    };
+    const stack: ScopeFrame[] = [{ kind: 'root', macros: new Map(initialMap) }];
+    const topMacros = () => stack[stack.length - 1].macros;
+
+    type StreamChunk = { str: string; pos: number; name?: string };
+    const chunks: StreamChunk[] = [{ str: safeInput, pos: 0 }];
+
+    const trimChunks = () => {
+      while (chunks.length > 0 && chunks[chunks.length - 1].pos >= chunks[chunks.length - 1].str.length) {
+        chunks.pop();
+      }
+    };
+    const eof = (): boolean => {
+      trimChunks();
+      return chunks.length === 0;
+    };
+    const peekChar = (offset = 0): string => {
+      let rem = offset;
+      for (let i = chunks.length - 1; i >= 0; i--) {
+        const c = chunks[i];
+        const avail = c.str.length - c.pos;
+        if (rem < avail) return c.str[c.pos + rem];
+        rem -= avail;
+      }
+      return '';
+    };
+    const peekSlice = (maxLen: number): string => {
+      let res = '';
+      for (let i = chunks.length - 1; i >= 0 && res.length < maxLen; i--) {
+        const c = chunks[i];
+        const avail = c.str.length - c.pos;
+        if (avail > 0) res += c.str.slice(c.pos, c.pos + (maxLen - res.length));
+      }
+      return res;
+    };
+    const consume = (n: number) => {
+      let rem = n;
+      while (rem > 0 && chunks.length > 0) {
+        const top = chunks[chunks.length - 1];
+        const avail = top.str.length - top.pos;
+        if (rem < avail) {
+          top.pos += rem;
+          rem = 0;
+        } else {
+          rem -= avail;
+          chunks.pop();
+        }
+      }
+    };
+    const readWs = (): string => {
+      let ws = '';
+      while (!eof()) {
+        const ch = peekChar(0);
+        if (ch === ' ' || ch === '\t' || ch === '\n') {
+          ws += ch;
+          consume(1);
+        } else {
+          break;
+        }
+      }
+      return ws;
+    };
+    const skipWs = () => {
+      while (!eof()) {
+        const ch = peekChar(0);
+        if (ch === ' ' || ch === '\t' || ch === '\n') consume(1);
+        else break;
+      }
+    };
+    const readBalanced = (openCh: string, closeCh: string): { content: string; raw: string } | null => {
+      if (peekChar(0) !== openCh) return null;
+      let raw = '';
+      let depth = 0;
+      while (!eof()) {
+        const ch = peekChar(0);
+        raw += ch;
+        consume(1);
+        if (ch === '\\' && !eof()) {
+          const next = peekChar(0);
+          raw += next;
+          consume(1);
+          continue;
+        }
+        if (ch === openCh) depth++;
+        else if (ch === closeCh) {
+          depth--;
+          if (depth === 0) {
+            return { content: raw.slice(1, -1), raw };
+          }
+        }
+      }
+      return null;
+    };
+    const readCmdOrBraceName = (): string | null => {
+      skipWs();
+      if (peekChar(0) === '{') {
+        const br = readBalanced('{', '}');
+        if (!br) return null;
+        const inner = br.content.trim();
+        return inner.startsWith('\\') ? inner.slice(1).trim() : null;
+      }
+      const head = peekSlice(80);
+      const nm = head.match(/^\\([a-zA-Z]+)/);
+      if (nm) {
+        consume(nm[0].length);
+        return nm[1];
+      }
+      return null;
+    };
+    const isExpanding = (name: string): number => {
+      let cnt = 0;
+      for (const c of chunks) {
+        if (c.name === name) cnt++;
+      }
+      return cnt;
+    };
+
+    const expandValueShallow = (valStr: string, map: Map<string, ExtractedMacro>, excludeMath = false): string => {
+      if (!valStr.includes('\\')) return valStr;
+      let res = valStr;
+      for (let p = 0; p < 3; p++) {
+        let changed = false;
+        res = res.replace(/\\([a-zA-Z]+)(?![a-zA-Z])/g, (full, cmdName: string, offset: number) => {
+          if (excludeMath && mathReservedCmds.has(cmdName)) return full;
+          if (builtinCmdNames.has(cmdName)) return full;
+          const mac = map.get(cmdName);
+          if (!mac || mac.argCount > 0) return full;
+          changed = true;
+          const nextCh = res[offset + full.length] ?? '';
+          const endsWithLetter = /[a-zA-Z]$/.test(mac.body);
+          return endsWithLetter && /[a-zA-Z0-9]/.test(nextCh) ? `${mac.body} ` : mac.body;
         });
-        body = nextBody;
-      } else {
-        const re =
-          macro.argCount === 1 && macro.defaultOpt !== undefined
-            ? new RegExp(`\\\\${macro.name}(?![a-zA-Z])`)
-            : new RegExp(`\\\\${macro.name}(?![a-zA-Z])\\s*(?:\\[|\\{)`);
-        let safety = 0;
-        let match: RegExpExecArray | null;
-        while ((match = re.exec(body)) !== null && safety < 300) {
-          safety++;
-          let pos = match.index + 1 + macro.name.length;
-          const postCmdSpace = skipSpaces(body, pos);
+        if (!changed) break;
+      }
+      return res;
+    };
+
+    const outParts: string[] = [];
+    let ops = 0;
+    let foreachClearVars: string[] | null = null;
+
+    while (!eof() && ops < maxOps) {
+      ops++;
+      trimChunks();
+      if (chunks.length === 0) break;
+
+      const top = chunks[chunks.length - 1];
+      const nextSpecial = top.str.slice(top.pos).search(/[\\{}]/);
+      if (nextSpecial === -1) {
+        outParts.push(top.str.slice(top.pos));
+        chunks.pop();
+        continue;
+      }
+      if (nextSpecial > 0) {
+        outParts.push(top.str.slice(top.pos, top.pos + nextSpecial));
+        top.pos += nextSpecial;
+        continue;
+      }
+
+      const ch = top.str[top.pos];
+      if (ch === '{') {
+        const nextMacros = new Map(topMacros());
+        if (foreachClearVars) {
+          foreachClearVars.forEach((v) => nextMacros.delete(v));
+          foreachClearVars = null;
+        }
+        stack.push({ kind: 'brace', macros: nextMacros });
+        outParts.push('{');
+        consume(1);
+        continue;
+      }
+      if (ch === '}') {
+        if (stack.length > 1 && stack[stack.length - 1].kind === 'brace') {
+          stack.pop();
+        }
+        outParts.push('}');
+        consume(1);
+        continue;
+      }
+
+      // ch === '\\'
+      const ahead = peekSlice(96);
+      if (ahead.length >= 2 && /[\\{}%$&_# ,;!()[\]]/.test(ahead[1])) {
+        outParts.push(ahead.slice(0, 2));
+        consume(2);
+        continue;
+      }
+
+      const cmdMatch = ahead.match(/^\\([a-zA-Z@]+)\*?/);
+      if (!cmdMatch) {
+        outParts.push('\\');
+        consume(1);
+        continue;
+      }
+
+      const fullCmd = cmdMatch[0];
+      const cmd = cmdMatch[1];
+
+      // 1. \begin{env} / \end{env} grouping
+      if (cmd === 'begin' || cmd === 'end') {
+        consume(fullCmd.length);
+        const ws = readWs();
+        const envBr = readBalanced('{', '}');
+        if (!envBr) {
+          outParts.push(fullCmd + ws);
+          continue;
+        }
+        const envName = envBr.content.trim();
+        outParts.push(`${fullCmd}${ws}${envBr.raw}`);
+        if (cmd === 'begin') {
+          stack.push({ kind: 'env', envName, macros: new Map(topMacros()) });
+        } else {
+          for (let s = stack.length - 1; s >= 1; s--) {
+            if (stack[s].kind === 'env' && stack[s].envName === envName) {
+              stack.length = s;
+              break;
+            }
+          }
+        }
+        continue;
+      }
+
+      // 2. \begingroup / \endgroup
+      if (cmd === 'begingroup') {
+        consume(fullCmd.length);
+        stack.push({ kind: 'group', macros: new Map(topMacros()) });
+        outParts.push(fullCmd);
+        continue;
+      }
+      if (cmd === 'endgroup') {
+        consume(fullCmd.length);
+        for (let s = stack.length - 1; s >= 1; s--) {
+          if (stack[s].kind === 'group') {
+            stack.length = s;
+            break;
+          }
+        }
+        outParts.push(fullCmd);
+        continue;
+      }
+
+      // 3. \newcommand / \renewcommand / \providecommand / \DeclareRobustCommand
+      if (
+        cmd === 'newcommand' ||
+        cmd === 'renewcommand' ||
+        cmd === 'providecommand' ||
+        cmd === 'DeclareRobustCommand'
+      ) {
+        consume(fullCmd.length);
+        const targetName = readCmdOrBraceName();
+        if (!targetName) {
+          continue;
+        }
+        skipWs();
+        let argCount = 0;
+        let defaultOpt: string | undefined;
+        if (peekChar(0) === '[') {
+          const brk = readBalanced('[', ']');
+          if (brk) {
+            argCount = Math.max(0, Math.min(9, parseInt(brk.content.trim(), 10) || 0));
+            skipWs();
+          }
+        }
+        if (peekChar(0) === '[') {
+          const defOpt = readBalanced('[', ']');
+          if (defOpt) {
+            defaultOpt = defOpt.content;
+            skipWs();
+          }
+        }
+        const bodyBr = peekChar(0) === '{' ? readBalanced('{', '}') : null;
+        if (bodyBr) {
+          if (cmd !== 'providecommand' || !topMacros().has(targetName)) {
+            topMacros().set(targetName, {
+              name: targetName,
+              argCount,
+              defaultOpt,
+              body: bodyBr.content,
+            });
+          }
+        }
+        continue;
+      }
+
+      // 4. \DeclareMathOperator(*)?{\op}{text}
+      if (cmd === 'DeclareMathOperator') {
+        const starred = fullCmd.endsWith('*');
+        consume(fullCmd.length);
+        const targetName = readCmdOrBraceName();
+        skipWs();
+        const bodyBr = peekChar(0) === '{' ? readBalanced('{', '}') : null;
+        if (targetName && bodyBr) {
+          topMacros().set(targetName, {
+            name: targetName,
+            argCount: 0,
+            body: starred ? `\\operatorname*{${bodyBr.content}}` : `\\operatorname{${bodyBr.content}}`,
+          });
+        }
+        continue;
+      }
+
+      // 5. \def / \gdef / \edef / \xdef (preserving TikZ \def\f(#1){...} functions!)
+      if (cmd === 'def' || cmd === 'gdef' || cmd === 'edef' || cmd === 'xdef') {
+        consume(fullCmd.length);
+        skipWs();
+        const targetHead = peekSlice(80);
+        const nm = targetHead.match(/^\\([a-zA-Z]+)/);
+        if (!nm) continue;
+        const targetName = nm[1];
+        consume(nm[0].length);
+        skipWs();
+
+        // TikZ math function definition like \def\f(#1){(#1)^2 - 1}
+        if (peekChar(0) === '(') {
+          const paren = readBalanced('(', ')');
+          skipWs();
+          const fnBody = peekChar(0) === '{' ? readBalanced('{', '}') : null;
+          if (paren && fnBody) {
+            const expandedBody = expandValueShallow(fnBody.content, topMacros(), true);
+            outParts.push(`\\def\\${targetName}${paren.raw}{${expandedBody}}`);
+          }
+          continue;
+        }
+
+        // Standard TeX \def\name#1#2...{body}
+        let argCount = 0;
+        while (peekChar(0) === '#' && /[1-9]/.test(peekChar(1))) {
+          argCount = Math.min(9, argCount + 1);
+          consume(2);
+          skipWs();
+        }
+        const defBody = peekChar(0) === '{' ? readBalanced('{', '}') : null;
+        if (defBody) {
+          const finalBody =
+            cmd === 'edef' || cmd === 'xdef'
+              ? expandValueShallow(defBody.content, topMacros())
+              : defBody.content;
+          const macroObj: ExtractedMacro = { name: targetName, argCount, body: finalBody };
+          if (cmd === 'gdef' || cmd === 'xdef') {
+            stack.forEach((f) => f.macros.set(targetName, macroObj));
+          } else {
+            topMacros().set(targetName, macroObj);
+          }
+        }
+        continue;
+      }
+
+      // 6. \pgfmathsetmacro / \pgfmathtruncatemacro
+      if (cmd === 'pgfmathsetmacro' || cmd === 'pgfmathtruncatemacro') {
+        consume(fullCmd.length);
+        const targetName = readCmdOrBraceName();
+        skipWs();
+        const exprBr = peekChar(0) === '{' ? readBalanced('{', '}') : null;
+        if (targetName && exprBr) {
+          const expandedExpr = expandValueShallow(exprBr.content, topMacros(), false);
+          const evaluated = evaluateTikzMathExpr(expandedExpr);
+          if (evaluated !== null) {
+            const finalNum = cmd === 'pgfmathtruncatemacro' ? Math.trunc(evaluated) : evaluated;
+            topMacros().set(targetName, {
+              name: targetName,
+              argCount: 0,
+              body: String(Math.round(finalNum * 1e8) / 1e8),
+            });
+          } else {
+            // Keep runtime variable expression (e.g. depends on \foreach loop variable) for tikzRenderer
+            outParts.push(`\\${cmd}{\\${targetName}}{${expandedExpr}}`);
+          }
+        }
+        continue;
+      }
+
+      // 7. \foreach \v in {...} -> mask loop variables from outer macros inside loop body
+      if (cmd === 'foreach') {
+        consume(fullCmd.length);
+        outParts.push(fullCmd);
+        const restHead = peekSlice(120);
+        const feM = restHead.match(/^(\s*(?:\\[a-zA-Z]+(?:\s*\/\s*\\[a-zA-Z]+)*)\s*(?:\[[^\]]*\])?\s*in\s*)/);
+        if (feM) {
+          outParts.push(feM[1]);
+          consume(feM[1].length);
+          const varsFound = (feM[1].match(/\\[a-zA-Z]+/g) || []).map((v) => v.slice(1));
+          if (peekChar(0) === '{') {
+            const listBr = readBalanced('{', '}');
+            if (listBr) {
+              const expList = expandValueShallow(listBr.content, topMacros(), false);
+              outParts.push(`{${expList}}`);
+            }
+          }
+          if (varsFound.length > 0) {
+            const wsAfterList = readWs();
+            outParts.push(wsAfterList);
+            if (peekChar(0) === '{') {
+              foreachClearVars = varsFound;
+            }
+          }
+        }
+        continue;
+      }
+
+      // 8. Active macro expansion
+      const macro = !builtinCmdNames.has(cmd) ? topMacros().get(cmd) : undefined;
+      if (macro && isExpanding(cmd) < 2 && chunks.length < 24) {
+        if (macro.argCount === 0) {
+          consume(fullCmd.length);
+          const nextCh = peekChar(0);
+          const endsWithLetter = /[a-zA-Z]$/.test(macro.body);
+          const expansion =
+            endsWithLetter && /[a-zA-Z0-9]/.test(nextCh) ? `${macro.body} ` : macro.body;
+          chunks.push({ str: expansion, pos: 0, name: cmd });
+          continue;
+        }
+
+        // Parameterized macro (1..9 args + optional [default])
+        const peekedAfter = peekSlice(fullCmd.length + 12).slice(fullCmd.length);
+        const firstNonWs = peekedAfter.replace(/^[ \t\n]+/, '')[0] ?? '';
+        if ((macro.argCount === 1 && macro.defaultOpt !== undefined) || firstNonWs === '[' || firstNonWs === '{') {
+          consume(fullCmd.length);
+          let wsAfter = readWs();
           const args: string[] = [];
+          let rawConsumed = wsAfter;
           let neededBraces = macro.argCount;
 
           if (macro.defaultOpt !== undefined) {
-            if (body[postCmdSpace] === '[') {
-              const optBr = readBalancedBrackets(body, postCmdSpace);
+            if (peekChar(0) === '[') {
+              const optBr = readBalanced('[', ']');
               if (optBr) {
                 args.push(optBr.content);
-                pos = optBr.endIdx + 1;
+                rawConsumed += optBr.raw;
               } else {
                 args.push(macro.defaultOpt);
               }
@@ -665,28 +1151,66 @@ function preprocessDocumentAndMacros(raw: string): {
               args.push(macro.defaultOpt);
             }
             neededBraces = macro.argCount - 1;
-          } else {
-            pos = postCmdSpace;
           }
 
-          if (neededBraces > 0) {
-            const extracted = extractBalancedMacroArgs(body, pos, neededBraces);
-            if (!extracted) break;
-            args.push(...extracted.args);
-            pos = extracted.endIdx;
+          let argsOk = true;
+          for (let a = 0; a < neededBraces; a++) {
+            const gap = readWs();
+            rawConsumed += gap;
+            if (peekChar(0) === '{') {
+              const argBr = readBalanced('{', '}');
+              if (argBr) {
+                args.push(argBr.content);
+                rawConsumed += argBr.raw;
+              } else {
+                argsOk = false;
+                break;
+              }
+            } else {
+              const tokM = peekSlice(40).match(/^\\[a-zA-Z]+/);
+              if (tokM) {
+                args.push(tokM[0]);
+                rawConsumed += tokM[0];
+                consume(tokM[0].length);
+              } else if (!eof()) {
+                const chArg = peekChar(0);
+                args.push(chArg);
+                rawConsumed += chArg;
+                consume(1);
+              } else {
+                argsOk = false;
+                break;
+              }
+            }
+          }
+
+          if (!argsOk) {
+            outParts.push(fullCmd + rawConsumed);
+            continue;
           }
 
           let expanded = macro.body;
           args.forEach((argVal, idx) => {
             expanded = expanded.replace(new RegExp(`#${idx + 1}`, 'g'), () => argVal);
           });
-          body = body.slice(0, match.index) + expanded + body.slice(pos);
-          changedInPass = true;
+          chunks.push({ str: expanded, pos: 0, name: cmd });
+          continue;
         }
       }
+
+      // Default command: copy through verbatim
+      outParts.push(fullCmd);
+      consume(fullCmd.length);
     }
-    if (!changedInPass) break;
-  }
+
+    let joined = outParts.join('');
+    for (let i = 0; i < verbatimHolders.length; i++) {
+      joined = joined.replace(`\x00VERBSC_${i}\x00`, () => verbatimHolders[i]);
+    }
+    return joined;
+  };
+
+  body = expandMacrosScoped(body, preambleMacros);
 
   // Evaluate and expand TeX \countN=start \loop\ifnum\countN<limit ... \advance\countN by step ... \repeat
   const evalTexCmp = (a: number, op: string, b: number): boolean => {
@@ -771,7 +1295,7 @@ function preprocessDocumentAndMacros(raw: string): {
   const isFullLatexDoc =
     hasDocBegin ||
     Boolean(title || author) ||
-    /\\(?:section|subsection|paragraph|maketitle|makebox|dotfill|tikz|immini|begin\{(?:enumerate|itemize|description|tasks|table|tabular|tabularx|longtable|figure|tikzpicture|pgfpicture|picture|abstract|verbatim|lstlisting|tcolorbox|ex|bt|vd|theorem|lemma|definition|proposition|corollary|proof|center|align|subequations|thebibliography))/.test(
+    /\\(?:section|subsection|paragraph|maketitle|makebox|dotfill|tikz|immini|begin\{(?:enumerate|itemize|itemchoice|description|tasks|table|tabular|tabularx|longtable|figure|tikzpicture|pgfpicture|picture|abstract|verbatim|lstlisting|tcolorbox|ex|bt|vd|theorem|lemma|definition|proposition|corollary|proof|center|align|subequations|thebibliography))/.test(
       normalized
     ) ||
     Object.keys(customTheorems).some((env) => normalized.includes(`\\begin{${env}}`));
@@ -1973,7 +2497,7 @@ function splitListItems(body: string): Array<{ customLabel?: string; content: st
         continue;
       }
       if (envDepth === 0) {
-        const itemM = rest.match(/^\\item(?![a-zA-Z])/);
+        const itemM = rest.match(/^\\item(?:ch)?(?![a-zA-Z])/);
         if (itemM) {
           if (currentStart !== -1) {
             items.push({
@@ -2126,7 +2650,7 @@ function hasUnclosedDelimiter(src: string): boolean {
 function isHardStructuralQuestionOrSectionStart(line: string): boolean {
   const clean = stripLeadingInlineCommands(line);
   return (
-    /^\\(?:section|subsection|subsubsection|chapter|part|begin\{(?:ex|bt|vd|theorem|lemma|definition|proposition|corollary|proof|figure|table|enumerate|itemize)\})/.test(
+    /^\\(?:section|subsection|subsubsection|chapter|part|begin\{(?:ex|bt|vd|theorem|lemma|definition|proposition|corollary|proof|figure|table|enumerate|itemize|itemchoice)\})/.test(
       line
     ) || /^(?:Câu|Bài)\s+\d+/i.test(clean)
   );
@@ -2377,11 +2901,27 @@ function parseExEnvironment(
       indentLeftPt: 0,
     });
     const flatSol = solPages.flat();
-    if (flatSol.length > 0 && flatSol[0].block_type === 'paragraph' && flatSol[0].segments) {
-      flatSol[0].segments = [
-        { type: 'text', content: 'Lời giải. ', bold: true, italic: true },
-        ...flatSol[0].segments,
-      ];
+    if (flatSol.length > 0) {
+      const firstSol = flatSol[0];
+      if (
+        firstSol.block_type === 'paragraph' &&
+        firstSol.segments &&
+        !(firstSol.indent_left_pt && firstSol.indent_left_pt > 0) &&
+        !(firstSol.first_line_indent_pt && firstSol.first_line_indent_pt < 0)
+      ) {
+        firstSol.segments = [
+          { type: 'text', content: 'Lời giải. ', bold: true, italic: true },
+          ...firstSol.segments,
+        ];
+      } else {
+        flatSol.unshift({
+          block_type: 'paragraph',
+          alignment: 'left',
+          font_size_pt: 12,
+          line_spacing: 1.18,
+          segments: [{ type: 'text', content: 'Lời giải.', bold: true, italic: true }],
+        });
+      }
     }
     blocks.push(...flatSol);
   }
@@ -2449,6 +2989,9 @@ function formatEnumItemBullet(
   }
   if (envName === 'itemize') {
     return nextDepth > 1 ? '– ' : '• ';
+  }
+  if (envName === 'itemchoice' && !enumLabelOpt) {
+    return `${String.fromCharCode(97 + (itemIdx % 26))}) `;
   }
   if (enumLabelOpt) {
     if (/\\alph\*/.test(enumLabelOpt)) {
@@ -2671,7 +3214,7 @@ function parseBodyBlocks(
   };
 
   const hasBlockContainerInside = (snippet: string): boolean =>
-    /\\begin\{(?:tikzpicture|pgfpicture|picture|tabular|tabular\*|tabularx|longtable|enumerate|itemize|description|figure|table|verbatim|lstlisting|minted|axis|ex|bt|vd|center|flushleft|flushright|minipage|tcolorbox)\}|\\(?:section|subsection|subsubsection|chapter|part|par(?![a-zA-Z]))|\n\s*\n/.test(
+    /\\begin\{(?:tikzpicture|pgfpicture|picture|tabular|tabular\*|tabularx|longtable|enumerate|itemize|itemchoice|description|figure|table|verbatim|lstlisting|minted|axis|ex|bt|vd|center|flushleft|flushright|minipage|tcolorbox)\}|\\(?:section|subsection|subsubsection|chapter|part|par(?![a-zA-Z]))|\n\s*\n/.test(
       snippet
     );
 
@@ -3412,7 +3955,12 @@ function parseBodyBlocks(
             continue;
           }
 
-          if (envName === 'enumerate' || envName === 'itemize' || envName === 'description') {
+          if (
+            envName === 'enumerate' ||
+            envName === 'itemize' ||
+            envName === 'itemchoice' ||
+            envName === 'description'
+          ) {
             flushTextSlice(i);
             let listBody = envRawBody.trimStart();
             let enumLabelOpt: string | undefined;
@@ -3464,7 +4012,10 @@ function parseBodyBlocks(
                   {
                     type: 'text',
                     content: bullet,
-                    bold: envName === 'enumerate' || envName === 'description',
+                    bold:
+                      envName === 'enumerate' ||
+                      envName === 'itemchoice' ||
+                      envName === 'description',
                   },
                   ...flat[0].segments,
                 ];
@@ -3479,7 +4030,10 @@ function parseBodyBlocks(
                     {
                       type: 'text',
                       content: bullet,
-                      bold: envName === 'enumerate' || envName === 'description',
+                      bold:
+                        envName === 'enumerate' ||
+                        envName === 'itemchoice' ||
+                        envName === 'description',
                     },
                   ],
                 });
