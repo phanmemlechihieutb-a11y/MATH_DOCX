@@ -3706,31 +3706,41 @@ function parseBodyBlocks(
       }
 
       // \tikz[opts]{...}
-      const tikzInlineMatch = rest.match(/^\\tikz(?:\s*\[([^\]]*)\])?\s*\{/);
-      if (tikzInlineMatch) {
-        const braceIdx = i + tikzInlineMatch[0].length - 1;
-        const br = readBalancedBraces(src, braceIdx);
-        if (br) {
-          flushTextSlice(i);
-          const tikzBody = tikzInlineMatch[1]
-            ? `[${tikzInlineMatch[1]}]\n${br.content}`
-            : br.content;
-          const rendered = renderLatexPictureToSvgDataUrl('tikzpicture', tikzBody, ctx.customColors);
-          if (rendered) {
-            pushBlock({
-              block_type: 'figure',
-              alignment:
-                opts.defaultAlign === 'left' || opts.defaultAlign === 'right'
-                  ? opts.defaultAlign
-                  : 'center',
-              croppedImageDataUrl: rendered.dataUrl,
-              croppedWidthPx: rendered.widthPx,
-              croppedHeightPx: rendered.heightPx,
-            });
+      const tikzInlineHead = rest.match(/^\\tikz(?![a-zA-Z])/);
+      if (tikzInlineHead) {
+        let scanIdx = i + tikzInlineHead[0].length;
+        let tikzOpts = '';
+        while (scanIdx < src.length && /\s/.test(src[scanIdx])) scanIdx++;
+        if (src[scanIdx] === '[') {
+          const optBrk = readBalancedBrackets(src, scanIdx);
+          if (optBrk) {
+            tikzOpts = optBrk.content;
+            scanIdx = optBrk.endIdx + 1;
+            while (scanIdx < src.length && /\s/.test(src[scanIdx])) scanIdx++;
           }
-          i = br.endIdx + 1;
-          textStart = i;
-          continue;
+        }
+        if (src[scanIdx] === '{') {
+          const br = readBalancedBraces(src, scanIdx);
+          if (br) {
+            flushTextSlice(i);
+            const tikzBody = tikzOpts ? `[${tikzOpts}]\n${br.content}` : br.content;
+            const rendered = renderLatexPictureToSvgDataUrl('tikzpicture', tikzBody, ctx.customColors);
+            if (rendered) {
+              pushBlock({
+                block_type: 'figure',
+                alignment:
+                  opts.defaultAlign === 'left' || opts.defaultAlign === 'right'
+                    ? opts.defaultAlign
+                    : 'center',
+                croppedImageDataUrl: rendered.dataUrl,
+                croppedWidthPx: rendered.widthPx,
+                croppedHeightPx: rendered.heightPx,
+              });
+            }
+            i = br.endIdx + 1;
+            textStart = i;
+            continue;
+          }
         }
       }
 

@@ -37,6 +37,12 @@ interface DrawStyle {
   shiftXPx?: number;
   shiftYPx?: number;
   isClip?: boolean;
+  hasDraw?: boolean;
+  hasFill?: boolean;
+  angleRadiusPx?: number;
+  angleEccentricity?: number;
+  picText?: string;
+  picTextOpts?: string;
   circle?: boolean;
   innerSep?: number;
   roundedCorners?: number;
@@ -64,6 +70,8 @@ interface TikzScopeState {
   dashArray?: string;
   fill: string;
   fillOpacity: number;
+  fontSize?: number;
+  fontWeight?: string;
   clipId?: string;
   clipBounds?: { minX: number; minY: number; maxX: number; maxY: number };
   vars?: Record<string, number>;
@@ -131,6 +139,40 @@ function readBalanced(
   return null;
 }
 
+function stripTikzComments(raw: string): string {
+  return raw
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map((line) => {
+      for (let i = 0; i < line.length; i++) {
+        if (line[i] === '\\') {
+          i++;
+          continue;
+        }
+        if (line[i] === '%') {
+          return line.slice(0, i);
+        }
+      }
+      return line;
+    })
+    .join('\n');
+}
+
+function readLeadingBracketOptions(
+  src: string,
+  startIdx: number
+): { opts: string; nextIdx: number } {
+  let p = startIdx;
+  while (p < src.length && /\s/.test(src[p])) p++;
+  if (src[p] === '[') {
+    const brk = readBalanced(src, p, '[', ']');
+    if (brk) {
+      return { opts: brk.content, nextIdx: brk.endIdx + 1 };
+    }
+  }
+  return { opts: '', nextIdx: startIdx };
+}
+
 function splitTopLevel(src: string, sep: string): string[] {
   const parts: string[] = [];
   let cur = '';
@@ -138,6 +180,7 @@ function splitTopLevel(src: string, sep: string): string[] {
   let bracket = 0;
   let paren = 0;
   let inMath = false;
+  let inQuotes = false;
 
   for (let i = 0; i < src.length; i++) {
     const ch = src[i];
@@ -146,9 +189,11 @@ function splitTopLevel(src: string, sep: string): string[] {
       i++;
       continue;
     }
-    if (ch === '$') {
+    if (ch === '"' && brace === 0) {
+      inQuotes = !inQuotes;
+    } else if (ch === '$') {
       inMath = !inMath;
-    } else if (!inMath) {
+    } else if (!inMath && !inQuotes) {
       if (ch === '{') brace++;
       else if (ch === '}') brace = Math.max(0, brace - 1);
       else if (ch === '[') bracket++;
@@ -158,6 +203,7 @@ function splitTopLevel(src: string, sep: string): string[] {
     }
 
     if (
+      !inQuotes &&
       !inMath &&
       brace === 0 &&
       bracket === 0 &&
@@ -197,19 +243,33 @@ function resolveTikzColor(raw: string, customColors: Record<string, string>): st
   if (COLOR_MAP[s]) return COLOR_MAP[s];
   if (/^#[0-9a-f]{6}$/i.test(s)) return s.toUpperCase();
 
-  // Support color mixing like blue!30 or red!50!yellow
+  // Support chained xcolor mixing like blue!30, red!50!yellow, or white!80!black!10
   if (s.includes('!')) {
-    const parts = s.split('!').map((p) => p.trim());
-    const c1 = resolveTikzColor(parts[0], customColors);
-    if (!c1 || c1 === 'none') return undefined;
-    const pct = parseFloat(parts[1]);
-    if (!Number.isFinite(pct)) return c1;
-    const w = Math.max(0, Math.min(100, pct)) / 100;
-    const c2 = parts[2] ? resolveTikzColor(parts[2], customColors) ?? '#FFFFFF' : '#FFFFFF';
-    if (c2 === 'none') return c1;
-    const [r1, g1, b1] = hexToRgb(c1);
-    const [r2, g2, b2] = hexToRgb(c2);
-    return rgbToHex(r1 * w + r2 * (1 - w), g1 * w + g2 * (1 - w), b1 * w + b2 * (1 - w));
+    const parts = s.split('!').map((p) => p.trim()).filter(Boolean);
+    if (parts.length === 0) return undefined;
+    let acc = resolveTikzColor(parts[0], customColors);
+    if (!acc || acc === 'none') return undefined;
+
+    let idx = 1;
+    while (idx < parts.length) {
+      const pct = parseFloat(parts[idx]);
+      if (!Number.isFinite(pct)) return acc;
+      const w = Math.max(0, Math.min(100, pct)) / 100;
+      const nextPart = parts[idx + 1];
+      const nextIsNumber = nextPart !== undefined && Number.isFinite(Number(nextPart));
+      let c2 = '#FFFFFF';
+      if (nextPart && !nextIsNumber) {
+        c2 = resolveTikzColor(nextPart, customColors) ?? '#FFFFFF';
+        idx += 2;
+      } else {
+        idx += 1;
+      }
+      if (c2 === 'none') continue;
+      const [r1, g1, b1] = hexToRgb(acc);
+      const [r2, g2, b2] = hexToRgb(c2);
+      acc = rgbToHex(r1 * w + r2 * (1 - w), g1 * w + g2 * (1 - w), b1 * w + b2 * (1 - w));
+    }
+    return acc;
   }
   return undefined;
 }
@@ -671,6 +731,9 @@ function evalMathExpr(
           case 'mod': return a0 % a1;
           case 'deg': return (a0 * 180) / Math.PI;
           case 'rad': return (a0 * Math.PI) / 180;
+          case 'veclen': return Math.hypot(a0, a1);
+          case 'int': return Math.trunc(a0);
+          case 'real': return a0;
           case 'ifthenelse': return a0 !== 0 ? a1 : a2;
           default: return NaN;
         }
@@ -703,22 +766,111 @@ interface FormattedLabel {
   plainLength: number;
 }
 
+function replaceBalancedLabelAccents(src: string): string {
+  let out = src;
+  for (let pass = 0; pass < 6; pass++) {
+    let changed = false;
+
+    const fracMatch = /\\(?:d|t)?frac(?![a-zA-Z])/.exec(out);
+    if (fracMatch) {
+      let p = fracMatch.index + fracMatch[0].length;
+      const readArg = (): { val: string; nextIdx: number } | null => {
+        while (p < out.length && /\s/.test(out[p])) p++;
+        if (p >= out.length) return null;
+        if (out[p] === '{') {
+          const br = readBalanced(out, p, '{', '}');
+          if (!br) return null;
+          return { val: br.content.trim(), nextIdx: br.endIdx + 1 };
+        }
+        if (out[p] === '\\') {
+          const cm = out.slice(p).match(/^\\[a-zA-Z]+/);
+          if (cm) return { val: cm[0], nextIdx: p + cm[0].length };
+        }
+        return { val: out[p], nextIdx: p + 1 };
+      };
+      const num = readArg();
+      if (num) {
+        p = num.nextIdx;
+        const den = readArg();
+        if (den) {
+          const sa = num.val.length > 2 && /[+-]/.test(num.val) ? `(${num.val})` : num.val;
+          const sb = den.val.length > 2 && /[+-]/.test(den.val) ? `(${den.val})` : den.val;
+          out = out.slice(0, fracMatch.index) + `${sa}/${sb}` + out.slice(den.nextIdx);
+          changed = true;
+          continue;
+        }
+      }
+    }
+
+    const sqrtMatch = /\\sqrt(?![a-zA-Z])/.exec(out);
+    if (sqrtMatch) {
+      let p = sqrtMatch.index + sqrtMatch[0].length;
+      while (p < out.length && /\s/.test(out[p])) p++;
+      let degStr = '';
+      if (out[p] === '[') {
+        const dBr = readBalanced(out, p, '[', ']');
+        if (dBr) {
+          degStr = dBr.content.trim();
+          p = dBr.endIdx + 1;
+          while (p < out.length && /\s/.test(out[p])) p++;
+        }
+      }
+      let argVal: string | null = null;
+      let hasBraces = false;
+      let nextIdx = p;
+      if (out[p] === '{') {
+        const br = readBalanced(out, p, '{', '}');
+        if (br) {
+          argVal = br.content.trim();
+          hasBraces = true;
+          nextIdx = br.endIdx + 1;
+        }
+      } else if (p < out.length) {
+        argVal = out[p];
+        nextIdx = p + 1;
+      }
+      if (argVal !== null) {
+        const rootSym = degStr === '3' ? '∛' : degStr ? `${degStr}√` : '√';
+        const repl = hasBraces || argVal.length > 1 ? `${rootSym}(${argVal})` : `${rootSym}${argVal}`;
+        out = out.slice(0, sqrtMatch.index) + repl + out.slice(nextIdx);
+        changed = true;
+        continue;
+      }
+    }
+
+    const decMatch = /\\(overrightarrow|vec|widehat|overline)(?![a-zA-Z])\s*\{/.exec(out);
+    if (decMatch) {
+      const br = readBalanced(out, decMatch.index + decMatch[0].length - 1, '{', '}');
+      if (br) {
+        const comb =
+          decMatch[1] === 'widehat' ? '\u0302' : decMatch[1] === 'overline' ? '\u0304' : '\u20D7';
+        out = out.slice(0, decMatch.index) + `${br.content}${comb}` + out.slice(br.endIdx + 1);
+        changed = true;
+        continue;
+      }
+    }
+
+    if (!changed) break;
+  }
+  return out;
+}
+
 function formatLatexPieceToTspans(
   raw: string,
   italicVars: boolean,
   baseFontSize: number
 ): FormattedLabel {
-  let s = raw.trim();
-  // Strip wrappers
-  s = s
+  // Replace simple style switches and symbol commands while keeping \text/\mathrm/\mathbf intact for upright styling
+  let s = raw
+    .replace(/(^|[^\\])~/g, '$1 ')
     .replace(
-      /\\(?:displaystyle|textstyle|scriptstyle|tiny|scriptsize|footnotesize|small|normalsize|large|Large|LARGE|huge|Huge|bfseries|itshape|mdseries|upshape|centering|ensuremath)\b/g,
+      /\\(?:displaystyle|textstyle|scriptstyle|tiny|scriptsize|footnotesize|small|normalsize|large|Large|LARGE|huge|Huge|bfseries|itshape|mdseries|upshape|centering|ensuremath)(?![a-zA-Z])/g,
       ''
     )
     .replace(/\\(?:left|right|big|Big|bigg|Bigg)(?=[()[\]{}|.])/g, '')
     .replace(/\\[,;:! ]/g, ' ')
-    .replace(/\\quad/g, '  ')
-    .replace(/\\qquad/g, '    ')
+    .replace(/\\quad(?![a-zA-Z])/g, '  ')
+    .replace(/\\qquad(?![a-zA-Z])/g, '    ')
     .replace(/\\infty(?![a-zA-Z])/g, '∞')
     .replace(/\\pm(?![a-zA-Z])/g, '±')
     .replace(/\\mp(?![a-zA-Z])/g, '∓')
@@ -765,39 +917,50 @@ function formatLatexPieceToTspans(
     .replace(/\\varphi|\\phi(?![a-zA-Z])/g, 'φ')
     .replace(/\\omega(?![a-zA-Z])/g, 'ω')
     .replace(/\\Omega(?![a-zA-Z])/g, 'Ω')
-    .replace(/\\mathbb\{R\}/g, 'ℝ')
-    .replace(/\\mathbb\{N\}/g, 'ℕ')
-    .replace(/\\mathbb\{Z\}/g, 'ℤ')
-    .replace(/\\mathbb\{Q\}/g, 'ℚ')
-    .replace(/\\mathbb\{C\}/g, 'ℂ')
-    .replace(
-      /\\(?:d|t)?frac(?:\s*\{([^}]*)\}|\s*([0-9a-zA-Z]))(?:\s*\{([^}]*)\}|\s*([0-9a-zA-Z]))/g,
-      (_m, a1: string | undefined, a2: string | undefined, b1: string | undefined, b2: string | undefined) => {
-        const ca = (a1 ?? a2 ?? '').trim();
-        const cb = (b1 ?? b2 ?? '').trim();
-        const sa = ca.length > 2 && /[+-]/.test(ca) ? `(${ca})` : ca;
-        const sb = cb.length > 2 && /[+-]/.test(cb) ? `(${cb})` : cb;
-        return `${sa}/${sb}`;
-      }
-    )
-    .replace(
-      /\\sqrt(?:\s*\[([^\]]*)\])?(?:\s*\{([^}]*)\}|\s*([0-9a-zA-Z]))/g,
-      (_m, deg: string | undefined, a1: string | undefined, a2: string | undefined) => {
-        const inner = (a1 ?? a2 ?? '').trim();
-        const rootSym = deg === '3' ? '∛' : deg ? `${deg}√` : '√';
-        return a1 !== undefined || inner.length > 1 ? `${rootSym}(${inner})` : `${rootSym}${inner}`;
-      }
-    )
-    .replace(/\\(?:overrightarrow|vec)\s*\{([^}]*)\}/g, '$1⃗')
-    .replace(/\\widehat\s*\{([^}]*)\}/g, '$1̂')
-    .replace(/\\overline\s*\{([^}]*)\}/g, '$1̄')
-    .replace(/\\(?:text|mathrm|mathbf|mathit|textbf)\s*\{([^}]*)\}/g, '$1')
-    .replace(/\\([a-zA-Z]+)/g, '$1')
-    .replace(/\\([{}$%&_])/g, '$1');
+    .replace(/\\mathbb\s*\{R\}/g, 'ℝ')
+    .replace(/\\mathbb\s*\{N\}/g, 'ℕ')
+    .replace(/\\mathbb\s*\{Z\}/g, 'ℤ')
+    .replace(/\\mathbb\s*\{Q\}/g, 'ℚ')
+    .replace(/\\mathbb\s*\{C\}/g, 'ℂ');
 
-  if (italicVars) {
-    s = s.replace(/-/g, '−');
-  }
+  s = replaceBalancedLabelAccents(s);
+
+  const uprightCmds = new Set([
+    'text',
+    'mathrm',
+    'textrm',
+    'textup',
+    'textnormal',
+    'operatorname',
+    'mbox',
+    'hbox',
+  ]);
+  const boldCmds = new Set(['textbf', 'mathbf']);
+  const italicCmds = new Set(['textit', 'mathit', 'emph']);
+  const knownFuncs = new Set([
+    'sin',
+    'cos',
+    'tan',
+    'cot',
+    'sec',
+    'csc',
+    'arcsin',
+    'arccos',
+    'arctan',
+    'log',
+    'ln',
+    'lg',
+    'exp',
+    'lim',
+    'max',
+    'min',
+    'sup',
+    'inf',
+    'det',
+    'dim',
+    'gcd',
+    'deg',
+  ]);
 
   let out = '';
   let plainLen = 0;
@@ -805,6 +968,57 @@ function formatLatexPieceToTspans(
   const subSize = Math.round(baseFontSize * 0.72 * 10) / 10;
 
   while (i < s.length) {
+    // Escaped punctuation/braces
+    if (s[i] === '\\' && i + 1 < s.length && /[{}$%&_#\\]/.test(s[i + 1])) {
+      out += escapeXmlAttr(s[i + 1]);
+      plainLen += 1;
+      i += 2;
+      continue;
+    }
+
+    // Commands (\text{...}, \mathrm{...}, \mathbf{...}, etc.)
+    if (s[i] === '\\') {
+      const cmdM = s.slice(i).match(/^\\([a-zA-Z]+)\*?/);
+      if (cmdM) {
+        const cmdName = cmdM[1];
+        let p = i + cmdM[0].length;
+        while (p < s.length && /\s/.test(s[p])) p++;
+        if (
+          (uprightCmds.has(cmdName) || boldCmds.has(cmdName) || italicCmds.has(cmdName)) &&
+          s[p] === '{'
+        ) {
+          const br = readBalanced(s, p, '{', '}');
+          if (br) {
+            const innerFormatted =
+              br.content.includes('$') || br.content.includes('\\(')
+                ? formatTikzLabelToSvg(br.content, baseFontSize)
+                : formatLatexPieceToTspans(br.content, italicCmds.has(cmdName), baseFontSize);
+            if (boldCmds.has(cmdName)) {
+              out += `<tspan font-weight="bold" font-style="normal">${innerFormatted.tspans}</tspan>`;
+            } else if (italicCmds.has(cmdName)) {
+              out += `<tspan font-style="italic">${innerFormatted.tspans}</tspan>`;
+            } else {
+              out += `<tspan font-style="normal">${innerFormatted.tspans}</tspan>`;
+            }
+            plainLen += innerFormatted.plainLength;
+            i = br.endIdx + 1;
+            continue;
+          }
+        }
+        // Fallback: emit command name (respecting known math functions as upright)
+        if (italicVars && !knownFuncs.has(cmdName)) {
+          out += `<tspan font-style="italic">${escapeXmlAttr(cmdName)}</tspan>`;
+        } else {
+          out += escapeXmlAttr(cmdName);
+        }
+        plainLen += cmdName.length;
+        i += cmdM[0].length;
+        continue;
+      }
+      i++;
+      continue;
+    }
+
     if ((s[i] === '^' || s[i] === '_') && i + 1 < s.length) {
       const isSup = s[i] === '^';
       let content = '';
@@ -823,8 +1037,9 @@ function formatLatexPieceToTspans(
       }
       const dy = isSup ? -Math.round(baseFontSize * 0.34) : Math.round(baseFontSize * 0.22);
       const resetDy = -dy;
-      out += `<tspan dy="${dy}" font-size="${subSize}">${escapeXmlAttr(content)}</tspan><tspan dy="${resetDy}">&#8203;</tspan>`;
-      plainLen += content.length * 0.7;
+      const subFormatted = formatLatexPieceToTspans(content, italicVars, subSize);
+      out += `<tspan dy="${dy}" font-size="${subSize}">${subFormatted.tspans}</tspan><tspan dy="${resetDy}">&#8203;</tspan>`;
+      plainLen += Math.max(0.6, subFormatted.plainLength * 0.7);
       continue;
     }
 
@@ -833,11 +1048,17 @@ function formatLatexPieceToTspans(
       continue;
     }
 
+    if (italicVars && s[i] === '-') {
+      out += '−';
+      plainLen += 1;
+      i++;
+      continue;
+    }
+
     if (italicVars && /[a-zA-Z]/.test(s[i])) {
       let j = i;
       while (j < s.length && /[a-zA-Z]/.test(s[j])) j++;
       const word = s.slice(i, j);
-      const knownFuncs = new Set(['sin', 'cos', 'tan', 'cot', 'log', 'ln', 'exp', 'lim', 'max', 'min']);
       if (word.length === 1 || !knownFuncs.has(word)) {
         out += `<tspan font-style="italic">${escapeXmlAttr(word)}</tspan>`;
       } else {
@@ -860,13 +1081,41 @@ function formatTikzLabelToSvg(rawLabel: string, baseFontSize = 13): FormattedLab
   const s = rawLabel.trim();
   if (!s) return { tspans: '', plainLength: 0 };
 
-  // Split by $...$ or \(...\)
+  const findClosingDollar = (str: string, start: number): number => {
+    for (let k = start; k < str.length; k++) {
+      if (str[k] === '\\' && k + 1 < str.length) {
+        k++;
+        continue;
+      }
+      if (str[k] === '$') return k;
+    }
+    return -1;
+  };
+
+  // Split by $$...$$, $...$, \(...\), or \[...\]
   let out = '';
   let plainLen = 0;
   let i = 0;
   while (i < s.length) {
+    if (s[i] === '\\' && s[i + 1] === '$') {
+      out += '$';
+      plainLen += 1;
+      i += 2;
+      continue;
+    }
+    if (s[i] === '$' && s[i + 1] === '$') {
+      const end = s.indexOf('$$', i + 2);
+      if (end !== -1) {
+        const inner = s.slice(i + 2, end);
+        const f = formatLatexPieceToTspans(inner, true, baseFontSize);
+        out += f.tspans;
+        plainLen += f.plainLength;
+        i = end + 2;
+        continue;
+      }
+    }
     if (s[i] === '$') {
-      const end = s.indexOf('$', i + 1);
+      const end = findClosingDollar(s, i + 1);
       if (end !== -1) {
         const inner = s.slice(i + 1, end);
         const f = formatLatexPieceToTspans(inner, true, baseFontSize);
@@ -887,9 +1136,28 @@ function formatTikzLabelToSvg(rawLabel: string, baseFontSize = 13): FormattedLab
         continue;
       }
     }
+    if (s[i] === '\\' && s[i + 1] === '[') {
+      const end = s.indexOf('\\]', i + 2);
+      if (end !== -1) {
+        const inner = s.slice(i + 2, end);
+        const f = formatLatexPieceToTspans(inner, true, baseFontSize);
+        out += f.tspans;
+        plainLen += f.plainLength;
+        i = end + 2;
+        continue;
+      }
+    }
     // Plain text until next math delimiter
     let j = i;
-    while (j < s.length && s[j] !== '$' && !(s[j] === '\\' && s[j + 1] === '(')) j++;
+    while (j < s.length) {
+      if (s[j] === '\\' && s[j + 1] === '$') {
+        j += 2;
+        continue;
+      }
+      if (s[j] === '$') break;
+      if (s[j] === '\\' && (s[j + 1] === '(' || s[j + 1] === '[')) break;
+      j++;
+    }
     const chunk = s.slice(i, j);
     const f = formatLatexPieceToTspans(chunk, false, baseFontSize);
     out += f.tspans;
@@ -900,21 +1168,66 @@ function formatTikzLabelToSvg(rawLabel: string, baseFontSize = 13): FormattedLab
   return { tspans: out, plainLength: plainLen };
 }
 
+function findForeachStatementEnd(src: string, startPos: number): number {
+  let pos = startPos;
+  let bDepth = 0;
+  let pDepth = 0;
+  let kDepth = 0;
+  let inMath = false;
+  let inQuotes = false;
+  while (pos < src.length) {
+    const c = src[pos];
+    if (c === '\\' && pos + 1 < src.length) {
+      pos += 2;
+      continue;
+    }
+    if (c === '"' && bDepth === 0) inQuotes = !inQuotes;
+    else if (c === '$') inMath = !inMath;
+    else if (!inMath && !inQuotes) {
+      if (c === '{') bDepth++;
+      else if (c === '}') bDepth = Math.max(0, bDepth - 1);
+      else if (c === '(') pDepth++;
+      else if (c === ')') pDepth = Math.max(0, pDepth - 1);
+      else if (c === '[') kDepth++;
+      else if (c === ']') kDepth = Math.max(0, kDepth - 1);
+      else if (c === ';' && bDepth === 0 && pDepth === 0 && kDepth === 0) {
+        return pos + 1;
+      }
+    }
+    pos++;
+  }
+  return src.length;
+}
+
 function expandForeachLoops(
   src: string,
   vars: Record<string, number> = {},
   customFuncs: Record<string, CustomMathFunc> = {}
 ): string {
   let out = src;
-  const re = /\\foreach\s+(\\[a-zA-Z]+(?:\s*\/\s*\\[a-zA-Z]+)*)\s*(?:\[[^\]]*\])?\s*in\s*\{/;
+  const re = /\\foreach\s+(\\[a-zA-Z]+(?:\s*\/\s*\\[a-zA-Z]+)*)/;
   let safety = 0;
   let m: RegExpExecArray | null;
 
   while ((m = re.exec(out)) !== null && safety < 40) {
     safety++;
     const varNames = m[1].split('/').map((v) => v.trim());
-    const listBr = readBalanced(out, m.index + m[0].length - 1, '{', '}');
+    let scan = m.index + m[0].length;
+    const { opts: feOpts, nextIdx: afterOpts } = readLeadingBracketOptions(out, scan);
+    scan = afterOpts;
+    while (scan < out.length && /\s/.test(out[scan])) scan++;
+    if (!out.startsWith('in', scan) || /[a-zA-Z]/.test(out[scan + 2] || '')) break;
+    scan += 2;
+    while (scan < out.length && /\s/.test(out[scan])) scan++;
+    if (out[scan] !== '{') break;
+    const listBr = readBalanced(out, scan, '{', '}');
     if (!listBr) break;
+
+    let countVar: string | null = null;
+    if (feOpts) {
+      const cntM = feOpts.match(/count\s*=\s*(\\[a-zA-Z]+)/);
+      if (cntM) countVar = cntM[1];
+    }
 
     let pos = listBr.endIdx + 1;
     while (pos < out.length && /\s/.test(out[pos])) pos++;
@@ -927,11 +1240,8 @@ function expandForeachLoops(
       bodyStr = bodyBr.content;
       endPos = bodyBr.endIdx + 1;
     } else {
-      // Single statement terminated by ;
-      const semi = out.indexOf(';', pos);
-      if (semi === -1) break;
-      bodyStr = out.slice(pos, semi + 1);
-      endPos = semi + 1;
+      endPos = findForeachStatementEnd(out, pos);
+      bodyStr = out.slice(pos, endPos);
     }
 
     const rawItems = splitTopLevel(listBr.content, ',').map((x) => x.trim()).filter(Boolean);
@@ -962,7 +1272,7 @@ function expandForeachLoops(
               guard++;
             }
           }
-          idx++; // skip endVal since loop pushed up to endVal
+          idx++;
           continue;
         }
       }
@@ -970,16 +1280,21 @@ function expandForeachLoops(
     }
 
     let expanded = '';
-    for (const item of items) {
+    items.forEach((item, itemIdx) => {
       const vals = splitTopLevel(item, '/').map((v) => v.trim());
       let rep = bodyStr;
       varNames.forEach((vn, vIdx) => {
         const val = vals[vIdx] ?? vals[0] ?? '';
         const escName = vn.replace('\\', '\\\\');
-        rep = rep.replace(new RegExp(`${escName}(?![a-zA-Z])`, 'g'), val);
+        rep = rep.replace(new RegExp(`${escName}(?![a-zA-Z])`, 'g'), () => val);
       });
+      if (countVar) {
+        const escCount = countVar.replace('\\', '\\\\');
+        const cntStr = String(itemIdx + 1);
+        rep = rep.replace(new RegExp(`${escCount}(?![a-zA-Z])`, 'g'), () => cntStr);
+      }
       expanded += `${rep}\n`;
-    }
+    });
 
     out = out.slice(0, m.index) + expanded + out.slice(endPos);
   }
@@ -1019,9 +1334,26 @@ function parseOptionsString(
     fill: base.fill,
     fillOpacity: base.fillOpacity,
     strokeOpacity: 1,
+    fontSize: base.fontSize,
+    fontWeight: base.fontWeight,
   };
 
   for (const part of parts) {
+    // Handle TikZ quotes syntax like `"$30^\circ$"` or `"$\alpha$"' {opts}`
+    if (part.startsWith('"')) {
+      const endQ = part.indexOf('"', 1);
+      if (endQ !== -1) {
+        style.picText = part.slice(1, endQ);
+        const tail = part.slice(endQ + 1).trim();
+        const braceIdx = tail.indexOf('{');
+        if (braceIdx !== -1) {
+          const br = readBalanced(tail, braceIdx, '{', '}');
+          if (br) style.picTextOpts = br.content;
+        }
+        continue;
+      }
+    }
+
     const eqIdx = part.indexOf('=');
     const key = (eqIdx === -1 ? part : part.slice(0, eqIdx)).trim();
     const val = (eqIdx === -1 ? '' : part.slice(eqIdx + 1)).trim();
@@ -1062,14 +1394,30 @@ function parseOptionsString(
     } else if (key === 'color' && cleanVal) {
       const c = resolveTikzColor(cleanVal, customColors);
       if (c) style.stroke = c;
-    } else if (key === 'draw' && cleanVal) {
-      const c = resolveTikzColor(cleanVal, customColors);
-      if (c) style.stroke = c;
+    } else if (key === 'draw') {
+      if (cleanVal.toLowerCase() === 'none') {
+        style.hasDraw = false;
+        style.stroke = 'none';
+      } else {
+        style.hasDraw = true;
+        if (cleanVal) {
+          const c = resolveTikzColor(cleanVal, customColors);
+          if (c) style.stroke = c;
+        }
+      }
     } else if (key === 'fill') {
-      if (!cleanVal) style.fill = style.stroke;
-      else {
+      if (!cleanVal) {
+        style.hasFill = true;
+        style.fill = style.stroke;
+      } else if (cleanVal.toLowerCase() === 'none') {
+        style.hasFill = false;
+        style.fill = 'none';
+      } else {
         const c = resolveTikzColor(cleanVal, customColors);
-        if (c) style.fill = c;
+        if (c) {
+          style.hasFill = true;
+          style.fill = c;
+        }
       }
     } else if (key === 'fill opacity' && cleanVal) {
       const op = parseFloat(cleanVal);
@@ -1080,6 +1428,23 @@ function parseOptionsString(
         style.fillOpacity = Math.max(0, Math.min(1, op));
         style.strokeOpacity = style.fillOpacity;
       }
+    } else if (key === 'angle radius' && cleanVal) {
+      const hasUnit = /[a-zA-Z]+$/.test(cleanVal);
+      if (hasUnit) {
+        const px = parseLengthToPx(cleanVal, unitPx);
+        if (px !== null && px > 0) style.angleRadiusPx = px;
+      } else {
+        const v = evalMathExpr(cleanVal, vars, false, customFuncs);
+        if (v !== null && v > 0) style.angleRadiusPx = v * unitPx * Math.abs(base.scaleX);
+      }
+    } else if (key === 'angle eccentricity' && cleanVal) {
+      const ecc = evalMathExpr(cleanVal, vars, false, customFuncs);
+      if (ecc !== null && Number.isFinite(ecc)) style.angleEccentricity = ecc;
+    } else if (key === 'pic text' && cleanVal) {
+      style.picText =
+        cleanVal.startsWith('"') && cleanVal.endsWith('"') && cleanVal.length >= 2
+          ? cleanVal.slice(1, -1)
+          : cleanVal;
     } else if (key === 'pattern' && cleanVal) {
       style.pattern = cleanVal.toLowerCase();
     } else if (key === 'pattern color' && cleanVal) {
@@ -1180,7 +1545,7 @@ function parseOptionsString(
       style.labelSpec = cleanVal;
     } else if (key === 'font' && cleanVal) {
       if (cleanVal.includes('bf') || cleanVal.includes('bold')) style.fontWeight = 'bold';
-      if (cleanVal.includes('small') || cleanVal.includes('footnotesize')) style.fontSize = 11;
+      if (cleanVal.includes('small') || cleanVal.includes('footnotesize')) style.fontSize = 11.5;
       if (cleanVal.includes('tiny') || cleanVal.includes('scriptsize')) style.fontSize = 10;
       if (cleanVal.includes('large') || cleanVal.includes('Large')) style.fontSize = 15;
     } else if (key === 'inner sep' && cleanVal) {
@@ -1197,6 +1562,148 @@ function parseOptionsString(
   return style;
 }
 
+function resolveCalcVectorTerm(
+  termRaw: string,
+  namedCoords: Record<string, Point2D>,
+  prevPoint: Point2D,
+  vars: Record<string, number>,
+  customFuncs: Record<string, CustomMathFunc>
+): Point2D | null {
+  let rest = termRaw.trim();
+  if (!rest) return null;
+
+  // Optional leading scalar multiplier like `0.5*(A)` or `{1/3}*(B)`
+  let scalar = 1;
+  if (!rest.startsWith('(')) {
+    let brace = 0;
+    let paren = 0;
+    let mulPos = -1;
+    for (let i = 0; i < rest.length; i++) {
+      const ch = rest[i];
+      if (ch === '{') brace++;
+      else if (ch === '}') brace = Math.max(0, brace - 1);
+      else if (ch === '(') paren++;
+      else if (ch === ')') paren = Math.max(0, paren - 1);
+      else if (ch === '*' && brace === 0 && paren === 0) {
+        mulPos = i;
+        break;
+      }
+    }
+    if (mulPos === -1) return null;
+    const scVal = evalMathExpr(rest.slice(0, mulPos), vars, false, customFuncs);
+    if (scVal === null) return null;
+    scalar = scVal;
+    rest = rest.slice(mulPos + 1).trim();
+  }
+
+  if (!rest.startsWith('(')) return null;
+  const p1Br = readBalanced(rest, 0, '(', ')');
+  if (!p1Br) return null;
+  const p1 = resolveCoordinateExpr(p1Br.content, namedCoords, prevPoint, false, vars, customFuncs);
+  if (!p1) return null;
+
+  const after1 = rest.slice(p1Br.endIdx + 1).trim();
+  if (!after1) {
+    return { x: scalar * p1.x, y: scalar * p1.y };
+  }
+
+  // Distance / projection / rotated modifier: !(...)! or !t! or !t!angle:
+  if (!after1.startsWith('!')) return null;
+
+  // Scan top-level `!` inside after1 (outside (), {})
+  const readUntilBang = (str: string, fromIdx: number): { val: string; bangIdx: number } | null => {
+    let b = 0;
+    let p = 0;
+    for (let i = fromIdx; i < str.length; i++) {
+      if (str[i] === '{') b++;
+      else if (str[i] === '}') b = Math.max(0, b - 1);
+      else if (str[i] === '(') p++;
+      else if (str[i] === ')') p = Math.max(0, p - 1);
+      else if (str[i] === '!' && b === 0 && p === 0) {
+        return { val: str.slice(fromIdx, i).trim(), bangIdx: i };
+      }
+    }
+    return null;
+  };
+
+  const midPart = readUntilBang(after1, 1);
+  if (!midPart) return null;
+  const modStr = midPart.val;
+  let tail = after1.slice(midPart.bangIdx + 1).trim();
+
+  // Optional rotation `angle:(p2)`
+  let rotAngleDeg = 0;
+  if (!tail.startsWith('(')) {
+    let b = 0;
+    let p = 0;
+    let colonPos = -1;
+    for (let i = 0; i < tail.length; i++) {
+      if (tail[i] === '{') b++;
+      else if (tail[i] === '}') b = Math.max(0, b - 1);
+      else if (tail[i] === '(') p++;
+      else if (tail[i] === ')') p = Math.max(0, p - 1);
+      else if (tail[i] === ':' && b === 0 && p === 0) {
+        colonPos = i;
+        break;
+      }
+    }
+    if (colonPos === -1) return null;
+    const ang = evalMathExpr(tail.slice(0, colonPos), vars, false, customFuncs);
+    if (ang === null) return null;
+    rotAngleDeg = ang;
+    tail = tail.slice(colonPos + 1).trim();
+  }
+
+  if (!tail.startsWith('(')) return null;
+  const p2Br = readBalanced(tail, 0, '(', ')');
+  if (!p2Br || tail.slice(p2Br.endIdx + 1).trim() !== '') return null;
+  const p2 = resolveCoordinateExpr(p2Br.content, namedCoords, prevPoint, false, vars, customFuncs);
+  if (!p2) return null;
+
+  // Orthogonal projection $(A)!(P)!(B)$
+  if (modStr.startsWith('(') && modStr.endsWith(')')) {
+    const pProjBr = readBalanced(modStr, 0, '(', ')');
+    if (pProjBr && pProjBr.endIdx === modStr.length - 1) {
+      const pProj = resolveCoordinateExpr(pProjBr.content, namedCoords, prevPoint, false, vars, customFuncs);
+      if (!pProj) return null;
+      const dx = p2.x - p1.x;
+      const dy = p2.y - p1.y;
+      const len2 = dx * dx + dy * dy;
+      if (len2 > 1e-9) {
+        const t = ((pProj.x - p1.x) * dx + (pProj.y - p1.y) * dy) / len2;
+        return { x: scalar * (p1.x + t * dx), y: scalar * (p1.y + t * dy) };
+      }
+    }
+  }
+
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
+  const segLen = Math.hypot(dx, dy);
+  let t: number | null = null;
+  if (/[a-zA-Z]+$/.test(modStr)) {
+    const distUnits = parseLengthToTikzUnits(modStr);
+    if (distUnits !== null) {
+      t = segLen > 1e-9 ? distUnits / segLen : 0;
+    }
+  }
+  if (t === null) {
+    t = evalMathExpr(modStr, vars, false, customFuncs);
+  }
+  if (t === null) return null;
+
+  let vx = dx * t;
+  let vy = dy * t;
+  if (Math.abs(rotAngleDeg) > 1e-9) {
+    const rad = (rotAngleDeg * Math.PI) / 180;
+    const rx = vx * Math.cos(rad) - vy * Math.sin(rad);
+    const ry = vx * Math.sin(rad) + vy * Math.cos(rad);
+    vx = rx;
+    vy = ry;
+  }
+
+  return { x: scalar * (p1.x + vx), y: scalar * (p1.y + vy) };
+}
+
 function resolveCoordinateExpr(
   rawCoord: string,
   namedCoords: Record<string, Point2D>,
@@ -1206,61 +1713,107 @@ function resolveCoordinateExpr(
   customFuncs: Record<string, CustomMathFunc> = {}
 ): Point2D | null {
   let s = rawCoord.trim();
+  if (!s) return null;
+  if (s.startsWith('(') && s.endsWith(')')) {
+    const br = readBalanced(s, 0, '(', ')');
+    if (br && br.endIdx === s.length - 1) s = br.content.trim();
+  }
   if (s.startsWith('axis cs:')) s = s.slice('axis cs:'.length).trim();
+  if (s.startsWith('canvas cs:')) s = s.slice('canvas cs:'.length).trim();
 
   // Named coordinate
   if (namedCoords[s]) {
     return { ...namedCoords[s] };
   }
 
-  // Orthogonal intersection: (A |- B) -> (A.x, B.y), (A -| B) -> (B.x, A.y)
-  const orthoM = s.match(/^(.+?)\s*(\|-|-\|)\s*(.+)$/);
-  if (orthoM) {
-    const p1 = resolveCoordinateExpr(orthoM[1], namedCoords, prevPoint, false, vars, customFuncs);
-    const p2 = resolveCoordinateExpr(orthoM[3], namedCoords, prevPoint, false, vars, customFuncs);
-    if (p1 && p2) {
-      return orthoM[2] === '|-' ? { x: p1.x, y: p2.y } : { x: p2.x, y: p1.y };
-    }
-  }
-
-  // Calc syntax: $(A)!0.5!(B)$ or $(A) + (B)$ or $(A)!t!angle:(B)$
-  if (s.startsWith('$') && s.endsWith('$')) {
-    const inner = s.slice(1, -1).trim();
-    const interpM = inner.match(/^\(([^)]+)\)!([^!]+)!\(([^)]+)\)$/);
-    if (interpM) {
-      const p1 = resolveCoordinateExpr(interpM[1], namedCoords, prevPoint, false, vars, customFuncs);
-      const p2 = resolveCoordinateExpr(interpM[3], namedCoords, prevPoint, false, vars, customFuncs);
-      const t = evalMathExpr(interpM[2], vars, false, customFuncs);
-      if (p1 && p2 && t !== null) {
-        return { x: p1.x + (p2.x - p1.x) * t, y: p1.y + (p2.y - p1.y) * t };
-      }
-    }
-    // Projection $(A)!(P)!(B)$
-    const projM = inner.match(/^\(([^)]+)\)!\(([^)]+)\)!\(([^)]+)\)$/);
-    if (projM) {
-      const a = resolveCoordinateExpr(projM[1], namedCoords, prevPoint, false, vars, customFuncs);
-      const p = resolveCoordinateExpr(projM[2], namedCoords, prevPoint, false, vars, customFuncs);
-      const b = resolveCoordinateExpr(projM[3], namedCoords, prevPoint, false, vars, customFuncs);
-      if (a && p && b) {
-        const dx = b.x - a.x;
-        const dy = b.y - a.y;
-        const len2 = dx * dx + dy * dy;
-        if (len2 > 1e-9) {
-          const t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2;
-          return { x: a.x + t * dx, y: a.y + t * dy };
+  // Intersection: `intersection of P1--P2 and P3--P4`
+  if (/^intersection\s+of\s+/i.test(s)) {
+    const body = s.replace(/^intersection\s+of\s+/i, '').trim();
+    const andParts = body.split(/\s+and\s+/i);
+    if (andParts.length === 2) {
+      const seg1 = splitTopLevel(andParts[0], '--');
+      const seg2 = splitTopLevel(andParts[1], '--');
+      if (seg1.length === 2 && seg2.length === 2) {
+        const a1 = resolveCoordinateExpr(seg1[0], namedCoords, prevPoint, false, vars, customFuncs);
+        const a2 = resolveCoordinateExpr(seg1[1], namedCoords, prevPoint, false, vars, customFuncs);
+        const b1 = resolveCoordinateExpr(seg2[0], namedCoords, prevPoint, false, vars, customFuncs);
+        const b2 = resolveCoordinateExpr(seg2[1], namedCoords, prevPoint, false, vars, customFuncs);
+        if (a1 && a2 && b1 && b2) {
+          const d1x = a2.x - a1.x;
+          const d1y = a2.y - a1.y;
+          const d2x = b2.x - b1.x;
+          const d2y = b2.y - b1.y;
+          const det = d1x * d2y - d1y * d2x;
+          if (Math.abs(det) > 1e-9) {
+            const t = ((b1.x - a1.x) * d2y - (b1.y - a1.y) * d2x) / det;
+            return { x: a1.x + t * d1x, y: a1.y + t * d1y };
+          }
         }
       }
     }
-    // Sum/diff of coordinates: $(A)+(B)$ or $(A)+(1,2)$
-    const addM = inner.match(/^\(([^)]+)\)\s*([+-])\s*(?:(\d+(?:\.\d+)?)\s*\*\s*)?\(([^)]+)\)$/);
-    if (addM) {
-      const p1 = resolveCoordinateExpr(addM[1], namedCoords, prevPoint, false, vars, customFuncs);
-      const p2 = resolveCoordinateExpr(addM[4], namedCoords, prevPoint, false, vars, customFuncs);
-      const factor = addM[3] ? parseFloat(addM[3]) : 1;
-      const sign = addM[2] === '-' ? -1 : 1;
-      if (p1 && p2) {
-        return { x: p1.x + sign * factor * p2.x, y: p1.y + sign * factor * p2.y };
+  }
+
+  // Orthogonal intersection: (A |- B) -> (A.x, B.y), (A -| B) -> (B.x, A.y)
+  const orthoParts = splitTopLevel(s, '|-');
+  if (orthoParts.length === 2) {
+    const p1 = resolveCoordinateExpr(orthoParts[0], namedCoords, prevPoint, false, vars, customFuncs);
+    const p2 = resolveCoordinateExpr(orthoParts[1], namedCoords, prevPoint, false, vars, customFuncs);
+    if (p1 && p2) return { x: p1.x, y: p2.y };
+  }
+  const orthoParts2 = splitTopLevel(s, '-|');
+  if (orthoParts2.length === 2) {
+    const p1 = resolveCoordinateExpr(orthoParts2[0], namedCoords, prevPoint, false, vars, customFuncs);
+    const p2 = resolveCoordinateExpr(orthoParts2[1], namedCoords, prevPoint, false, vars, customFuncs);
+    if (p1 && p2) return { x: p2.x, y: p1.y };
+  }
+
+  // Calc syntax: $(A)!0.5!(B)$, $(A)!1.5cm!(B)$, $(A)!0.5!90:(B)$, $(A)!(P)!(B)$, $(A) + 2*(B) - (C)$
+  if (s.startsWith('$') && s.endsWith('$')) {
+    const inner = s.slice(1, -1).trim();
+    const terms: Array<{ sign: number; raw: string }> = [];
+    let brace = 0;
+    let bracket = 0;
+    let paren = 0;
+    let curSign = 1;
+    let termStart = 0;
+
+    for (let i = 0; i < inner.length; i++) {
+      const ch = inner[i];
+      if (ch === '{') brace++;
+      else if (ch === '}') brace = Math.max(0, brace - 1);
+      else if (ch === '[') bracket++;
+      else if (ch === ']') bracket = Math.max(0, bracket - 1);
+      else if (ch === '(') paren++;
+      else if (ch === ')') paren = Math.max(0, paren - 1);
+      else if ((ch === '+' || ch === '-') && brace === 0 && bracket === 0 && paren === 0) {
+        const prev = inner.slice(termStart, i).trim();
+        if (prev) {
+          terms.push({ sign: curSign, raw: prev });
+          curSign = ch === '-' ? -1 : 1;
+          termStart = i + 1;
+        } else {
+          curSign *= ch === '-' ? -1 : 1;
+          termStart = i + 1;
+        }
       }
+    }
+    const lastTerm = inner.slice(termStart).trim();
+    if (lastTerm) terms.push({ sign: curSign, raw: lastTerm });
+
+    if (terms.length > 0) {
+      let sumX = 0;
+      let sumY = 0;
+      let allOk = true;
+      for (const term of terms) {
+        const pt = resolveCalcVectorTerm(term.raw, namedCoords, prevPoint, vars, customFuncs);
+        if (!pt) {
+          allOk = false;
+          break;
+        }
+        sumX += term.sign * pt.x;
+        sumY += term.sign * pt.y;
+      }
+      if (allOk) return { x: sumX, y: sumY };
     }
   }
 
@@ -1277,11 +1830,13 @@ function resolveCoordinateExpr(
     }
   }
 
-  // Cartesian: (x, y)
+  // Cartesian: (x, y) or (x=..., y=...)
   const xyParts = splitTopLevel(s, ',');
   if (xyParts.length === 2) {
-    const x = parseLengthToTikzUnits(xyParts[0]) ?? evalMathExpr(xyParts[0], vars, false, customFuncs);
-    const y = parseLengthToTikzUnits(xyParts[1]) ?? evalMathExpr(xyParts[1], vars, false, customFuncs);
+    const rawX = xyParts[0].replace(/^\s*x\s*=\s*/i, '');
+    const rawY = xyParts[1].replace(/^\s*y\s*=\s*/i, '');
+    const x = parseLengthToTikzUnits(rawX) ?? evalMathExpr(rawX, vars, false, customFuncs);
+    const y = parseLengthToTikzUnits(rawY) ?? evalMathExpr(rawY, vars, false, customFuncs);
     if (x !== null && y !== null) {
       return isRelativeMove ? { x: prevPoint.x + x, y: prevPoint.y + y } : { x, y };
     }
@@ -1666,10 +2221,13 @@ function renderAxisEnvToItems(
     const stmt = rawStmt.trim();
     if (!stmt) continue;
 
-    const addPlotM = stmt.match(/^\\addplot3?\+?\s*(?:\[([^\]]*)\])?\s*([\s\S]+)$/);
+    const addPlotM = stmt.match(/^\\addplot3?\+?(?![a-zA-Z])/);
     if (addPlotM) {
-      const pOptsRaw = addPlotM[1] || '';
-      const pBody = addPlotM[2].trim();
+      const { opts: pOptsRaw, nextIdx: afterPlotOpts } = readLeadingBracketOptions(
+        stmt,
+        addPlotM[0].length
+      );
+      const pBody = stmt.slice(afterPlotOpts).trim();
       const baseState: TikzScopeState = {
         scaleX: 1,
         scaleY: 1,
@@ -1691,12 +2249,22 @@ function renderAxisEnvToItems(
         const br = readBalanced(pBody, pBody.indexOf('{'), '{', '}');
         if (br) {
           const cur: Point2D[] = [];
-          const coordRe = /\(([^,]+),([^)]+)\)/g;
-          let cm: RegExpExecArray | null;
-          while ((cm = coordRe.exec(br.content)) !== null) {
-            const px = evalMathExpr(cm[1], vars, false, customFuncs);
-            const py = evalMathExpr(cm[2], vars, false, customFuncs);
-            if (px !== null && py !== null) cur.push({ x: toSvgX(px), y: toSvgY(py) });
+          let ci = 0;
+          while (ci < br.content.length) {
+            if (br.content[ci] === '(') {
+              const cPar = readBalanced(br.content, ci, '(', ')');
+              if (cPar) {
+                const xy = splitTopLevel(cPar.content, ',');
+                if (xy.length === 2) {
+                  const px = evalMathExpr(xy[0], vars, false, customFuncs);
+                  const py = evalMathExpr(xy[1], vars, false, customFuncs);
+                  if (px !== null && py !== null) cur.push({ x: toSvgX(px), y: toSvgY(py) });
+                }
+                ci = cPar.endIdx + 1;
+                continue;
+              }
+            }
+            ci++;
           }
           if (cur.length > 0) ptsList.push(cur);
         }
@@ -2126,16 +2694,34 @@ function preprocessTkzEuclide(body: string): {
   const presetCoords: Record<string, Point2D> = {};
   let out = body;
 
-  // \tkzDefPoint(x,y){A}
-  out = out.replace(
-    /\\tkzDefPoint(?:\[[^\]]*\])?\s*\(([^,]+),([^)]+)\)\s*\{([^}]+)\}/g,
-    (_m, xStr: string, yStr: string, name: string) => {
-      const x = evalMathExpr(xStr);
-      const y = evalMathExpr(yStr);
-      if (x !== null && y !== null) presetCoords[name.trim()] = { x, y };
-      return '';
+  // \tkzDefPoint(x,y){A} (supports nested parens/braces in x,y)
+  {
+    const defPtRe = /\\tkzDefPoint(?![a-zA-Z])/;
+    let dm: RegExpExecArray | null;
+    let dGuard = 0;
+    while ((dm = defPtRe.exec(out)) !== null && dGuard < 100) {
+      dGuard++;
+      let p = dm.index + dm[0].length;
+      const { nextIdx } = readLeadingBracketOptions(out, p);
+      p = nextIdx;
+      while (p < out.length && /\s/.test(out[p])) p++;
+      if (out[p] !== '(') break;
+      const par = readBalanced(out, p, '(', ')');
+      if (!par) break;
+      p = par.endIdx + 1;
+      while (p < out.length && /\s/.test(out[p])) p++;
+      if (out[p] !== '{') break;
+      const nameBr = readBalanced(out, p, '{', '}');
+      if (!nameBr) break;
+      const xy = splitTopLevel(par.content, ',');
+      if (xy.length === 2) {
+        const x = evalMathExpr(xy[0]);
+        const y = evalMathExpr(xy[1]);
+        if (x !== null && y !== null) presetCoords[nameBr.content.trim()] = { x, y };
+      }
+      out = out.slice(0, dm.index) + out.slice(nameBr.endIdx + 1);
     }
-  );
+  }
 
   // \tkzDefPoints{0/0/A, 4/0/B}
   out = out.replace(/\\tkzDefPoints\s*\{([^}]+)\}/g, (_m, list: string) => {
@@ -2196,12 +2782,19 @@ function preprocessTkzEuclide(body: string): {
 
   // \tkzDrawPoints[opts](A,B,C)
   out = out.replace(
-    /\\tkzDrawPoints(?:\[[^\]]*\])?\s*\(([^)]+)\)/g,
-    (_m, pts: string) =>
-      pts
+    /\\tkzDrawPoints(?:\[([^\]]*)\])?\s*\(([^)]+)\)/g,
+    (_m, opts: string | undefined, pts: string) => {
+      const cleanOpts = (opts || '')
         .split(',')
-        .map((p) => `\\fill (${p.trim()}) circle (2pt);`)
-        .join('\n')
+        .map((s) => s.trim())
+        .filter((s) => s && !/^size\s*=/.test(s) && !/^shape\s*=/.test(s))
+        .join(', ');
+      const optStr = cleanOpts ? `[${cleanOpts}]` : '';
+      return pts
+        .split(',')
+        .map((p) => `\\fill${optStr} (${p.trim()}) circle (2pt);`)
+        .join('\n');
+    }
   );
 
   // \tkzLabelPoints[above](A,B,C)
@@ -2220,13 +2813,19 @@ function preprocessTkzEuclide(body: string): {
     (_m, opts: string | undefined, oName: string, second: string) => {
       const oPt = presetCoords[oName.trim()];
       if (!oPt) return '';
+      const cleanOpts = (opts || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter((s) => s && s !== 'R')
+        .join(', ');
+      const optStr = cleanOpts ? `[${cleanOpts}]` : '';
       if (opts && /\bR\b/.test(opts)) {
-        return `\\draw (${oName.trim()}) circle (${second.trim()});`;
+        return `\\draw${optStr} (${oName.trim()}) circle (${second.trim()});`;
       }
       const aPt = presetCoords[second.trim()];
       if (aPt) {
         const r = Math.hypot(aPt.x - oPt.x, aPt.y - oPt.y);
-        return `\\draw (${oName.trim()}) circle (${r.toFixed(4)});`;
+        return `\\draw${optStr} (${oName.trim()}) circle (${r.toFixed(4)});`;
       }
       return '';
     }
@@ -2402,18 +3001,35 @@ function executeTikzStatements(
     const minTextY = ty - fs * 0.85;
     const maxTextY = ty + fs * 0.25;
 
-    if (nStyle.fill && nStyle.fill !== 'none') {
-      const boxPad = nStyle.innerSep ?? 2;
+    const hasNodeFill = Boolean(nStyle.fill && nStyle.fill !== 'none');
+    const hasNodeDraw = Boolean(nStyle.hasDraw);
+    if (hasNodeFill || hasNodeDraw) {
+      const boxPad = nStyle.innerSep ?? 3;
       const rx = minTextX - boxPad;
       const ry = minTextY - boxPad;
       const rw = textW + boxPad * 2;
       const rh = maxTextY - minTextY + boxPad * 2;
-      const rxAttr = nStyle.roundedCorners ? ` rx="${nStyle.roundedCorners.toFixed(1)}"` : '';
-      targetList.push({
-        kind: 'rect',
-        svg: `<rect x="${rx.toFixed(1)}" y="${ry.toFixed(1)}" width="${rw.toFixed(1)}" height="${rh.toFixed(1)}" fill="${nStyle.fill}" stroke="none"${rxAttr}/>`,
-        bounds: { minX: rx, minY: ry, maxX: rx + rw, maxY: ry + rh },
-      });
+      const fillAttr = hasNodeFill ? nStyle.fill : 'none';
+      const strokeAttr = hasNodeDraw ? nStyle.stroke : 'none';
+      const swAttr = hasNodeDraw ? ` stroke-width="${nStyle.strokeWidth}"` : '';
+      const dashAttr = hasNodeDraw && nStyle.dashArray ? ` stroke-dasharray="${nStyle.dashArray}"` : '';
+      if (nStyle.circle) {
+        const cx = rx + rw / 2;
+        const cy = ry + rh / 2;
+        const rad = Math.max(rw, rh) / 2 + 1;
+        targetList.push({
+          kind: 'circle',
+          svg: `<circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="${rad.toFixed(1)}" fill="${fillAttr}" stroke="${strokeAttr}"${swAttr}${dashAttr}/>`,
+          bounds: { minX: cx - rad, minY: cy - rad, maxX: cx + rad, maxY: cy + rad },
+        });
+      } else {
+        const rxAttr = nStyle.roundedCorners ? ` rx="${nStyle.roundedCorners.toFixed(1)}"` : '';
+        targetList.push({
+          kind: 'rect',
+          svg: `<rect x="${rx.toFixed(1)}" y="${ry.toFixed(1)}" width="${rw.toFixed(1)}" height="${rh.toFixed(1)}" fill="${fillAttr}" stroke="${strokeAttr}"${swAttr}${dashAttr}${rxAttr}/>`,
+          bounds: { minX: rx, minY: ry, maxX: rx + rw, maxY: ry + rh },
+        });
+      }
     }
 
     targetList.push({
@@ -2493,13 +3109,16 @@ function executeTikzStatements(
     const rest = src.slice(cursor);
 
     // 1. \begin{axis}[opts] ... \end{axis}
-    const axisM = rest.match(/^\\begin\{axis\}\s*(?:\[([^\]]*)\])?/);
+    const axisM = rest.match(/^\\begin\{axis\}/);
     if (axisM) {
-      const startInner = cursor + axisM[0].length;
+      const { opts: axisOptsRaw, nextIdx: startInner } = readLeadingBracketOptions(
+        src,
+        cursor + axisM[0].length
+      );
       const endIdx = src.indexOf('\\end{axis}', startInner);
       if (endIdx !== -1) {
         renderAxisEnvToItems(
-          axisM[1] || '',
+          axisOptsRaw,
           src.slice(startInner, endIdx),
           unitPx,
           customColors,
@@ -2515,9 +3134,12 @@ function executeTikzStatements(
     }
 
     // 2. \begin{scope}[opts] ... \end{scope}
-    const scopeM = rest.match(/^\\begin\{scope\}\s*(?:\[([^\]]*)\])?/);
+    const scopeM = rest.match(/^\\begin\{scope\}/);
     if (scopeM) {
-      const startInner = cursor + scopeM[0].length;
+      const { opts: scopeOptsRaw, nextIdx: startInner } = readLeadingBracketOptions(
+        src,
+        cursor + scopeM[0].length
+      );
       let depth = 1;
       let scan = startInner;
       let foundEnd = -1;
@@ -2539,7 +3161,7 @@ function executeTikzStatements(
         scan++;
       }
       if (foundEnd !== -1) {
-        const st = parseOptionsString(scopeM[1] || '', scope, customColors, unitPx, scope.vars, scope.customFuncs);
+        const st = parseOptionsString(scopeOptsRaw, scope, customColors, unitPx, scope.vars, scope.customFuncs);
         const childCustomFuncs = {
           ...(scope.customFuncs || {}),
           ...(st.customFuncs || {}),
@@ -2558,6 +3180,8 @@ function executeTikzStatements(
           dashArray: st.dashArray,
           fill: st.fill,
           fillOpacity: st.fillOpacity,
+          fontSize: st.fontSize ?? scope.fontSize,
+          fontWeight: st.fontWeight ?? scope.fontWeight,
           vars: { ...(scope.vars || {}) },
           customFuncs: childCustomFuncs,
           trigRad: st.trigRad ?? scope.trigRad,
@@ -2602,48 +3226,32 @@ function executeTikzStatements(
     }
 
     // 4. \foreach loop (expand in place using active scope vars, then continue executing)
-    const foreachM = rest.match(/^\\foreach\s+(\\[a-zA-Z]+(?:\s*\/\s*\\[a-zA-Z]+)*)\s*(?:\[[^\]]*\])?\s*in\s*\{/);
+    const foreachM = rest.match(/^\\foreach\s+(\\[a-zA-Z]+(?:\s*\/\s*\\[a-zA-Z]+)*)/);
     if (foreachM) {
-      const listBr = readBalanced(src, cursor + foreachM[0].length - 1, '{', '}');
-      if (listBr) {
-        let endLoopPos = listBr.endIdx + 1;
-        while (endLoopPos < src.length && /\s/.test(src[endLoopPos])) endLoopPos++;
-        if (src[endLoopPos] === '{') {
-          const bBr = readBalanced(src, endLoopPos, '{', '}');
-          if (bBr) endLoopPos = bBr.endIdx + 1;
-        } else {
-          let semiPos = endLoopPos;
-          let bDepth = 0;
-          let pDepth = 0;
-          let kDepth = 0;
-          let inMath = false;
-          while (semiPos < src.length) {
-            const c = src[semiPos];
-            if (c === '\\' && semiPos + 1 < src.length) {
-              semiPos += 2;
-              continue;
+      let feScan = cursor + foreachM[0].length;
+      const { nextIdx: afterFeOpts } = readLeadingBracketOptions(src, feScan);
+      feScan = afterFeOpts;
+      while (feScan < src.length && /\s/.test(src[feScan])) feScan++;
+      if (src.startsWith('in', feScan) && !/[a-zA-Z]/.test(src[feScan + 2] || '')) {
+        feScan += 2;
+        while (feScan < src.length && /\s/.test(src[feScan])) feScan++;
+        if (src[feScan] === '{') {
+          const listBr = readBalanced(src, feScan, '{', '}');
+          if (listBr) {
+            let endLoopPos = listBr.endIdx + 1;
+            while (endLoopPos < src.length && /\s/.test(src[endLoopPos])) endLoopPos++;
+            if (src[endLoopPos] === '{') {
+              const bBr = readBalanced(src, endLoopPos, '{', '}');
+              if (bBr) endLoopPos = bBr.endIdx + 1;
+            } else {
+              endLoopPos = findForeachStatementEnd(src, endLoopPos);
             }
-            if (c === '$') inMath = !inMath;
-            else if (!inMath) {
-              if (c === '{') bDepth++;
-              else if (c === '}') bDepth = Math.max(0, bDepth - 1);
-              else if (c === '(') pDepth++;
-              else if (c === ')') pDepth = Math.max(0, pDepth - 1);
-              else if (c === '[') kDepth++;
-              else if (c === ']') kDepth = Math.max(0, kDepth - 1);
-              else if (c === ';' && bDepth === 0 && pDepth === 0 && kDepth === 0) {
-                semiPos++;
-                break;
-              }
-            }
-            semiPos++;
+            const chunkToExpand = src.slice(cursor, endLoopPos);
+            const expandedChunk = expandForeachLoops(chunkToExpand, scope.vars, scope.customFuncs);
+            src = src.slice(0, cursor) + expandedChunk + src.slice(endLoopPos);
+            continue;
           }
-          endLoopPos = semiPos;
         }
-        const chunkToExpand = src.slice(cursor, endLoopPos);
-        const expandedChunk = expandForeachLoops(chunkToExpand, scope.vars, scope.customFuncs);
-        src = src.slice(0, cursor) + expandedChunk + src.slice(endLoopPos);
-        continue;
       }
     }
 
@@ -2733,14 +3341,16 @@ function executeTikzStatements(
     let bracket = 0;
     let paren = 0;
     let inMath = false;
+    let inQuotes = false;
     while (endStmt < src.length) {
       const ch = src[endStmt];
       if (ch === '\\' && endStmt + 1 < src.length) {
         endStmt += 2;
         continue;
       }
-      if (ch === '$') inMath = !inMath;
-      else if (!inMath) {
+      if (ch === '"' && brace === 0) inQuotes = !inQuotes;
+      else if (ch === '$') inMath = !inMath;
+      else if (!inMath && !inQuotes) {
         if (ch === '{') brace++;
         else if (ch === '}') brace = Math.max(0, brace - 1);
         else if (ch === '[') bracket++;
@@ -2755,33 +3365,296 @@ function executeTikzStatements(
     cursor = endStmt < src.length ? endStmt + 1 : src.length;
     if (!stmt) continue;
 
-    // \coordinate[opts] (name) at (x,y)
-    const coordM = stmt.match(
-      /^\\coordinate(?:\s*\[([^\]]*)\])?\s*\(([^)]+)\)\s*at\s*\(([^)]+)\)$/
-    );
-    if (coordM) {
-      const pt = resolveCoordinateExpr(coordM[3], namedCoords, { x: 0, y: 0 }, false, scope.vars, scope.customFuncs);
-      if (pt) {
-        namedCoords[coordM[2].trim()] = pt;
-        if (coordM[1]) {
-          const st = parseOptionsString(coordM[1], scope, customColors, unitPx, scope.vars, scope.customFuncs);
-          if (st.labelSpec) {
-            const sp = toSvgPt(pt);
-            const parts = st.labelSpec.split(':');
-            const anchor = parts.length === 2 ? parts[0].trim() : 'above';
-            const lbl = parts.length === 2 ? parts[1].trim() : st.labelSpec;
-            const f = formatTikzLabelToSvg(lbl, 13);
-            const off = getAnchorOffsets(anchor, 12, 12);
-            items.push({
-              kind: 'text',
-              svg: `<text x="${(sp.x + off.dx).toFixed(1)}" y="${(sp.y + off.dy).toFixed(1)}" font-size="13" font-family="Times New Roman, serif" text-anchor="${off.textAnchor}" fill="${st.stroke}">${f.tspans}</text>`,
-              bounds: {
-                minX: sp.x + off.dx - f.plainLength * 4.5,
-                minY: sp.y + off.dy - 13,
-                maxX: sp.x + off.dx + f.plainLength * 4.5,
-                maxY: sp.y + off.dy + 5,
-              },
-            });
+    // \coordinate[opts] (name) at (coordExpr)  (supports nested parens/braces and opts/name order)
+    if (/^\\coordinate(?![a-zA-Z])/.test(stmt)) {
+      let p = '\\coordinate'.length;
+      const optParts: string[] = [];
+      let coordName: string | undefined;
+      let atExpr: string | undefined;
+
+      while (p < stmt.length) {
+        while (p < stmt.length && /\s/.test(stmt[p])) p++;
+        if (stmt[p] === '[') {
+          const brk = readBalanced(stmt, p, '[', ']');
+          if (!brk) break;
+          optParts.push(brk.content);
+          p = brk.endIdx + 1;
+          continue;
+        }
+        if (stmt.startsWith('at', p) && !/[a-zA-Z0-9_]/.test(stmt[p + 2] || '')) {
+          let q = p + 2;
+          while (q < stmt.length && /\s/.test(stmt[q])) q++;
+          if (stmt[q] === '(') {
+            const par = readBalanced(stmt, q, '(', ')');
+            if (!par) break;
+            atExpr = par.content;
+            p = par.endIdx + 1;
+            continue;
+          }
+        }
+        if (stmt[p] === '(' && coordName === undefined) {
+          const par = readBalanced(stmt, p, '(', ')');
+          if (!par) break;
+          coordName = par.content.trim();
+          p = par.endIdx + 1;
+          continue;
+        }
+        break;
+      }
+
+      if (coordName) {
+        const pt = atExpr
+          ? resolveCoordinateExpr(atExpr, namedCoords, { x: 0, y: 0 }, false, scope.vars, scope.customFuncs)
+          : { x: 0, y: 0 };
+        if (pt) {
+          namedCoords[coordName] = pt;
+          const optsRaw = optParts.join(', ');
+          if (optsRaw) {
+            const st = parseOptionsString(optsRaw, scope, customColors, unitPx, scope.vars, scope.customFuncs);
+            if (st.labelSpec) {
+              const sp = toSvgPt(pt);
+              const cIdx = st.labelSpec.indexOf(':');
+              const anchor = cIdx !== -1 ? st.labelSpec.slice(0, cIdx).trim() : 'above';
+              const lbl = cIdx !== -1 ? st.labelSpec.slice(cIdx + 1).trim() : st.labelSpec;
+              const fs = st.fontSize ?? 13;
+              const f = formatTikzLabelToSvg(lbl, fs);
+              const off = getAnchorOffsets(anchor, fs, fs);
+              items.push({
+                kind: 'text',
+                svg: `<text x="${(sp.x + off.dx).toFixed(1)}" y="${(sp.y + off.dy).toFixed(1)}" font-size="${fs}" font-family="Times New Roman, serif" text-anchor="${off.textAnchor}" fill="${st.stroke}">${f.tspans}</text>`,
+                bounds: {
+                  minX: sp.x + off.dx - f.plainLength * 4.5,
+                  minY: sp.y + off.dy - fs,
+                  maxX: sp.x + off.dx + f.plainLength * 4.5,
+                  maxY: sp.y + off.dy + 5,
+                },
+              });
+            }
+          }
+        }
+      }
+      continue;
+    }
+
+    // \pic[opts] (name)? at (pt)? {angle = A--B--C} or {right angle = A--B--C}
+    if (/^\\pic(?![a-zA-Z])/.test(stmt)) {
+      let p = '\\pic'.length;
+      const optParts: string[] = [];
+      let picAtCoord: string | undefined;
+      while (p < stmt.length) {
+        while (p < stmt.length && /\s/.test(stmt[p])) p++;
+        if (stmt[p] === '[') {
+          const brk = readBalanced(stmt, p, '[', ']');
+          if (!brk) break;
+          optParts.push(brk.content);
+          p = brk.endIdx + 1;
+          continue;
+        }
+        if (stmt.startsWith('at', p) && !/[a-zA-Z0-9_]/.test(stmt[p + 2] || '')) {
+          let q = p + 2;
+          while (q < stmt.length && /\s/.test(stmt[q])) q++;
+          if (stmt[q] === '(') {
+            const par = readBalanced(stmt, q, '(', ')');
+            if (!par) break;
+            picAtCoord = par.content;
+            p = par.endIdx + 1;
+            continue;
+          }
+        }
+        if (stmt[p] === '(') {
+          const par = readBalanced(stmt, p, '(', ')');
+          if (!par) break;
+          p = par.endIdx + 1;
+          continue;
+        }
+        break;
+      }
+      while (p < stmt.length && /\s/.test(stmt[p])) p++;
+      if (stmt[p] === '{') {
+        const bodyBr = readBalanced(stmt, p, '{', '}');
+        if (bodyBr) {
+          const picBase: TikzScopeState = { ...scope, fill: 'none', lineWidth: Math.min(scope.lineWidth, 1.1) };
+          const st = parseOptionsString(
+            optParts.join(', '),
+            picBase,
+            customColors,
+            unitPx,
+            scope.vars,
+            scope.customFuncs
+          );
+          const angM = bodyBr.content.trim().match(/^(right\s+angle|angle)\s*=\s*([\s\S]+)$/i);
+          if (angM) {
+            const isRightAngle = /^right/i.test(angM[1]);
+            const ptsRaw = splitTopLevel(angM[2], '--').map((t) => t.trim()).filter(Boolean);
+            if (ptsRaw.length === 3) {
+              const p1 = resolveCoordinateExpr(ptsRaw[0], namedCoords, { x: 0, y: 0 }, false, scope.vars, scope.customFuncs);
+              const p2 = resolveCoordinateExpr(ptsRaw[1], namedCoords, { x: 0, y: 0 }, false, scope.vars, scope.customFuncs);
+              const p3 = resolveCoordinateExpr(ptsRaw[2], namedCoords, { x: 0, y: 0 }, false, scope.vars, scope.customFuncs);
+              if (p1 && p2 && p3) {
+                const s1 = toSvgPt(p1);
+                const s2 = toSvgPt(p2);
+                const s3 = toSvgPt(p3);
+                const d1x = s1.x - s2.x;
+                const d1y = s1.y - s2.y;
+                const d2x = s3.x - s2.x;
+                const d2y = s3.y - s2.y;
+                const l1 = Math.hypot(d1x, d1y);
+                const l2 = Math.hypot(d2x, d2y);
+
+                if (l1 > 1e-6 && l2 > 1e-6) {
+                  const doFill = Boolean(st.hasFill) || (st.fill !== 'none') || Boolean(st.pattern);
+                  const doStroke =
+                    st.hasDraw === false
+                      ? false
+                      : Boolean(st.hasDraw) ||
+                        Boolean(st.arrowStart || st.arrowEnd) ||
+                        (isRightAngle && !doFill);
+                  const clipAttr = scope.clipId ? ` clip-path="url(#${scope.clipId})"` : '';
+                  const dashAttr = st.dashArray ? ` stroke-dasharray="${st.dashArray}"` : '';
+                  const opAttr = st.strokeOpacity < 1 ? ` stroke-opacity="${st.strokeOpacity}"` : '';
+                  const fillOpAttr = st.fillOpacity < 1 ? ` fill-opacity="${st.fillOpacity}"` : '';
+
+                  if (isRightAngle) {
+                    const sz = st.angleRadiusPx ?? 13.5;
+                    const ux = d1x / l1;
+                    const uy = d1y / l1;
+                    const vx = d2x / l2;
+                    const vy = d2y / l2;
+                    const pu = { x: s2.x + ux * sz, y: s2.y + uy * sz };
+                    const pv = { x: s2.x + vx * sz, y: s2.y + vy * sz };
+                    const puv = { x: pu.x + vx * sz, y: pu.y + vy * sz };
+                    const bMinX = Math.min(s2.x, pu.x, pv.x, puv.x) - 2;
+                    const bMinY = Math.min(s2.y, pu.y, pv.y, puv.y) - 2;
+                    const bMaxX = Math.max(s2.x, pu.x, pv.x, puv.x) + 2;
+                    const bMaxY = Math.max(s2.y, pu.y, pv.y, puv.y) + 2;
+
+                    if (doFill) {
+                      const dFill = `M ${s2.x.toFixed(2)} ${s2.y.toFixed(2)} L ${pu.x.toFixed(2)} ${pu.y.toFixed(2)} L ${puv.x.toFixed(2)} ${puv.y.toFixed(2)} L ${pv.x.toFixed(2)} ${pv.y.toFixed(2)} Z`;
+                      items.push({
+                        kind: 'path',
+                        svg: `<path d="${dFill}" fill="${st.fill}"${fillOpAttr} stroke="none"${clipAttr}/>`,
+                        bounds: { minX: bMinX, minY: bMinY, maxX: bMaxX, maxY: bMaxY },
+                      });
+                    }
+                    if (doStroke) {
+                      const dStroke = `M ${pu.x.toFixed(2)} ${pu.y.toFixed(2)} L ${puv.x.toFixed(2)} ${puv.y.toFixed(2)} L ${pv.x.toFixed(2)} ${pv.y.toFixed(2)}`;
+                      items.push({
+                        kind: 'path',
+                        svg: `<path d="${dStroke}" fill="none" stroke="${st.stroke}" stroke-width="${st.strokeWidth}"${dashAttr}${opAttr} stroke-linecap="round" stroke-linejoin="round"${clipAttr}/>`,
+                        bounds: { minX: bMinX, minY: bMinY, maxX: bMaxX, maxY: bMaxY },
+                      });
+                    }
+                    if (st.picText) {
+                      const bx = ux + vx;
+                      const by = uy + vy;
+                      const bl = Math.hypot(bx, by) || 1;
+                      const ecc = st.angleEccentricity ?? 0.65;
+                      const lx = s2.x + (bx / bl) * sz * ecc;
+                      const ly = s2.y + (by / bl) * sz * ecc;
+                      const fs = st.fontSize ?? 12;
+                      const f = formatTikzLabelToSvg(st.picText, fs);
+                      const textW = Math.max(8, f.plainLength * fs * 0.56);
+                      items.push({
+                        kind: 'text',
+                        svg: `<text x="${lx.toFixed(1)}" y="${(ly + fs * 0.34).toFixed(1)}" font-size="${fs}" font-family="Times New Roman, serif" text-anchor="middle" fill="${st.stroke}">${f.tspans}</text>`,
+                        bounds: { minX: lx - textW / 2, minY: ly - fs * 0.6, maxX: lx + textW / 2, maxY: ly + fs * 0.6 },
+                      });
+                    }
+                  } else {
+                    const radius = st.angleRadiusPx ?? 19; // TikZ default 5mm ≈ 19px
+                    // Standard math angles (CCW) computed from SVG screen rays
+                    const a1 = Math.atan2(-d1y, d1x);
+                    const a2 = Math.atan2(-d2y, d2x);
+                    let sweep = a2 - a1;
+                    while (sweep < 0) sweep += 2 * Math.PI;
+                    if (sweep > 2 * Math.PI - 1e-4) sweep = 2 * Math.PI;
+
+                    const pStart = {
+                      x: s2.x + radius * Math.cos(a1),
+                      y: s2.y - radius * Math.sin(a1),
+                    };
+                    const pEnd = {
+                      x: s2.x + radius * Math.cos(a1 + sweep),
+                      y: s2.y - radius * Math.sin(a1 + sweep),
+                    };
+
+                    // Compute tight bounding box across arc samples
+                    let minAX = Math.min(pStart.x, pEnd.x);
+                    let minAY = Math.min(pStart.y, pEnd.y);
+                    let maxAX = Math.max(pStart.x, pEnd.x);
+                    let maxAY = Math.max(pStart.y, pEnd.y);
+                    if (doFill) {
+                      minAX = Math.min(minAX, s2.x);
+                      minAY = Math.min(minAY, s2.y);
+                      maxAX = Math.max(maxAX, s2.x);
+                      maxAY = Math.max(maxAY, s2.y);
+                    }
+                    for (let k = 1; k < 16; k++) {
+                      const ang = a1 + (sweep * k) / 16;
+                      const px = s2.x + radius * Math.cos(ang);
+                      const py = s2.y - radius * Math.sin(ang);
+                      if (px < minAX) minAX = px;
+                      if (py < minAY) minAY = py;
+                      if (px > maxAX) maxAX = px;
+                      if (py > maxAY) maxAY = py;
+                    }
+
+                    const largeArc = sweep > Math.PI ? 1 : 0;
+                    const arcSeg =
+                      sweep >= 2 * Math.PI - 1e-3
+                        ? `A ${radius.toFixed(2)} ${radius.toFixed(2)} 0 1 0 ${(s2.x - radius * Math.cos(a1)).toFixed(2)} ${(s2.y + radius * Math.sin(a1)).toFixed(2)} A ${radius.toFixed(2)} ${radius.toFixed(2)} 0 1 0 ${pStart.x.toFixed(2)} ${pStart.y.toFixed(2)}`
+                        : `A ${radius.toFixed(2)} ${radius.toFixed(2)} 0 ${largeArc} 0 ${pEnd.x.toFixed(2)} ${pEnd.y.toFixed(2)}`;
+
+                    if (doFill) {
+                      const dWedge = `M ${s2.x.toFixed(2)} ${s2.y.toFixed(2)} L ${pStart.x.toFixed(2)} ${pStart.y.toFixed(2)} ${arcSeg} Z`;
+                      items.push({
+                        kind: 'path',
+                        svg: `<path d="${dWedge}" fill="${st.fill}"${fillOpAttr} stroke="none"${clipAttr}/>`,
+                        bounds: { minX: minAX - 2, minY: minAY - 2, maxX: maxAX + 2, maxY: maxAY + 2 },
+                      });
+                    }
+                    if (doStroke) {
+                      const mStart = st.arrowStart ? ` marker-start="url(#${ensureArrow(st.stroke)})"` : '';
+                      const mEnd = st.arrowEnd ? ` marker-end="url(#${ensureArrow(st.stroke)})"` : '';
+                      const dArc = `M ${pStart.x.toFixed(2)} ${pStart.y.toFixed(2)} ${arcSeg}`;
+                      items.push({
+                        kind: 'path',
+                        svg: `<path d="${dArc}" fill="none" stroke="${st.stroke}" stroke-width="${st.strokeWidth}"${dashAttr}${opAttr} stroke-linecap="round"${mStart}${mEnd}${clipAttr}/>`,
+                        bounds: { minX: minAX - 3, minY: minAY - 3, maxX: maxAX + 3, maxY: maxAY + 3 },
+                      });
+                    }
+                    if (st.picText) {
+                      const txtStyle = st.picTextOpts
+                        ? parseOptionsString(st.picTextOpts, { ...scope, fill: 'none' }, customColors, unitPx, scope.vars, scope.customFuncs)
+                        : st;
+                      const ecc = st.angleEccentricity ?? 0.6;
+                      const aMid = a1 + sweep / 2;
+                      const lr = radius * ecc;
+                      const lx = s2.x + lr * Math.cos(aMid);
+                      const ly = s2.y - lr * Math.sin(aMid);
+                      const fs = txtStyle.fontSize ?? st.fontSize ?? 13;
+                      const f = formatTikzLabelToSvg(st.picText, fs);
+                      const textW = Math.max(8, f.plainLength * fs * 0.56);
+                      items.push({
+                        kind: 'text',
+                        svg: `<text x="${lx.toFixed(1)}" y="${(ly + fs * 0.34).toFixed(1)}" font-size="${fs}" font-family="Times New Roman, serif" text-anchor="middle" fill="${txtStyle.stroke}">${f.tspans}</text>`,
+                        bounds: {
+                          minX: lx - textW / 2,
+                          minY: ly - fs * 0.65,
+                          maxX: lx + textW / 2,
+                          maxY: ly + fs * 0.55,
+                        },
+                      });
+                    }
+                  }
+                }
+              }
+            }
+          } else if (picAtCoord) {
+            const pt = resolveCoordinateExpr(picAtCoord, namedCoords, { x: 0, y: 0 }, false, scope.vars, scope.customFuncs);
+            if (pt && st.picText) {
+              emitNodeItem(st.picText, st, pt, toSvgPt);
+            }
           }
         }
       }
@@ -2805,26 +3678,33 @@ function executeTikzStatements(
       continue;
     }
 
-    // \draw, \fill, \filldraw, \path, \shadedraw, \clip
-    const drawM = stmt.match(
-      /^\\(draw|filldraw|fill|path|shadedraw|shade|clip)(?:\s*\[([^\]]*)\])?\s*([\s\S]+)$/
-    );
-    if (!drawM) continue;
+    // \draw, \fill, \filldraw, \path, \shadedraw, \clip (balanced [opts])
+    const drawCmdM = stmt.match(/^\\(draw|filldraw|fill|path|shadedraw|shade|clip)(?![a-zA-Z])/);
+    if (!drawCmdM) continue;
 
-    const cmd = drawM[1];
-    const st = parseOptionsString(drawM[2] || '', scope, customColors, unitPx, scope.vars, scope.customFuncs);
+    const cmd = drawCmdM[1];
+    const { opts: drawOptsRaw, nextIdx: afterDrawOpts } = readLeadingBracketOptions(
+      stmt,
+      drawCmdM[0].length
+    );
+    const st = parseOptionsString(drawOptsRaw, scope, customColors, unitPx, scope.vars, scope.customFuncs);
     const isClipStmt = cmd === 'clip' || Boolean(st.isClip);
     if (cmd === 'fill' || cmd === 'filldraw' || cmd === 'shadedraw' || cmd === 'shade') {
-      if (st.fill === 'none') st.fill = st.stroke;
+      if (st.fill === 'none' && st.hasFill !== false) st.fill = st.stroke;
     }
-    const doStroke = cmd !== 'fill' && cmd !== 'clip' && cmd !== 'path';
+    const doStroke =
+      st.hasDraw === false
+        ? false
+        : Boolean(st.hasDraw) || (cmd !== 'fill' && cmd !== 'clip' && cmd !== 'path');
     const doFill =
-      cmd === 'fill' ||
-      cmd === 'filldraw' ||
-      cmd === 'shadedraw' ||
-      cmd === 'shade' ||
-      st.fill !== 'none' ||
-      Boolean(st.pattern);
+      st.hasFill === false
+        ? false
+        : cmd === 'fill' ||
+          cmd === 'filldraw' ||
+          cmd === 'shadedraw' ||
+          cmd === 'shade' ||
+          st.fill !== 'none' ||
+          Boolean(st.pattern);
 
     const drawScope: TikzScopeState = {
       ...scope,
@@ -2838,7 +3718,7 @@ function executeTikzStatements(
     };
     const localToSvgPt = (pt: Point2D): Point2D => scopeToSvgPt(pt, drawScope);
 
-    const pathStr = drawM[3].trim();
+    const pathStr = stmt.slice(afterDrawOpts).trim();
     let idx = 0;
     let curPt: Point2D = { x: 0, y: 0 };
     let startPt: Point2D = { x: 0, y: 0 };
@@ -2885,13 +3765,9 @@ function executeTikzStatements(
         if (pt) {
           const sp = localToSvgPt(pt);
           expandBBox(sp.x, sp.y);
-          if (!hasSubpath) {
-            dCmds.push(`M ${sp.x.toFixed(2)} ${sp.y.toFixed(2)}`);
-            startPt = pt;
-            hasSubpath = true;
-          } else {
-            dCmds.push(`M ${sp.x.toFixed(2)} ${sp.y.toFixed(2)}`);
-          }
+          dCmds.push(`M ${sp.x.toFixed(2)} ${sp.y.toFixed(2)}`);
+          startPt = pt;
+          hasSubpath = true;
           if (updateCur) {
             lastSegFrom = curPt;
             lastSegTo = pt;
@@ -2911,19 +3787,46 @@ function executeTikzStatements(
         idx += 2;
         while (idx < pathStr.length && /\s/.test(pathStr[idx])) idx++;
 
-        // Support inline `node[opts]{text}` placed between `--` and `(nextPt)`
+        // Support inline `node[opts]{text}` and `coordinate[opts](name)` between `--` and `(nextPt)`
         const pendingMidNodes: Array<{ opts: string; text: string }> = [];
-        while (pathStr.startsWith('node', idx) && !/[a-zA-Z]/.test(pathStr[idx + 4] || '')) {
-          const parsedMid = parseNodeHeader(pathStr, idx + 4);
-          if (!parsedMid) break;
-          pendingMidNodes.push({ opts: parsedMid.opts, text: parsedMid.text });
-          idx = parsedMid.endIdx + 1;
-          while (idx < pathStr.length && /\s/.test(pathStr[idx])) idx++;
+        const pendingMidCoords: Array<{ opts: string; name: string }> = [];
+        while (idx < pathStr.length) {
+          if (pathStr.startsWith('node', idx) && !/[a-zA-Z]/.test(pathStr[idx + 4] || '')) {
+            const parsedMid = parseNodeHeader(pathStr, idx + 4);
+            if (!parsedMid) break;
+            pendingMidNodes.push({ opts: parsedMid.opts, text: parsedMid.text });
+            idx = parsedMid.endIdx + 1;
+            while (idx < pathStr.length && /\s/.test(pathStr[idx])) idx++;
+            continue;
+          }
+          if (pathStr.startsWith('coordinate', idx) && !/[a-zA-Z]/.test(pathStr[idx + 10] || '')) {
+            const { opts: cOptsRaw, nextIdx: afterCOpts } = readLeadingBracketOptions(pathStr, idx + 10);
+            let p = afterCOpts;
+            while (p < pathStr.length && /\s/.test(pathStr[p])) p++;
+            if (pathStr[p] !== '(') break;
+            const cPar = readBalanced(pathStr, p, '(', ')');
+            if (!cPar) break;
+            pendingMidCoords.push({ opts: cOptsRaw, name: cPar.content.trim() });
+            idx = cPar.endIdx + 1;
+            while (idx < pathStr.length && /\s/.test(pathStr[idx])) idx++;
+            continue;
+          }
+          break;
         }
 
         if (pathStr.startsWith('cycle', idx)) {
           idx += 5;
           dCmds.push('Z');
+          for (const mc of pendingMidCoords) {
+            const cStyle = mc.opts
+              ? parseOptionsString(mc.opts, nodeBaseScope, customColors, unitPx, scope.vars, scope.customFuncs)
+              : null;
+            const tPos = cStyle?.pos ?? 0.5;
+            namedCoords[mc.name] = {
+              x: curPt.x + (startPt.x - curPt.x) * tPos,
+              y: curPt.y + (startPt.y - curPt.y) * tPos,
+            };
+          }
           for (const pn of pendingMidNodes) {
             const nStyle = parseOptionsString(pn.opts, nodeBaseScope, customColors, unitPx, scope.vars, scope.customFuncs);
             const tPos = nStyle.pos ?? 0.5;
@@ -2974,6 +3877,16 @@ function executeTikzStatements(
             dCmds.push(`L ${sp.x.toFixed(2)} ${sp.y.toFixed(2)}`);
             lastSegFrom = curPt;
             lastSegTo = nextPt;
+            for (const mc of pendingMidCoords) {
+              const cStyle = mc.opts
+                ? parseOptionsString(mc.opts, nodeBaseScope, customColors, unitPx, scope.vars, scope.customFuncs)
+                : null;
+              const tPos = cStyle?.pos ?? 0.5;
+              namedCoords[mc.name] = {
+                x: lastSegFrom.x + (lastSegTo.x - lastSegFrom.x) * tPos,
+                y: lastSegFrom.y + (lastSegTo.y - lastSegFrom.y) * tPos,
+              };
+            }
             for (const pn of pendingMidNodes) {
               const nStyle = parseOptionsString(pn.opts, nodeBaseScope, customColors, unitPx, scope.vars, scope.customFuncs);
               const tPos = nStyle.pos ?? 0.5;
@@ -2994,42 +3907,72 @@ function executeTikzStatements(
         continue;
       }
 
-      // Cubic/Quadratic Bezier: .. controls (c1) [and (c2)] .. (end)
+      // Cubic/Quadratic Bezier: .. controls (c1) [and (c2)] .. (end) (balanced parens)
       if (pathStr.startsWith('..', idx)) {
-        const ctrlM = pathStr
-          .slice(idx)
-          .match(
-            /^\.\.\s*controls\s*\(([^)]+)\)\s*(?:and\s*\(([^)]+)\)\s*)?\.\.\s*(?:(\+\+|\+))?\s*\(([^)]+)\)/
-          );
-        if (ctrlM) {
-          const c1 = resolveCoordinateExpr(ctrlM[1], namedCoords, curPt, false, scope.vars, scope.customFuncs);
-          const c2 = ctrlM[2]
-            ? resolveCoordinateExpr(ctrlM[2], namedCoords, curPt, false, scope.vars, scope.customFuncs)
-            : c1;
-          const endPt = resolveCoordinateExpr(
-            ctrlM[4],
-            namedCoords,
-            curPt,
-            Boolean(ctrlM[3]),
-            scope.vars,
-            scope.customFuncs
-          );
-          if (c1 && c2 && endPt) {
-            const sc1 = localToSvgPt(c1);
-            const sc2 = localToSvgPt(c2);
-            const se = localToSvgPt(endPt);
-            expandBBox(sc1.x, sc1.y);
-            expandBBox(sc2.x, sc2.y);
-            expandBBox(se.x, se.y);
-            dCmds.push(
-              `C ${sc1.x.toFixed(2)} ${sc1.y.toFixed(2)}, ${sc2.x.toFixed(2)} ${sc2.y.toFixed(2)}, ${se.x.toFixed(2)} ${se.y.toFixed(2)}`
-            );
-            lastSegFrom = curPt;
-            lastSegTo = endPt;
-            curPt = endPt;
+        let p = idx + 2;
+        while (p < pathStr.length && /\s/.test(pathStr[p])) p++;
+        if (pathStr.startsWith('controls', p) && !/[a-zA-Z]/.test(pathStr[p + 8] || '')) {
+          p += 8;
+          while (p < pathStr.length && /\s/.test(pathStr[p])) p++;
+          if (pathStr[p] === '(') {
+            const c1Br = readBalanced(pathStr, p, '(', ')');
+            if (c1Br) {
+              p = c1Br.endIdx + 1;
+              while (p < pathStr.length && /\s/.test(pathStr[p])) p++;
+              let c2Expr: string | null = null;
+              if (pathStr.startsWith('and', p) && !/[a-zA-Z]/.test(pathStr[p + 3] || '')) {
+                p += 3;
+                while (p < pathStr.length && /\s/.test(pathStr[p])) p++;
+                if (pathStr[p] === '(') {
+                  const c2Br = readBalanced(pathStr, p, '(', ')');
+                  if (c2Br) {
+                    c2Expr = c2Br.content;
+                    p = c2Br.endIdx + 1;
+                  }
+                }
+              }
+              while (p < pathStr.length && /\s/.test(pathStr[p])) p++;
+              if (pathStr.startsWith('..', p)) {
+                p += 2;
+                while (p < pathStr.length && /\s/.test(pathStr[p])) p++;
+                let relEnd = false;
+                if (pathStr.startsWith('++', p)) {
+                  relEnd = true;
+                  p += 2;
+                } else if (pathStr[p] === '+') {
+                  relEnd = true;
+                  p += 1;
+                }
+                while (p < pathStr.length && /\s/.test(pathStr[p])) p++;
+                if (pathStr[p] === '(') {
+                  const endBr = readBalanced(pathStr, p, '(', ')');
+                  if (endBr) {
+                    const c1 = resolveCoordinateExpr(c1Br.content, namedCoords, curPt, false, scope.vars, scope.customFuncs);
+                    const c2 = c2Expr
+                      ? resolveCoordinateExpr(c2Expr, namedCoords, curPt, false, scope.vars, scope.customFuncs)
+                      : c1;
+                    const endPt = resolveCoordinateExpr(endBr.content, namedCoords, curPt, relEnd, scope.vars, scope.customFuncs);
+                    if (c1 && c2 && endPt) {
+                      const sc1 = localToSvgPt(c1);
+                      const sc2 = localToSvgPt(c2);
+                      const se = localToSvgPt(endPt);
+                      expandBBox(sc1.x, sc1.y);
+                      expandBBox(sc2.x, sc2.y);
+                      expandBBox(se.x, se.y);
+                      dCmds.push(
+                        `C ${sc1.x.toFixed(2)} ${sc1.y.toFixed(2)}, ${sc2.x.toFixed(2)} ${sc2.y.toFixed(2)}, ${se.x.toFixed(2)} ${se.y.toFixed(2)}`
+                      );
+                      lastSegFrom = curPt;
+                      lastSegTo = endPt;
+                      curPt = endPt;
+                    }
+                    idx = endBr.endIdx + 1;
+                    continue;
+                  }
+                }
+              }
+            }
           }
-          idx += ctrlM[0].length;
-          continue;
         }
       }
 
@@ -3061,12 +4004,17 @@ function executeTikzStatements(
         }
       }
 
-      // circle (r) or circle [radius=r]
-      if (pathStr.startsWith('circle', idx)) {
-        const parseCircleRadiusPx = (rawExpr: string): number | null => {
+      // circle (r), circle [radius=r], circle [x radius=rx, y radius=ry],
+      // or ellipse [x radius=rx, y radius=ry], ellipse (rx and ry)
+      if (
+        (pathStr.startsWith('circle', idx) && !/[a-zA-Z0-9_]/.test(pathStr[idx + 6] || '')) ||
+        (pathStr.startsWith('ellipse', idx) && !/[a-zA-Z0-9_]/.test(pathStr[idx + 7] || ''))
+      ) {
+        const isEllipseCmd = pathStr.startsWith('ellipse', idx);
+        const parseAxisRadiusPx = (rawExpr: string, scaleFactor: number): number | null => {
           const trimmed = rawExpr.trim();
           const unitM = trimmed.match(/^(-?\d+(?:\.\d+)?)\s*(cm|mm|pt|em|ex|in|px)$/i);
-          const sc = Math.abs(drawScope.scaleX);
+          const sc = Math.abs(scaleFactor);
           if (unitM) {
             const basePx = parseLengthToPx(trimmed, unitPx);
             if (basePx === null) return null;
@@ -3078,33 +4026,80 @@ function executeTikzStatements(
           const unitless = evalMathExpr(trimmed, scope.vars, false, scope.customFuncs);
           return unitless !== null ? unitless * unitPx * sc : null;
         };
-        let rPx: number | null = null;
-        let nextIdx = idx + 6;
+
+        let rxPx: number | null = null;
+        let ryPx: number | null = null;
+        let rotDeg = 0;
+        let nextIdx = idx + (isEllipseCmd ? 7 : 6);
         while (nextIdx < pathStr.length && /\s/.test(pathStr[nextIdx])) nextIdx++;
+
         if (pathStr[nextIdx] === '(') {
           const paren = readBalanced(pathStr, nextIdx, '(', ')');
           if (paren) {
-            rPx = parseCircleRadiusPx(paren.content);
+            if (isEllipseCmd) {
+              const andM = paren.content.match(/^([\s\S]+?)\s+and\s+([\s\S]+)$/i);
+              const parts = andM
+                ? [andM[1], andM[2]]
+                : splitTopLevel(paren.content, ',');
+              if (parts.length >= 2) {
+                rxPx = parseAxisRadiusPx(parts[0], drawScope.scaleX);
+                ryPx = parseAxisRadiusPx(parts[1], drawScope.scaleY);
+              }
+            } else {
+              rxPx = parseAxisRadiusPx(paren.content, drawScope.scaleX);
+              ryPx = rxPx !== null ? parseAxisRadiusPx(paren.content, drawScope.scaleY) : null;
+            }
             nextIdx = paren.endIdx + 1;
           }
         } else if (pathStr[nextIdx] === '[') {
           const brk = readBalanced(pathStr, nextIdx, '[', ']');
           if (brk) {
-            const radM = brk.content.match(/radius\s*=\s*([^,\]]+)/);
-            if (radM) {
-              rPx = parseCircleRadiusPx(radM[1]);
+            let sharedRadiusExpr: string | null = null;
+            for (const opt of splitTopLevel(brk.content, ',')) {
+              const eq = opt.indexOf('=');
+              if (eq === -1) continue;
+              const k = opt.slice(0, eq).trim().toLowerCase();
+              const v = opt.slice(eq + 1).trim();
+              if (k === 'x radius') rxPx = parseAxisRadiusPx(v, drawScope.scaleX);
+              else if (k === 'y radius') ryPx = parseAxisRadiusPx(v, drawScope.scaleY);
+              else if (k === 'radius') sharedRadiusExpr = v;
+              else if (k === 'rotate') {
+                rotDeg = evalMathExpr(v, scope.vars, false, scope.customFuncs) ?? 0;
+              }
+            }
+            if (sharedRadiusExpr !== null) {
+              if (rxPx === null) rxPx = parseAxisRadiusPx(sharedRadiusExpr, drawScope.scaleX);
+              if (ryPx === null) ryPx = parseAxisRadiusPx(sharedRadiusExpr, drawScope.scaleY);
             }
             nextIdx = brk.endIdx + 1;
           }
         }
-        if (rPx !== null && rPx > 0) {
+
+        if (rxPx !== null && ryPx !== null && rxPx > 0 && ryPx > 0) {
           const c = localToSvgPt(curPt);
-          expandBBox(c.x - rPx, c.y - rPx);
-          expandBBox(c.x + rPx, c.y + rPx);
-          // Emit circle via SVG path so fill/stroke/clip share one pipeline cleanly
-          dCmds.push(
-            `M ${(c.x - rPx).toFixed(2)} ${c.y.toFixed(2)} A ${rPx.toFixed(2)} ${rPx.toFixed(2)} 0 1 0 ${(c.x + rPx).toFixed(2)} ${c.y.toFixed(2)} A ${rPx.toFixed(2)} ${rPx.toFixed(2)} 0 1 0 ${(c.x - rPx).toFixed(2)} ${c.y.toFixed(2)} Z`
-          );
+          // Emit circle/ellipse via SVG arc path so fill/stroke/clip share one pipeline cleanly
+          if (Math.abs(rotDeg) < 1e-4) {
+            expandBBox(c.x - rxPx, c.y - ryPx);
+            expandBBox(c.x + rxPx, c.y + ryPx);
+            dCmds.push(
+              `M ${(c.x - rxPx).toFixed(2)} ${c.y.toFixed(2)} A ${rxPx.toFixed(2)} ${ryPx.toFixed(2)} 0 1 0 ${(c.x + rxPx).toFixed(2)} ${c.y.toFixed(2)} A ${rxPx.toFixed(2)} ${ryPx.toFixed(2)} 0 1 0 ${(c.x - rxPx).toFixed(2)} ${c.y.toFixed(2)} Z`
+            );
+          } else {
+            const rad = (rotDeg * Math.PI) / 180;
+            const cosR = Math.cos(rad);
+            const sinR = Math.sin(rad);
+            const bx = Math.hypot(rxPx * cosR, ryPx * sinR);
+            const by = Math.hypot(rxPx * sinR, ryPx * cosR);
+            expandBBox(c.x - bx, c.y - by);
+            expandBBox(c.x + bx, c.y + by);
+            const p1x = c.x - rxPx * cosR;
+            const p1y = c.y + rxPx * sinR;
+            const p2x = c.x + rxPx * cosR;
+            const p2y = c.y - rxPx * sinR;
+            dCmds.push(
+              `M ${p1x.toFixed(2)} ${p1y.toFixed(2)} A ${rxPx.toFixed(2)} ${ryPx.toFixed(2)} ${(-rotDeg).toFixed(2)} 1 0 ${p2x.toFixed(2)} ${p2y.toFixed(2)} A ${rxPx.toFixed(2)} ${ryPx.toFixed(2)} ${(-rotDeg).toFixed(2)} 1 0 ${p1x.toFixed(2)} ${p1y.toFixed(2)} Z`
+            );
+          }
         }
         idx = nextIdx;
         continue;
@@ -3120,7 +4115,7 @@ function executeTikzStatements(
         if (pathStr[nextIdx] === '(') {
           const paren = readBalanced(pathStr, nextIdx, '(', ')');
           if (paren) {
-            const parts = paren.content.split(':');
+            const parts = splitTopLevel(paren.content, ':');
             if (parts.length === 3) {
               aStart = evalMathExpr(parts[0], scope.vars, false, scope.customFuncs);
               aEnd = evalMathExpr(parts[1], scope.vars, false, scope.customFuncs);
@@ -3131,13 +4126,22 @@ function executeTikzStatements(
         } else if (pathStr[nextIdx] === '[') {
           const brk = readBalanced(pathStr, nextIdx, '[', ']');
           if (brk) {
-            const sm = brk.content.match(/start angle\s*=\s*([^,\]]+)/);
-            const em = brk.content.match(/end angle\s*=\s*([^,\]]+)/);
-            const rm = brk.content.match(/radius\s*=\s*([^,\]]+)/);
-            if (sm && em && rm) {
-              aStart = evalMathExpr(sm[1], scope.vars, false, scope.customFuncs);
-              aEnd = evalMathExpr(em[1], scope.vars, false, scope.customFuncs);
-              rUnits = parseLengthToTikzUnits(rm[1], unitPx) ?? evalMathExpr(rm[1], scope.vars, false, scope.customFuncs);
+            let sa: string | undefined;
+            let ea: string | undefined;
+            let rr: string | undefined;
+            for (const part of splitTopLevel(brk.content, ',')) {
+              const eq = part.indexOf('=');
+              if (eq === -1) continue;
+              const k = part.slice(0, eq).trim().toLowerCase();
+              const v = part.slice(eq + 1).trim();
+              if (k === 'start angle') sa = v;
+              else if (k === 'end angle') ea = v;
+              else if (k === 'radius') rr = v;
+            }
+            if (sa && ea && rr) {
+              aStart = evalMathExpr(sa, scope.vars, false, scope.customFuncs);
+              aEnd = evalMathExpr(ea, scope.vars, false, scope.customFuncs);
+              rUnits = parseLengthToTikzUnits(rr, unitPx) ?? evalMathExpr(rr, scope.vars, false, scope.customFuncs);
             }
             nextIdx = brk.endIdx + 1;
           }
@@ -3234,18 +4238,31 @@ function executeTikzStatements(
           if (braceIdx !== -1) {
             const br = readBalanced(pathStr, braceIdx, '{', '}');
             if (br) {
-              const coordRe = /\(([^,]+),([^)]+)\)/g;
-              let cm: RegExpExecArray | null;
+              let ci = 0;
               let first = true;
-              while ((cm = coordRe.exec(br.content)) !== null) {
-                const px = evalMathExpr(cm[1], scope.vars, Boolean(scope.trigRad), scope.customFuncs);
-                const py = evalMathExpr(cm[2], scope.vars, Boolean(scope.trigRad), scope.customFuncs);
-                if (px !== null && py !== null) {
-                  const sp = plotToSvgPt({ x: px, y: py });
-                  expandBBox(sp.x, sp.y);
-                  dCmds.push(`${first ? 'M' : 'L'} ${sp.x.toFixed(2)} ${sp.y.toFixed(2)}`);
-                  first = false;
+              while (ci < br.content.length) {
+                if (br.content[ci] === '(') {
+                  const cPar = readBalanced(br.content, ci, '(', ')');
+                  if (cPar) {
+                    const pt = resolveCoordinateExpr(
+                      cPar.content,
+                      namedCoords,
+                      curPt,
+                      false,
+                      scope.vars,
+                      scope.customFuncs
+                    );
+                    if (pt) {
+                      const sp = plotToSvgPt(pt);
+                      expandBBox(sp.x, sp.y);
+                      dCmds.push(`${first ? 'M' : 'L'} ${sp.x.toFixed(2)} ${sp.y.toFixed(2)}`);
+                      first = false;
+                    }
+                    ci = cPar.endIdx + 1;
+                    continue;
+                  }
                 }
+                ci++;
               }
               idx = br.endIdx + 1;
               continue;
@@ -3313,17 +4330,66 @@ function executeTikzStatements(
         }
       }
 
-      // Inline coordinate (name)
-      if (pathStr.startsWith('coordinate', idx)) {
-        const cm = pathStr.slice(idx).match(/^coordinate(?:\s*\[[^\]]*\])?\s*\(([^)]+)\)/);
-        if (cm) {
-          namedCoords[cm[1].trim()] = { ...curPt };
-          idx += cm[0].length;
-          continue;
+      // Inline coordinate[opts] (name)
+      if (pathStr.startsWith('coordinate', idx) && !/[a-zA-Z]/.test(pathStr[idx + 10] || '')) {
+        const { opts: cOptsRaw, nextIdx: afterCOpts } = readLeadingBracketOptions(pathStr, idx + 10);
+        let p = afterCOpts;
+        while (p < pathStr.length && /\s/.test(pathStr[p])) p++;
+        if (pathStr[p] === '(') {
+          const cPar = readBalanced(pathStr, p, '(', ')');
+          if (cPar) {
+            const cStyle = cOptsRaw
+              ? parseOptionsString(cOptsRaw, nodeBaseScope, customColors, unitPx, scope.vars, scope.customFuncs)
+              : null;
+            const cPt =
+              cStyle?.pos !== undefined
+                ? {
+                    x: lastSegFrom.x + (lastSegTo.x - lastSegFrom.x) * cStyle.pos,
+                    y: lastSegFrom.y + (lastSegTo.y - lastSegFrom.y) * cStyle.pos,
+                  }
+                : { ...curPt };
+            namedCoords[cPar.content.trim()] = cPt;
+            idx = cPar.endIdx + 1;
+            continue;
+          }
         }
       }
 
-      // to[...] (pt)
+      // edge[opts] (pt)
+      if (pathStr.startsWith('edge', idx) && !/[a-zA-Z]/.test(pathStr[idx + 4] || '')) {
+        const { opts: edgeOptsRaw, nextIdx: afterEdgeOpts } = readLeadingBracketOptions(pathStr, idx + 4);
+        let p = afterEdgeOpts;
+        while (p < pathStr.length && /\s/.test(pathStr[p])) p++;
+        if (pathStr[p] === '(') {
+          const ePar = readBalanced(pathStr, p, '(', ')');
+          if (ePar) {
+            const targetPt = resolveCoordinateExpr(ePar.content, namedCoords, curPt, false, scope.vars, scope.customFuncs);
+            if (targetPt) {
+              const eStyle = parseOptionsString(edgeOptsRaw, drawScope, customColors, unitPx, scope.vars, scope.customFuncs);
+              const s1 = localToSvgPt(curPt);
+              const s2 = localToSvgPt(targetPt);
+              const dashAttr = eStyle.dashArray ? ` stroke-dasharray="${eStyle.dashArray}"` : '';
+              const mStart = eStyle.arrowStart ? ` marker-start="url(#${ensureArrow(eStyle.stroke)})"` : '';
+              const mEnd = eStyle.arrowEnd ? ` marker-end="url(#${ensureArrow(eStyle.stroke)})"` : '';
+              const clipAttr = scope.clipId ? ` clip-path="url(#${scope.clipId})"` : '';
+              items.push({
+                kind: 'path',
+                svg: `<path d="M ${s1.x.toFixed(2)} ${s1.y.toFixed(2)} L ${s2.x.toFixed(2)} ${s2.y.toFixed(2)}" fill="none" stroke="${eStyle.stroke}" stroke-width="${eStyle.strokeWidth}"${dashAttr} stroke-linecap="round"${mStart}${mEnd}${clipAttr}/>`,
+                bounds: {
+                  minX: Math.min(s1.x, s2.x) - 3,
+                  minY: Math.min(s1.y, s2.y) - 3,
+                  maxX: Math.max(s1.x, s2.x) + 3,
+                  maxY: Math.max(s1.y, s2.y) + 3,
+                },
+              });
+            }
+            idx = ePar.endIdx + 1;
+            continue;
+          }
+        }
+      }
+
+      // to[...] (pt) (also handles inline node[...] {...} between to[...] and (pt))
       if (pathStr.startsWith('to', idx) && !/[a-zA-Z]/.test(pathStr[idx + 2] || '')) {
         let nextIdx = idx + 2;
         let bendDeg = 0;
@@ -3339,37 +4405,86 @@ function executeTikzStatements(
           }
         }
         while (nextIdx < pathStr.length && /\s/.test(pathStr[nextIdx])) nextIdx++;
+        const pendingToNodes: Array<{ opts: string; text: string }> = [];
+        const pendingToCoords: Array<{ opts: string; name: string }> = [];
+        while (nextIdx < pathStr.length) {
+          if (pathStr.startsWith('node', nextIdx) && !/[a-zA-Z]/.test(pathStr[nextIdx + 4] || '')) {
+            const parsedMid = parseNodeHeader(pathStr, nextIdx + 4);
+            if (!parsedMid) break;
+            pendingToNodes.push({ opts: parsedMid.opts, text: parsedMid.text });
+            nextIdx = parsedMid.endIdx + 1;
+            while (nextIdx < pathStr.length && /\s/.test(pathStr[nextIdx])) nextIdx++;
+            continue;
+          }
+          if (pathStr.startsWith('coordinate', nextIdx) && !/[a-zA-Z]/.test(pathStr[nextIdx + 10] || '')) {
+            const { opts: cOptsRaw, nextIdx: afterCOpts } = readLeadingBracketOptions(pathStr, nextIdx + 10);
+            let p = afterCOpts;
+            while (p < pathStr.length && /\s/.test(pathStr[p])) p++;
+            if (pathStr[p] !== '(') break;
+            const cPar = readBalanced(pathStr, p, '(', ')');
+            if (!cPar) break;
+            pendingToCoords.push({ opts: cOptsRaw, name: cPar.content.trim() });
+            nextIdx = cPar.endIdx + 1;
+            while (nextIdx < pathStr.length && /\s/.test(pathStr[nextIdx])) nextIdx++;
+            continue;
+          }
+          break;
+        }
         if (pathStr[nextIdx] === '(') {
           const paren = readBalanced(pathStr, nextIdx, '(', ')');
           if (paren) {
             const nextPt = resolveCoordinateExpr(paren.content, namedCoords, curPt, false, scope.vars, scope.customFuncs);
             if (nextPt) {
-            const s1 = localToSvgPt(curPt);
-            const s2 = localToSvgPt(nextPt);
-            if (bendDeg !== 0) {
-              const mx = (s1.x + s2.x) / 2;
-              const my = (s1.y + s2.y) / 2;
-              const dx = s2.x - s1.x;
-              const dy = s2.y - s1.y;
-              const k = Math.tan((bendDeg * Math.PI) / 360) * 0.65;
-              const cx = mx + dy * k;
-              const cy = my - dx * k;
-              expandBBox(cx, cy);
-              expandBBox(s2.x, s2.y);
-              dCmds.push(`Q ${cx.toFixed(2)} ${cy.toFixed(2)}, ${s2.x.toFixed(2)} ${s2.y.toFixed(2)}`);
-            } else {
-              expandBBox(s2.x, s2.y);
-              dCmds.push(`L ${s2.x.toFixed(2)} ${s2.y.toFixed(2)}`);
+              const s1 = localToSvgPt(curPt);
+              const s2 = localToSvgPt(nextPt);
+              if (bendDeg !== 0) {
+                const mx = (s1.x + s2.x) / 2;
+                const my = (s1.y + s2.y) / 2;
+                const dx = s2.x - s1.x;
+                const dy = s2.y - s1.y;
+                const k = Math.tan((bendDeg * Math.PI) / 360) * 0.65;
+                const cx = mx + dy * k;
+                const cy = my - dx * k;
+                expandBBox(cx, cy);
+                expandBBox(s2.x, s2.y);
+                dCmds.push(`Q ${cx.toFixed(2)} ${cy.toFixed(2)}, ${s2.x.toFixed(2)} ${s2.y.toFixed(2)}`);
+              } else {
+                expandBBox(s2.x, s2.y);
+                dCmds.push(`L ${s2.x.toFixed(2)} ${s2.y.toFixed(2)}`);
+              }
+              lastSegFrom = curPt;
+              lastSegTo = nextPt;
+              for (const mc of pendingToCoords) {
+                const cStyle = mc.opts
+                  ? parseOptionsString(mc.opts, nodeBaseScope, customColors, unitPx, scope.vars, scope.customFuncs)
+                  : null;
+                const tPos = cStyle?.pos ?? 0.5;
+                namedCoords[mc.name] = {
+                  x: lastSegFrom.x + (lastSegTo.x - lastSegFrom.x) * tPos,
+                  y: lastSegFrom.y + (lastSegTo.y - lastSegFrom.y) * tPos,
+                };
+              }
+              for (const pn of pendingToNodes) {
+                const nStyle = parseOptionsString(pn.opts, nodeBaseScope, customColors, unitPx, scope.vars, scope.customFuncs);
+                const tPos = nStyle.pos ?? 0.5;
+                emitNodeItem(
+                  pn.text,
+                  nStyle,
+                  {
+                    x: lastSegFrom.x + (lastSegTo.x - lastSegFrom.x) * tPos,
+                    y: lastSegFrom.y + (lastSegTo.y - lastSegFrom.y) * tPos,
+                  },
+                  localToSvgPt,
+                  deferredNodeItems
+                );
+              }
+              curPt = nextPt;
             }
-            lastSegFrom = curPt;
-            lastSegTo = nextPt;
-            curPt = nextPt;
+            idx = paren.endIdx + 1;
+            continue;
           }
-          idx = paren.endIdx + 1;
-          continue;
         }
       }
-    }
 
     idx++;
   }
@@ -3558,7 +4673,7 @@ export function renderLatexPictureToSvgDataUrl(
   const arrowMarkerIds = new Map<string, string>();
   const patternsUsed = new Map<string, string>();
 
-  let body = rawBody.trimStart();
+  let body = stripTikzComments(rawBody).trimStart();
   let envOptsRaw = '';
 
   if (envName === 'picture') {
@@ -3600,6 +4715,8 @@ export function renderLatexPictureToSvgDataUrl(
       baseScope.color = st.stroke;
       baseScope.lineWidth = st.strokeWidth;
       baseScope.dashArray = st.dashArray;
+      if (st.fontSize !== undefined) baseScope.fontSize = st.fontSize;
+      if (st.fontWeight !== undefined) baseScope.fontWeight = st.fontWeight;
       if (st.customFuncs) baseScope.customFuncs = st.customFuncs;
       if (st.trigRad !== undefined) baseScope.trigRad = st.trigRad;
     }
