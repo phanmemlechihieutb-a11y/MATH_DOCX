@@ -103,6 +103,7 @@ export interface EmbeddedFigureAsset {
   widthPx: number;
   heightPx: number;
   caption?: string | null;
+  box_2d?: number[] | null;
 }
 
 interface ParserContext {
@@ -4281,6 +4282,24 @@ function parseBodyBlocks(
           const asset = ctx.figureAssets?.[assetKey];
           if (asset) {
             flushTextSlice(i);
+            let nextIdx = br.endIdx + 1;
+            let parsedCaption: string | undefined;
+
+            // Consume optional trailing "\\ \textit{caption}" or "\caption{caption}" emitted by pagesToLatexSource
+            const afterImg = src.slice(nextIdx);
+            const capLeadMatch = afterImg.match(/^(?:[ \t]*\n?[ \t]*\\\\)?[ \t]*\n?[ \t]*\\(?:textit|caption)\s*\{/);
+            if (capLeadMatch) {
+              const capBracePos = nextIdx + capLeadMatch[0].length - 1;
+              const capBr = readBalancedBraces(src, capBracePos);
+              if (capBr) {
+                parsedCaption = capBr.content
+                  .replace(/\\([%&#_{}$])/g, '$1')
+                  .replace(/\\textbackslash\{\}/g, '\\')
+                  .trim();
+                nextIdx = capBr.endIdx + 1;
+              }
+            }
+
             pushBlock({
               block_type: 'figure',
               alignment:
@@ -4290,9 +4309,12 @@ function parseBodyBlocks(
               croppedImageDataUrl: asset.dataUrl,
               croppedWidthPx: asset.widthPx,
               croppedHeightPx: asset.heightPx,
-              ...(asset.caption ? { caption: asset.caption } : {}),
+              ...(Array.isArray(asset.box_2d) && asset.box_2d.length === 4
+                ? { box_2d: asset.box_2d }
+                : {}),
+              ...(parsedCaption ? { caption: parsedCaption } : {}),
             });
-            i = br.endIdx + 1;
+            i = nextIdx;
             textStart = i;
             continue;
           }

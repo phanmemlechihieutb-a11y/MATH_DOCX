@@ -113,6 +113,7 @@ export function pagesToLatexSource(pages: PageExtraction[]): {
             widthPx: blk.croppedWidthPx ?? 420,
             heightPx: blk.croppedHeightPx ?? 300,
             caption: blk.caption ?? null,
+            box_2d: blk.box_2d ?? null,
           };
           const body = blk.caption
             ? `\\includegraphics{${key}}\n\\\\\n\\textit{${escapeLatexPlainText(blk.caption)}}`

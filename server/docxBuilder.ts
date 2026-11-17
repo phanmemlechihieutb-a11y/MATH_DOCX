@@ -524,16 +524,20 @@ function renderSingleBlockXml(
   }
 
   if (blk.block_type === 'figure' && blk.croppedImageDataUrl) {
-    const base64Match = blk.croppedImageDataUrl.match(/^data:image\/png;base64,(.+)$/);
+    const base64Match = blk.croppedImageDataUrl.match(
+      /^data:image\/(png|jpeg|jpg|webp);base64,(.+)$/i
+    );
     if (!base64Match) return '';
 
+    const rawFmt = base64Match[1].toLowerCase();
+    const ext = rawFmt === 'jpeg' ? 'jpg' : rawFmt;
     const imgIndex = mediaItems.length + 1;
     const relId = `rIdImg${imgIndex}`;
-    const filename = `image${imgIndex}.png`;
+    const filename = `image${imgIndex}.${ext}`;
     mediaItems.push({
       id: relId,
       filename,
-      data: Buffer.from(base64Match[1], 'base64'),
+      data: Buffer.from(base64Match[2], 'base64'),
     });
 
     const widthPx = Math.max(40, blk.croppedWidthPx ?? 600);
@@ -735,6 +739,9 @@ export async function buildDocxBuffer(
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-officedocument.relationships+xml"/>
   <Default Extension="xml" ContentType="application/xml"/>
   <Default Extension="png" ContentType="image/png"/>
+  <Default Extension="jpg" ContentType="image/jpeg"/>
+  <Default Extension="jpeg" ContentType="image/jpeg"/>
+  <Default Extension="webp" ContentType="image/webp"/>
   <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
   <Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
 </Types>`;

@@ -167,6 +167,22 @@ function isInkPixel(
   return r < threshold || g < threshold || b < threshold;
 }
 
+function isContainedInBox(
+  nTop: number,
+  nLeft: number,
+  nBottom: number,
+  nRight: number,
+  figTop: number,
+  figLeft: number,
+  figBottom: number,
+  figRight: number
+): boolean {
+  const nArea = Math.max(1, (nBottom - nTop) * (nRight - nLeft));
+  const ix = Math.max(0, Math.min(nRight, figRight) - Math.max(nLeft, figLeft));
+  const iy = Math.max(0, Math.min(nBottom, figBottom) - Math.max(nTop, figTop));
+  return (ix * iy) / nArea >= 0.7;
+}
+
 function expandCropToInkBounds(
   ctx: CanvasRenderingContext2D,
   pageW: number,
@@ -177,29 +193,64 @@ function expandCropToInkBounds(
   rawBottom: number,
   neighborBoxes: number[][] = []
 ): { left: number; top: number; right: number; bottom: number } {
-  const maxLeft = Math.max(0, rawLeft - Math.round(pageW * 0.16));
-  const maxRight = Math.min(pageW, rawRight + Math.round(pageW * 0.16));
-  const maxTop = Math.max(0, rawTop - Math.round(pageH * 0.12));
-  const maxBottom = Math.min(pageH, rawBottom + Math.round(pageH * 0.18));
+  let maxLeft = Math.max(0, rawLeft - Math.round(pageW * 0.16));
+  let maxRight = Math.min(pageW, rawRight + Math.round(pageW * 0.16));
+  let maxTop = Math.max(0, rawTop - Math.round(pageH * 0.14));
+  let maxBottom = Math.min(pageH, rawBottom + Math.round(pageH * 0.18));
 
   let overlappingTopMaxY = -1;
+  let overlappingBottomMinY = pageH + 1;
 
   for (const nb of neighborBoxes) {
     if (!Array.isArray(nb) || nb.length !== 4) continue;
     const [ny1, nx1, ny2, nx2] = nb;
-    const nTop = Math.floor((ny1 * pageH) / 1000);
-    const nLeft = Math.floor((nx1 * pageW) / 1000);
-    const nBottom = Math.ceil((ny2 * pageH) / 1000);
-    const nRight = Math.ceil((nx2 * pageW) / 1000);
+    const nTop = Math.floor((Math.min(ny1, ny2) * pageH) / 1000);
+    const nLeft = Math.floor((Math.min(nx1, nx2) * pageW) / 1000);
+    const nBottom = Math.ceil((Math.max(ny1, ny2) * pageH) / 1000);
+    const nRight = Math.ceil((Math.max(nx1, nx2) * pageW) / 1000);
 
-    const horizOverlap = Math.min(nRight, maxRight) - Math.max(nLeft, maxLeft);
-    if (
-      horizOverlap > 20 &&
-      nTop < rawTop - 4 &&
-      nBottom > rawTop &&
-      nBottom < rawTop + Math.min(Math.round(pageH * 0.05), (rawBottom - rawTop) * 0.28)
-    ) {
-      overlappingTopMaxY = Math.max(overlappingTopMaxY, nBottom);
+    // Ignore stray labels that lie inside the figure box itself
+    if (isContainedInBox(nTop, nLeft, nBottom, nRight, rawTop, rawLeft, rawBottom, rawRight)) {
+      continue;
+    }
+
+    const directHorizOverlap = Math.min(nRight, rawRight) - Math.max(nLeft, rawLeft);
+    const hasHorizOverlapWithFig =
+      directHorizOverlap > Math.min(24, (rawRight - rawLeft) * 0.2);
+
+    if (hasHorizOverlapWithFig) {
+      if (nBottom <= rawTop + 4) {
+        maxTop = Math.max(maxTop, Math.min(rawTop, nBottom + 2));
+      } else if (
+        nTop < rawTop - 4 &&
+        nBottom > rawTop &&
+        nBottom < rawTop + Math.min(Math.round(pageH * 0.05), (rawBottom - rawTop) * 0.28)
+      ) {
+        overlappingTopMaxY = Math.max(overlappingTopMaxY, nBottom);
+      }
+
+      if (nTop >= rawBottom - 4) {
+        maxBottom = Math.min(maxBottom, Math.max(rawBottom, nTop - 2));
+      } else if (
+        nBottom > rawBottom + 4 &&
+        nTop < rawBottom &&
+        nTop > rawBottom - Math.min(Math.round(pageH * 0.05), (rawBottom - rawTop) * 0.28)
+      ) {
+        overlappingBottomMinY = Math.min(overlappingBottomMinY, nTop);
+      }
+    }
+
+    const directVertOverlap = Math.min(nBottom, rawBottom) - Math.max(nTop, rawTop);
+    const hasVertOverlapWithFig =
+      directVertOverlap > Math.min(20, (rawBottom - rawTop) * 0.2);
+
+    if (hasVertOverlapWithFig) {
+      if (nRight <= rawLeft + 4) {
+        maxLeft = Math.max(maxLeft, Math.min(rawLeft, nRight + 2));
+      }
+      if (nLeft >= rawRight - 4) {
+        maxRight = Math.min(maxRight, Math.max(rawRight, nLeft - 2));
+      }
     }
   }
 
@@ -272,22 +323,21 @@ function expandCropToInkBounds(
   let curRight = rawRight;
   let curBottom = rawBottom;
 
-  // Only trim an overlapping top strip if a clean horizontal white gap separates it
-  // from a wide horizontal table border below (never trims floating labels on graphs).
+  // Trim an overlapping top strip if a clean horizontal white gap separates it from the figure
   if (overlappingTopMaxY > curTop) {
     const trimLimit = Math.min(
       curBottom - 20,
       overlappingTopMaxY + Math.round(pageH * 0.02)
     );
     const minTrimGap = Math.max(5, Math.round(pageH * 0.0025));
-    const spanW = Math.max(1, curRight - curLeft);
     let seenTopInk = false;
     let gapRun = 0;
     for (let y = curTop; y < trimLimit; y++) {
       const cnt = countRowInk(y, curLeft, curRight);
       if (cnt > 0) {
-        if (seenTopInk && gapRun >= minTrimGap && cnt >= spanW * 0.4) {
+        if (seenTopInk && gapRun >= minTrimGap) {
           curTop = y;
+          maxTop = Math.max(maxTop, y);
           break;
         }
         seenTopInk = true;
@@ -298,10 +348,35 @@ function expandCropToInkBounds(
     }
   }
 
-  const hGap = Math.max(14, Math.round(pageW * 0.015));
-  const vGapTop = Math.max(6, Math.round(pageH * 0.003));
-  const vGapBottom = Math.max(12, Math.round(pageH * 0.0055));
-  const vGapAfterBorder = Math.max(5, Math.round(pageH * 0.0022));
+  // Trim an overlapping bottom strip if a clean horizontal white gap separates it from the figure
+  if (overlappingBottomMinY < curBottom) {
+    const trimFloor = Math.max(
+      curTop + 20,
+      overlappingBottomMinY - Math.round(pageH * 0.02)
+    );
+    const minTrimGap = Math.max(5, Math.round(pageH * 0.0025));
+    let seenBottomInk = false;
+    let gapRun = 0;
+    for (let y = curBottom - 1; y >= trimFloor; y--) {
+      const cnt = countRowInk(y, curLeft, curRight);
+      if (cnt > 0) {
+        if (seenBottomInk && gapRun >= minTrimGap) {
+          curBottom = y + 1;
+          maxBottom = Math.min(maxBottom, y + 1);
+          break;
+        }
+        seenBottomInk = true;
+        gapRun = 0;
+      } else if (seenBottomInk) {
+        gapRun++;
+      }
+    }
+  }
+
+  const hGap = Math.max(16, Math.round(pageW * 0.016));
+  const vGapTop = Math.max(12, Math.round(pageH * 0.008));
+  const vGapBottom = Math.max(14, Math.round(pageH * 0.009));
+  const vGapAfterBorder = Math.max(7, Math.round(pageH * 0.0035));
 
   const expandHorizontal = () => {
     let leftWhite = 0;
@@ -438,6 +513,14 @@ function expandCropToInkBounds(
     inkBottom = curBottom;
   }
 
+  // Fallback to raw OCR box if tightened ink box collapsed too small
+  if (inkRight - inkLeft < 16 || inkBottom - inkTop < 16) {
+    inkLeft = rawLeft;
+    inkRight = rawRight;
+    inkTop = rawTop;
+    inkBottom = rawBottom;
+  }
+
   // Add breathing-room padding from the true ink edges, stopping safely clear of external ink
   const padX = Math.max(8, Math.round(pageW * 0.005));
   const padY = Math.max(7, Math.round(pageH * 0.004));
@@ -521,7 +604,14 @@ export async function cropFiguresFromPage(
 
   const results = boxes.map((box2d) => {
     if (!box2d || box2d.length !== 4) return null;
-    const [ymin, xmin, ymax, xmax] = box2d;
+    const rawY1 = Math.max(0, Math.min(1000, Number(box2d[0]) || 0));
+    const rawX1 = Math.max(0, Math.min(1000, Number(box2d[1]) || 0));
+    const rawY2 = Math.max(0, Math.min(1000, Number(box2d[2]) || 0));
+    const rawX2 = Math.max(0, Math.min(1000, Number(box2d[3]) || 0));
+    const ymin = Math.min(rawY1, rawY2);
+    const ymax = Math.max(rawY1, rawY2);
+    const xmin = Math.min(rawX1, rawX2);
+    const xmax = Math.max(rawX1, rawX2);
 
     const rawLeft = Math.max(0, Math.floor((xmin * page.width) / 1000));
     const rawTop = Math.max(0, Math.floor((ymin * page.height) / 1000));

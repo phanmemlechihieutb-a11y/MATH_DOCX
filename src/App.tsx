@@ -622,10 +622,158 @@ export default function App() {
     [addPageBreaks, choiceLayout, inputSource, mathFormat, rebuildDocxExport, sourceFilename]
   );
 
+  const isBoxMostlyInsideAnyFigure = (
+    blkBox: number[],
+    figureBoxes: number[][]
+  ): boolean => {
+    const [by1, bx1, by2, bx2] = blkBox;
+    const bTop = Math.min(by1, by2);
+    const bLeft = Math.min(bx1, bx2);
+    const bBottom = Math.max(by1, by2);
+    const bRight = Math.max(bx1, bx2);
+    const bArea = Math.max(1, (bBottom - bTop) * (bRight - bLeft));
+    return figureBoxes.some((fBox) => {
+      const [fy1, fx1, fy2, fx2] = fBox;
+      const fTop = Math.min(fy1, fy2);
+      const fLeft = Math.min(fx1, fx2);
+      const fBottom = Math.max(fy1, fy2);
+      const fRight = Math.max(fx1, fx2);
+      const ix = Math.max(0, Math.min(bRight, fRight) - Math.max(bLeft, fLeft));
+      const iy = Math.max(0, Math.min(bBottom, fBottom) - Math.max(bTop, fTop));
+      return (ix * iy) / bArea >= 0.75;
+    });
+  };
+
+  const filterDuplicateBlocksInsideFigures = (blocks: DocumentBlock[]): DocumentBlock[] => {
+    const croppedBoxes = blocks
+      .filter(
+        (b): b is DocumentBlock & { box_2d: number[] } =>
+          b.block_type === 'figure' &&
+          Boolean(b.croppedImageDataUrl) &&
+          Array.isArray(b.box_2d) &&
+          b.box_2d.length === 4
+      )
+      .map((b) => b.box_2d);
+    if (croppedBoxes.length === 0) return blocks;
+
+    return blocks.filter((blk) => {
+      if (blk.block_type === 'figure' || blk.block_type === 'table') return true;
+      if (!Array.isArray(blk.box_2d) || blk.box_2d.length !== 4) return true;
+      if (!isBoxMostlyInsideAnyFigure(blk.box_2d, croppedBoxes)) return true;
+      const plain = (blk.segments ?? []).map((s) => s.content ?? '').join('').trim();
+      if (/^(?:Câu|Bài|Ví dụ|Hình|Bảng)\s+\d+/i.test(plain)) return true;
+      return false;
+    });
+  };
+
+  const handleAutoCropFiguresChange = async (nextEnabled: boolean) => {
+    setAutoCropFigures(nextEnabled);
+    if (
+      extractedPages.length === 0 ||
+      renderedPages.length === 0 ||
+      isConverting ||
+      isExportingPaste
+    ) {
+      return;
+    }
+
+    try {
+      const updatedPages: PageExtraction[] = await Promise.all(
+        extractedPages.map(async (page) => {
+          const sourcePage = renderedPages.find((rp) => rp.pageNumber === page.pageNumber);
+          if (!sourcePage) return page;
+
+          if (!nextEnabled) {
+            return {
+              ...page,
+              blocks: page.blocks.map((blk) =>
+                blk.block_type === 'figure'
+                  ? {
+                      ...blk,
+                      croppedImageDataUrl: null,
+                      croppedWidthPx: null,
+                      croppedHeightPx: null,
+                    }
+                  : blk
+              ),
+            };
+          }
+
+          const blocksClone = page.blocks.map((b) => ({ ...b }));
+          const figureBlocks = blocksClone.filter(
+            (blk): blk is DocumentBlock & { box_2d: number[] } =>
+              blk.block_type === 'figure' &&
+              Array.isArray(blk.box_2d) &&
+              blk.box_2d.length === 4
+          );
+          if (figureBlocks.length === 0) return page;
+
+          const neighborBoxes = blocksClone
+            .filter(
+              (blk): blk is DocumentBlock & { box_2d: number[] } =>
+                blk.block_type !== 'figure' &&
+                Array.isArray(blk.box_2d) &&
+                blk.box_2d.length === 4
+            )
+            .map((b) => b.box_2d);
+
+          const croppedList = await cropFiguresFromPage(
+            sourcePage,
+            figureBlocks.map((b) => b.box_2d),
+            0.014,
+            neighborBoxes
+          );
+          figureBlocks.forEach((blk, fIdx) => {
+            const cropped = croppedList[fIdx];
+            if (cropped) {
+              blk.croppedImageDataUrl = cropped.dataUrl;
+              blk.croppedWidthPx = cropped.width;
+              blk.croppedHeightPx = cropped.height;
+              blk.box_2d = cropped.box2d;
+            }
+          });
+
+          return {
+            ...page,
+            blocks: filterDuplicateBlocksInsideFigures(blocksClone),
+          };
+        })
+      );
+
+      setExtractedPages(updatedPages);
+      const { latex: regeneratedLatex, assets: regeneratedAssets } =
+        pagesToLatexSource(updatedPages);
+      setFigureAssets(regeneratedAssets);
+      setPastedLatex(regeneratedLatex);
+      if (docxDownloadUrl) {
+        setStatusMessage(
+          nextEnabled
+            ? 'Đã tự động nhận diện & cắt chèn hình vẽ vào tài liệu.'
+            : 'Đã tắt cắt chèn hình vẽ trong bản xem trước và file Word.'
+        );
+        await rebuildDocxExport(
+          updatedPages,
+          sourceFilename || 'tai_lieu_toan',
+          addPageBreaks,
+          choiceLayout,
+          mathFormat
+        );
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Không thể cập nhật hình vẽ đã cắt.';
+      setErrorMessage(msg);
+    }
+  };
+
   const handleChoiceLayoutChange = async (nextLayout: ChoiceLayoutMode) => {
     setChoiceLayout(nextLayout);
     const activePages =
-      editedPages ?? (extractedPages.length > 0 ? extractedPages : []);
+      editedPages ??
+      (inputSource === 'paste' && pastedLatex.trim()
+        ? normalizePagesInlineMath(parsePastedLatexToPages(pastedLatex, 'auto', figureAssets))
+        : extractedPages.length > 0
+        ? extractedPages
+        : []);
     if (activePages.length > 0 && !isConverting && !isExportingPaste) {
       try {
         setStatusMessage('Đang cập nhật bố cục phương án trả lời trong file Word...');
@@ -647,7 +795,12 @@ export default function App() {
   const handleMathFormatChange = async (nextFormat: MathOutputFormat) => {
     setMathFormat(nextFormat);
     const activePages =
-      editedPages ?? (extractedPages.length > 0 ? extractedPages : []);
+      editedPages ??
+      (inputSource === 'paste' && pastedLatex.trim()
+        ? normalizePagesInlineMath(parsePastedLatexToPages(pastedLatex, 'auto', figureAssets))
+        : extractedPages.length > 0
+        ? extractedPages
+        : []);
     if (activePages.length > 0 && !isConverting && !isExportingPaste) {
       try {
         setStatusMessage(
@@ -876,25 +1029,29 @@ export default function App() {
           throw new Error(ocrJson.error || `Lỗi OCR trang ${page.pageNumber}`);
         }
 
-        const blocks = Array.isArray(ocrJson.blocks) ? ocrJson.blocks : [];
+        let blocks = Array.isArray(ocrJson.blocks) ? ocrJson.blocks : [];
 
         if (autoCropFigures) {
           const figureBlocks = blocks.filter(
             (blk): blk is DocumentBlock & { box_2d: number[] } =>
-              blk.block_type === 'figure' && Array.isArray(blk.box_2d)
+              blk.block_type === 'figure' &&
+              Array.isArray(blk.box_2d) &&
+              blk.box_2d.length === 4
           );
           if (figureBlocks.length > 0) {
+            const figRawBoxes = figureBlocks.map((b) => b.box_2d);
             const neighborBoxes = blocks
               .filter(
                 (blk): blk is DocumentBlock & { box_2d: number[] } =>
                   blk.block_type !== 'figure' &&
                   Array.isArray(blk.box_2d) &&
-                  blk.box_2d.length === 4
+                  blk.box_2d.length === 4 &&
+                  !isBoxMostlyInsideAnyFigure(blk.box_2d, figRawBoxes)
               )
               .map((b) => b.box_2d);
             const croppedList = await cropFiguresFromPage(
               page,
-              figureBlocks.map((b) => b.box_2d),
+              figRawBoxes,
               0.014,
               neighborBoxes
             );
@@ -907,6 +1064,7 @@ export default function App() {
                 blk.box_2d = cropped.box2d;
               }
             });
+            blocks = filterDuplicateBlocksInsideFigures(blocks);
           }
         }
 
@@ -1536,12 +1694,12 @@ export default function App() {
               <input
                 type="checkbox"
                 checked={autoCropFigures}
-                onChange={(e) => setAutoCropFigures(e.target.checked)}
+                onChange={(e) => void handleAutoCropFiguresChange(e.target.checked)}
                 disabled={isConverting}
                 className="mt-0.5 h-4 w-4 rounded border-slate-300 text-blue-700 focus:ring-blue-600"
               />
               <span className="text-sm text-slate-700">
-                Tự động nhận diện &amp; cắt chèn hình vẽ / đồ thị / bảng biến thiên
+                Tự động nhận diện và cắt chèn hình vẽ
               </span>
             </label>
 
@@ -1551,7 +1709,7 @@ export default function App() {
               </span>
               <div className="space-y-2">
                 <label
-                  className={`flex items-start gap-2.5 p-2.5 rounded-lg border transition-colors cursor-pointer select-none ${
+                  className={`flex items-center gap-2.5 p-2.5 rounded-lg border transition-colors cursor-pointer select-none ${
                     mathFormat === 'omml'
                       ? 'border-blue-600 bg-blue-50/40'
                       : 'border-slate-200 hover:border-blue-400'
@@ -1564,17 +1722,16 @@ export default function App() {
                     checked={mathFormat === 'omml'}
                     onChange={() => void handleMathFormatChange('omml')}
                     disabled={isConverting || isExportingPaste}
-                    className="mt-0.5 h-4 w-4 border-slate-300 text-blue-700 focus:ring-blue-600"
+                    className="h-4 w-4 border-slate-300 text-blue-700 focus:ring-blue-600"
                   />
                   <span className="text-xs leading-relaxed text-slate-700">
                     <strong className="block text-slate-900 font-semibold">
                       Dạng Equation (Mặc định)
                     </strong>
-                    Xuất Equation chuẩn Word (OMML), chỉnh sửa trực tiếp trong Microsoft Word
                   </span>
                 </label>
                 <label
-                  className={`flex items-start gap-2.5 p-2.5 rounded-lg border transition-colors cursor-pointer select-none ${
+                  className={`flex items-center gap-2.5 p-2.5 rounded-lg border transition-colors cursor-pointer select-none ${
                     mathFormat === 'latex'
                       ? 'border-blue-600 bg-blue-50/40'
                       : 'border-slate-200 hover:border-blue-400'
@@ -1587,14 +1744,12 @@ export default function App() {
                     checked={mathFormat === 'latex'}
                     onChange={() => void handleMathFormatChange('latex')}
                     disabled={isConverting || isExportingPaste}
-                    className="mt-0.5 h-4 w-4 border-slate-300 text-blue-700 focus:ring-blue-600"
+                    className="h-4 w-4 border-slate-300 text-blue-700 focus:ring-blue-600"
                   />
                   <span className="text-xs leading-relaxed text-slate-700">
                     <strong className="block text-slate-900 font-semibold">
                       Dạng Toggle TeX (<code className="font-mono">{'${...}$'}</code>)
                     </strong>
-                    Công thức toán, số, dấu phép tính đặt trong dấu{' '}
-                    <code className="font-mono">{'${...}$'}</code> để Toggle TeX (Alt+\)
                   </span>
                 </label>
               </div>
@@ -1606,7 +1761,7 @@ export default function App() {
               </span>
               <div className="space-y-2">
                 <label
-                  className={`flex items-start gap-2.5 p-2.5 rounded-lg border transition-colors cursor-pointer select-none ${
+                  className={`flex items-center gap-2.5 p-2.5 rounded-lg border transition-colors cursor-pointer select-none ${
                     choiceLayout === 'table'
                       ? 'border-blue-600 bg-blue-50/40'
                       : 'border-slate-200 hover:border-blue-400'
@@ -1619,17 +1774,16 @@ export default function App() {
                     checked={choiceLayout === 'table'}
                     onChange={() => void handleChoiceLayoutChange('table')}
                     disabled={isConverting}
-                    className="mt-0.5 h-4 w-4 border-slate-300 text-blue-700 focus:ring-blue-600"
+                    className="h-4 w-4 border-slate-300 text-blue-700 focus:ring-blue-600"
                   />
                   <span className="text-xs leading-relaxed text-slate-700">
                     <strong className="block text-slate-900 font-semibold">
                       Nằm trong bảng
                     </strong>
-                    Chia cột bằng bảng không viền, giữ thẳng hàng tuyệt đối
                   </span>
                 </label>
                 <label
-                  className={`flex items-start gap-2.5 p-2.5 rounded-lg border transition-colors cursor-pointer select-none ${
+                  className={`flex items-center gap-2.5 p-2.5 rounded-lg border transition-colors cursor-pointer select-none ${
                     choiceLayout === 'tabs'
                       ? 'border-blue-600 bg-blue-50/40'
                       : 'border-slate-200 hover:border-blue-400'
@@ -1642,13 +1796,12 @@ export default function App() {
                     checked={choiceLayout === 'tabs'}
                     onChange={() => void handleChoiceLayoutChange('tabs')}
                     disabled={isConverting}
-                    className="mt-0.5 h-4 w-4 border-slate-300 text-blue-700 focus:ring-blue-600"
+                    className="h-4 w-4 border-slate-300 text-blue-700 focus:ring-blue-600"
                   />
                   <span className="text-xs leading-relaxed text-slate-700">
                     <strong className="block text-slate-900 font-semibold">
                       Không trong bảng (đặt Tab)
                     </strong>
-                    Xuất đoạn văn chuẩn đặt điểm dừng Tab phù hợp từng cột
                   </span>
                 </label>
               </div>
