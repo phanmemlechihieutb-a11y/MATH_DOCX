@@ -1343,15 +1343,15 @@ export default function App() {
     <div className="min-h-screen flex flex-col bg-slate-50 text-slate-900">
       {/* Top Bar Contract: 3 zones separated by gap-8 */}
       <header className="sticky top-0 z-30 bg-white/95 backdrop-blur border-b border-slate-200">
-        <div className="max-w-[1600px] mx-auto px-6 h-16 flex items-center justify-between gap-8">
+        <div className="max-w-[1600px] mx-auto px-6 h-8 flex items-center justify-between gap-8">
           <a
             href="#top"
-            className="text-lg font-bold tracking-tight text-red-600 whitespace-nowrap shrink-0 lg:w-[346px]"
+            className="text-sm font-bold tracking-tight text-red-600 whitespace-nowrap shrink-0 lg:w-[346px]"
           >
             MathDocx_viết code: Lê Chí Hiếu
           </a>
 
-          <nav className="hidden md:flex flex-1 items-center justify-center gap-6 text-sm font-medium text-slate-600">
+          <nav className="hidden md:flex flex-1 items-center justify-center gap-6 text-xs font-medium text-slate-600">
             <button
               type="button"
               onClick={() => setActiveTab('original')}
@@ -1386,9 +1386,9 @@ export default function App() {
               <a
                 href={docxDownloadUrl}
                 download={docxFileName}
-                className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors whitespace-nowrap shrink-0"
+                className="inline-flex items-center gap-1.5 px-2.5 py-0.5 text-xs font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-md transition-colors whitespace-nowrap shrink-0"
               >
-                <Download className="w-4 h-4" />
+                <Download className="w-3.5 h-3.5" />
                 Tải xuống file Word
               </a>
             )}
@@ -1399,7 +1399,7 @@ export default function App() {
       {/* Main Split Workspace: Left Controls/Options/Formatting — Right Content Display */}
       <main id="top" className="flex-1 flex flex-col md:flex-row w-full max-w-[1600px] mx-auto">
         {/* Left Sidebar: Sticky Controls, Options & Formatting */}
-        <aside className="w-full md:w-[400px] lg:w-[460px] shrink-0 bg-white border-b md:border-b-0 md:border-r border-slate-200 md:sticky md:top-16 md:h-[calc(100vh-4rem)] md:overflow-y-auto divide-y divide-slate-200">
+        <aside className="w-full md:w-[400px] lg:w-[460px] shrink-0 bg-white border-b md:border-b-0 md:border-r border-slate-200 md:sticky md:top-8 md:h-[calc(100vh-2rem)] md:overflow-y-auto divide-y divide-slate-200">
           {/* 1. Tài liệu đầu vào (nhỏ gọn bên trái) */}
           <section className="p-4 space-y-2.5">
             <div className="flex items-center justify-between gap-2">
@@ -1885,7 +1885,7 @@ export default function App() {
             !pastedLatex.trim() &&
             displayPreviewPages.length === 0 ? (
               <section
-                className="w-full min-h-[420px] md:min-h-[520px] flex flex-col bg-white border border-slate-200 rounded-xl p-6 md:p-10"
+                className="w-full min-h-[280px] md:min-h-[346px] flex flex-col bg-white border border-slate-200 rounded-xl p-5 md:p-7"
                 onPaste={(e) => {
                   handlePasteEventForImage(e, false);
                 }}
@@ -1905,7 +1905,7 @@ export default function App() {
                     const file = e.dataTransfer.files?.[0];
                     if (file) void handleFileSelected(file);
                   }}
-                  className="flex-1 flex flex-col items-center justify-center border-2 border-dashed border-slate-300 hover:border-blue-500 hover:bg-blue-50/40 rounded-xl p-10 md:p-16 text-center transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-600"
+                  className="flex-1 flex flex-col items-center justify-center border-2 border-dashed border-slate-300 hover:border-blue-500 hover:bg-blue-50/40 rounded-xl p-6 md:p-10 text-center transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-600"
                 >
                   {isLoadingFile ? (
                     <div className="flex flex-col items-center gap-2 py-3">
@@ -2143,9 +2143,9 @@ export default function App() {
           {/* Technical OMML Explanation Section */}
           <section
             id="omml-guide"
-            className="bg-white border border-slate-200 rounded-xl p-6 md:p-8"
+            className="bg-white border border-slate-200 rounded-xl px-5 py-3 md:px-6 md:py-3.5"
           >
-            <h2 className="text-lg font-bold text-slate-900">
+            <h2 className="text-sm font-semibold text-slate-900">
               Cơ chế chuyển công thức Toán sang Word Equation (OMML)
             </h2>
             <p className="hidden">
@@ -2157,19 +2157,19 @@ export default function App() {
               </code>
               . Ứng dụng thực hiện quy trình 3 bước hoàn toàn tự động:
             </p>
-            <div className="mt-5 grid grid-cols-1 md:grid-cols-3 gap-6 text-sm text-slate-700">
+            <div className="mt-2 grid grid-cols-1 md:grid-cols-3 gap-3 text-xs text-slate-700">
               <div>
-                <h3 className="font-semibold text-slate-900">
+                <h3 className="font-medium text-slate-800">
                   01. Bóc tách cấu trúc & LaTeX
                 </h3>
               </div>
               <div>
-                <h3 className="font-semibold text-slate-900">
+                <h3 className="font-medium text-slate-800">
                   02. LaTeX → MathML → XML OMML
                 </h3>
               </div>
               <div>
-                <h3 className="font-semibold text-slate-900">
+                <h3 className="font-medium text-slate-800">
                   03. Đóng gói OOXML (.docx)
                 </h3>
               </div>
