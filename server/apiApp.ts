@@ -515,6 +515,8 @@ export async function handleExportDocx(req: RequestWithOptionalBody, res: Server
       'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
     );
     res.setHeader('Content-Disposition', `attachment; filename="${safeBase}_${suffix}.docx"`);
+    res.setHeader('Content-Length', String(buffer.length));
+    res.setHeader('Cache-Control', 'no-store');
     res.end(buffer);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Lỗi xuất file Word.';

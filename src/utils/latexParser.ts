@@ -4,6 +4,7 @@ import type {
   InlineSegment,
   PageExtraction,
   TableCellData,
+  TabStopSpec,
 } from '../types/document.ts';
 import { evaluateTikzMathExpr, renderLatexPictureToSvgDataUrl } from './tikzRenderer.ts';
 
@@ -47,27 +48,89 @@ const BARE_LATEX_CMD_RE =
 
 const LATEX_COLOR_MAP: Record<string, string> = {
   red: '#DC2626',
+  crimson: '#DC143C',
+  darkred: '#991B1B',
+  maroon: '#800000',
   blue: '#2563EB',
+  darkblue: '#1E3A8A',
+  navy: '#1E3A8A',
+  navyblue: '#1E3A8A',
+  royalblue: '#1D4ED8',
+  dodgerblue: '#1E90FF',
+  midnightblue: '#191970',
+  cornflowerblue: '#6495ED',
+  cerulean: '#00A2E3',
+  skyblue: '#0284C7',
+  processblue: '#00B0F0',
+  bluegreen: '#00B3B8',
+  cadetblue: '#5F9EA0',
+  aquamarine: '#00B5BE',
+  turquoise: '#00B4CC',
   green: '#16A34A',
   darkgreen: '#15803D',
   forestgreen: '#15803D',
+  pinegreen: '#008B72',
+  junglegreen: '#00A99D',
+  seagreen: '#3FBC9D',
+  emerald: '#059669',
+  limegreen: '#8DC73F',
+  springgreen: '#7BC143',
+  greenyellow: '#AFE138',
+  yellowgreen: '#98CC70',
+  olivegreen: '#3C8031',
+  teal: '#0D9488',
+  cyan: '#0891B2',
   orange: '#EA580C',
+  darkorange: '#C2410C',
+  burntorange: '#F7921D',
+  redorange: '#F26035',
+  orangered: '#FF4500',
+  bittersweet: '#C04F17',
+  peach: '#F7965A',
+  apricot: '#FBB982',
+  melon: '#F89E7B',
+  salmon: '#F69289',
+  yellow: '#CA8A04',
+  goldenrod: '#DAA520',
+  gold: '#CA8A04',
+  amber: '#D97706',
+  dandelion: '#FDBC42',
+  olive: '#65A30D',
+  lime: '#84CC16',
   purple: '#9333EA',
   violet: '#7C3AED',
+  blueviolet: '#473992',
+  darkorchid: '#A4538A',
+  orchid: '#AF72B0',
+  plum: '#92268F',
+  mulberry: '#A93C93',
+  lavender: '#F49EC4',
+  thistle: '#D883B7',
+  indigo: '#4338CA',
+  periwinkle: '#7977B8',
   magenta: '#DB2777',
-  cyan: '#0891B2',
-  teal: '#0D9488',
+  fuchsia: '#8C368C',
+  rhodamine: '#EF559F',
+  rubinered: '#ED017D',
+  wildstrawberry: '#EE2967',
+  carnationpink: '#F282B4',
+  pink: '#EC4899',
+  redviolet: '#A1246B',
+  violetred: '#EF58A0',
+  brickred: '#B6321C',
+  mahogany: '#A9341F',
   brown: '#92400E',
+  rawsienna: '#974006',
+  sepia: '#671800',
+  tan: '#DA9D76',
   gray: '#64748B',
   grey: '#64748B',
+  lightgray: '#E2E8F0',
+  silver: '#CBD5E1',
   darkgray: '#334155',
+  darkgrey: '#334155',
   black: '#0F172A',
-  navy: '#1E3A8A',
-  maroon: '#991B1B',
-  yellow: '#CA8A04',
-  olive: '#65A30D',
-  pink: '#EC4899',
-  lime: '#84CC16',
+  white: '#FFFFFF',
 };
 
 const FONT_SIZE_PT_MAP: Record<string, number> = {
@@ -106,6 +169,80 @@ export interface EmbeddedFigureAsset {
   box_2d?: number[] | null;
 }
 
+export interface DocumentPageConfig {
+  pageSize: 'a4' | 'a5' | 'letter';
+  isLandscape: boolean;
+  marginTopPt: number;
+  marginRightPt: number;
+  marginBottomPt: number;
+  marginLeftPt: number;
+  contentWidthPt: number;
+  baseFontSizePt: number;
+  defaultLineSpacing: number;
+  defaultParIndentPt: number;
+  defaultParSkipPt: number;
+}
+
+function createDefaultPageConfig(): DocumentPageConfig {
+  return {
+    pageSize: 'a4',
+    isLandscape: false,
+    marginTopPt: 54,
+    marginRightPt: 54,
+    marginBottomPt: 54,
+    marginLeftPt: 54,
+    contentWidthPt: 595.3 - 108,
+    baseFontSizePt: 12,
+    defaultLineSpacing: 1.18,
+    defaultParIndentPt: 0,
+    defaultParSkipPt: 0,
+  };
+}
+
+function parseLatexLengthToPt(
+  rawExpr: string,
+  containerWidthPt = 487.3,
+  baseFontPt = 12
+): number | null {
+  const s = (rawExpr ?? '').trim();
+  if (!s) return null;
+  const relMatch = s.match(
+    /^([+-]?(?:\d+(?:\.\d*)?|\.\d+))?\s*\\(textwidth|linewidth|columnwidth|hsize|paperwidth|baselineskip)\b/
+  );
+  if (relMatch) {
+    const factor = relMatch[1] !== undefined ? parseFloat(relMatch[1]) : 1;
+    if (!Number.isFinite(factor)) return null;
+    const unit = relMatch[2];
+    if (unit === 'paperwidth') return factor * 595.3;
+    if (unit === 'baselineskip') return factor * baseFontPt * 1.2;
+    return factor * containerWidthPt;
+  }
+  const absMatch = s.match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(pt|bp|pc|in|cm|mm|em|ex)\b/i);
+  if (absMatch) {
+    const val = parseFloat(absMatch[1]);
+    if (!Number.isFinite(val)) return null;
+    const unit = absMatch[2].toLowerCase();
+    switch (unit) {
+      case 'pt':
+      case 'bp':
+        return val;
+      case 'pc':
+        return val * 12;
+      case 'in':
+        return val * 72;
+      case 'cm':
+        return val * 28.3465;
+      case 'mm':
+        return val * 2.83465;
+      case 'em':
+        return val * baseFontPt;
+      case 'ex':
+        return val * (baseFontPt * 0.48);
+    }
+  }
+  return null;
+}
+
 interface ParserContext {
   sectionCount: number;
   subsectionCount: number;
@@ -120,14 +257,16 @@ interface ParserContext {
   lastNumberedKind: string | null;
   customTheorems: Record<string, CustomTheoremDef>;
   customColors: Record<string, string>;
+  defaultTasksLabel?: string;
   figureAssets?: Record<string, EmbeddedFigureAsset>;
+  pageConfig: DocumentPageConfig;
 }
 
 function createParserContext(
   initial?: Partial<
     Pick<
       ParserContext,
-      'isVietnamese' | 'labels' | 'labelKinds' | 'cites' | 'customTheorems' | 'customColors' | 'figureAssets'
+      'isVietnamese' | 'labels' | 'labelKinds' | 'cites' | 'customTheorems' | 'customColors' | 'defaultTasksLabel' | 'figureAssets' | 'pageConfig'
     >
   >
 ): ParserContext {
@@ -145,7 +284,9 @@ function createParserContext(
     lastNumberedKind: null,
     customTheorems: initial?.customTheorems ?? {},
     customColors: initial?.customColors ?? {},
+    defaultTasksLabel: initial?.defaultTasksLabel,
     figureAssets: initial?.figureAssets,
+    pageConfig: initial?.pageConfig ?? createDefaultPageConfig(),
   };
 }
 
@@ -169,18 +310,148 @@ function formatTodayDate(isVietnamese: boolean): string {
   return now.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
 }
 
+function hexToRgbTuple(hex: string): [number, number, number] | null {
+  const c = hex.replace(/^#/, '');
+  if (!/^[0-9a-f]{6}$/i.test(c)) return null;
+  return [
+    parseInt(c.slice(0, 2), 16),
+    parseInt(c.slice(2, 4), 16),
+    parseInt(c.slice(4, 6), 16),
+  ];
+}
+
+function rgbTupleToHex(r: number, g: number, b: number): string {
+  return (
+    '#' +
+    [r, g, b]
+      .map((v) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0').toUpperCase())
+      .join('')
+  );
+}
+
+function resolveSimpleColor(name: string, customColors?: Record<string, string>): string | undefined {
+  let c = name.trim().toLowerCase();
+  if (!c) return undefined;
+  let invert = false;
+  while (c.startsWith('-')) {
+    invert = !invert;
+    c = c.slice(1).trim();
+  }
+  let resolved: string | undefined;
+  if (customColors && customColors[c]) resolved = customColors[c];
+  else if (LATEX_COLOR_MAP[c]) resolved = LATEX_COLOR_MAP[c];
+  else if (/^#?[0-9a-f]{6}$/i.test(c)) {
+    resolved = c.startsWith('#') ? c.toUpperCase() : `#${c.toUpperCase()}`;
+  } else if (/^#?[0-9a-f]{3}$/i.test(c)) {
+    const clean = c.replace(/^#/, '').toUpperCase();
+    resolved = `#${clean[0]}${clean[0]}${clean[1]}${clean[1]}${clean[2]}${clean[2]}`;
+  }
+  if (!resolved) return undefined;
+  if (invert) {
+    const rgb = hexToRgbTuple(resolved);
+    if (rgb) return rgbTupleToHex(255 - rgb[0], 255 - rgb[1], 255 - rgb[2]);
+  }
+  return resolved;
+}
+
 function resolveLatexColor(raw: string, customColors?: Record<string, string>): string | undefined {
   const c = raw.trim().toLowerCase();
   if (!c) return undefined;
-  if (customColors && customColors[c]) return customColors[c];
-  if (LATEX_COLOR_MAP[c]) return LATEX_COLOR_MAP[c];
-  if (/^#?[0-9a-f]{6}$/i.test(c)) {
-    return c.startsWith('#') ? c.toUpperCase() : `#${c.toUpperCase()}`;
+  const direct = resolveSimpleColor(c, customColors);
+  if (direct) return direct;
+
+  if (c.includes('!')) {
+    const parts = c.split('!').map((p) => p.trim()).filter(Boolean);
+    if (parts.length === 0) return undefined;
+    const firstHex = resolveSimpleColor(parts[0], customColors);
+    if (!firstHex) return undefined;
+    let acc = hexToRgbTuple(firstHex);
+    if (!acc) return firstHex;
+
+    let idx = 1;
+    while (idx < parts.length) {
+      const pct = parseFloat(parts[idx]);
+      if (!Number.isFinite(pct)) break;
+      const ratio = Math.max(0, Math.min(100, pct)) / 100;
+      const nextPart = parts[idx + 1];
+      let targetHex = '#FFFFFF';
+      if (nextPart !== undefined && Number.isNaN(Number(nextPart))) {
+        const resolvedNext = resolveSimpleColor(nextPart, customColors);
+        if (resolvedNext) targetHex = resolvedNext;
+        idx += 2;
+      } else {
+        idx += 1;
+      }
+      const rgb2 = hexToRgbTuple(targetHex);
+      if (rgb2) {
+        acc = [
+          acc[0] * ratio + rgb2[0] * (1 - ratio),
+          acc[1] * ratio + rgb2[1] * (1 - ratio),
+          acc[2] * ratio + rgb2[2] * (1 - ratio),
+        ];
+      }
+    }
+    return rgbTupleToHex(acc[0], acc[1], acc[2]);
   }
-  const base = c.split('!')[0]?.trim();
-  if (base && customColors && customColors[base]) return customColors[base];
-  if (base && LATEX_COLOR_MAP[base]) return LATEX_COLOR_MAP[base];
   return undefined;
+}
+
+function resolveLatexModelAndSpec(
+  modelRaw: string | undefined,
+  specRaw: string,
+  customColors?: Record<string, string>
+): string | undefined {
+  const spec = specRaw.trim();
+  if (!spec) return undefined;
+  if (!modelRaw) {
+    return resolveLatexColor(spec, customColors);
+  }
+  const model = modelRaw.trim();
+  const modelUpper = model.toUpperCase();
+  if (modelUpper === 'HTML') {
+    const cleaned = spec.replace(/^#/, '').toUpperCase();
+    if (/^[0-9A-F]{6}$/.test(cleaned)) return `#${cleaned}`;
+    if (/^[0-9A-F]{3}$/.test(cleaned)) {
+      return `#${cleaned[0]}${cleaned[0]}${cleaned[1]}${cleaned[1]}${cleaned[2]}${cleaned[2]}`;
+    }
+  } else if (model === 'RGB') {
+    const parts = spec.split(/[\s,]+/).filter(Boolean).map((p) => parseFloat(p));
+    if (parts.length === 3 && parts.every(Number.isFinite)) {
+      return rgbTupleToHex(parts[0], parts[1], parts[2]);
+    }
+  } else if (model === 'rgb') {
+    const parts = spec.split(/[\s,]+/).filter(Boolean).map((p) => parseFloat(p));
+    if (parts.length === 3 && parts.every(Number.isFinite)) {
+      return rgbTupleToHex(parts[0] * 255, parts[1] * 255, parts[2] * 255);
+    }
+  } else if (model.toLowerCase() === 'gray') {
+    const val = parseFloat(spec);
+    if (Number.isFinite(val)) {
+      const ratio = model === 'Gray' && val > 1 ? Math.max(0, Math.min(1, val / 15)) : Math.max(0, Math.min(1, val));
+      const g = ratio * 255;
+      return rgbTupleToHex(g, g, g);
+    }
+  } else if (modelUpper === 'CMYK') {
+    const parts = spec.split(/[\s,]+/).filter(Boolean).map((p) => parseFloat(p));
+    if (parts.length === 4 && parts.every(Number.isFinite)) {
+      const scale = model === 'CMYK' && parts.some((v) => v > 1) ? 100 : 1;
+      const [c, m, y, k] = parts.map((v) => Math.max(0, Math.min(1, v / scale)));
+      return rgbTupleToHex(
+        255 * (1 - c) * (1 - k),
+        255 * (1 - m) * (1 - k),
+        255 * (1 - y) * (1 - k)
+      );
+    }
+  } else if (model.toLowerCase() === 'named') {
+    return resolveLatexColor(spec, customColors);
+  }
+  return resolveLatexColor(spec, customColors);
+}
+
+function isBlackLatexColor(specRaw: string, resolvedHex?: string): boolean {
+  const s = specRaw.trim().toLowerCase();
+  if (s === 'black') return true;
+  return resolvedHex === '#000000' || resolvedHex === '#0F172A';
 }
 
 function readBalancedBraces(
@@ -241,6 +512,94 @@ function skipSpaces(src: string, idx: number): number {
     i++;
   }
   return i;
+}
+
+function extractBalancedKeyValOption(optStr: string, key: string): string | undefined {
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const keyRe = new RegExp(`(?:^|,)\\s*${escapedKey}\\s*=\\s*`);
+  let depth = 0;
+  for (let i = 0; i < optStr.length; i++) {
+    const ch = optStr[i];
+    if (ch === '\\' && i + 1 < optStr.length) {
+      i++;
+      continue;
+    }
+    if (ch === '{') {
+      depth++;
+      continue;
+    }
+    if (ch === '}') {
+      depth = Math.max(0, depth - 1);
+      continue;
+    }
+    if (depth === 0) {
+      const sub = optStr.slice(i);
+      const m = sub.match(keyRe);
+      if (m) {
+        // Ensure we didn't match right after another comma inside a word unless at start or comma
+        const valStart = i + m[0].length;
+        const p = skipSpaces(optStr, valStart);
+        if (optStr[p] === '{') {
+          const br = readBalancedBraces(optStr, p);
+          if (br) return br.content.trim();
+        }
+        let end = p;
+        let vDepth = 0;
+        while (end < optStr.length) {
+          const c = optStr[end];
+          if (c === '\\' && end + 1 < optStr.length) {
+            end += 2;
+            continue;
+          }
+          if (c === '{') vDepth++;
+          else if (c === '}') {
+            if (vDepth === 0) break;
+            vDepth--;
+          } else if (c === ',' && vDepth === 0) {
+            break;
+          }
+          end++;
+        }
+        return optStr.slice(p, end).trim();
+      }
+    }
+  }
+  return undefined;
+}
+
+function boldLeadingChoiceMarker(segments: InlineSegment[]): InlineSegment[] {
+  if (segments.length === 0) return segments;
+  const s0 = segments[0];
+  if (s0.type !== 'text') return segments;
+
+  const fullM = s0.content.match(/^(\s*(?:[A-D]\.|[a-d]\))\s*)([\s\S]*)$/);
+  if (fullM) {
+    const labelPart = fullM[1];
+    const restPart = fullM[2];
+    const out: InlineSegment[] = [{ ...s0, content: labelPart, bold: true }];
+    if (restPart) {
+      out.push({ ...s0, content: restPart });
+    }
+    return [...out, ...segments.slice(1)];
+  }
+
+  // Case like \textbf{A}. $(5;2)$ where 'A' and '.' are split across adjacent text segments
+  if (/^\s*(?:[A-D]|[a-d])\s*$/.test(s0.content) && segments[1]?.type === 'text') {
+    const s1 = segments[1];
+    const dotM = s1.content.match(/^([.\)]\s*)([\s\S]*)$/);
+    if (dotM) {
+      const out: InlineSegment[] = [
+        { ...s0, bold: true },
+        { ...s1, content: dotM[1], bold: true },
+      ];
+      if (dotM[2]) {
+        out.push({ ...s1, content: dotM[2] });
+      }
+      return [...out, ...segments.slice(2)];
+    }
+  }
+
+  return segments;
 }
 
 function stripLatexComments(raw: string): string {
@@ -894,6 +1253,122 @@ function normalizeChatGptAndMarkdownBody(input: string): string {
   return s;
 }
 
+function parseDocumentPageConfig(src: string): DocumentPageConfig {
+  const cfg = createDefaultPageConfig();
+
+  const docClsM = src.match(/\\documentclass\s*(?:\[([^\]]*)\])?\s*\{([^}]*)\}/);
+  if (docClsM && docClsM[1]) {
+    const opts = docClsM[1]
+      .split(',')
+      .map((o) => o.trim().toLowerCase());
+    for (const opt of opts) {
+      if (opt === '10pt') cfg.baseFontSizePt = 10;
+      else if (opt === '11pt') cfg.baseFontSizePt = 11;
+      else if (opt === '12pt') cfg.baseFontSizePt = 12;
+      else if (opt === 'a4paper') cfg.pageSize = 'a4';
+      else if (opt === 'a5paper') cfg.pageSize = 'a5';
+      else if (opt === 'letterpaper') cfg.pageSize = 'letter';
+      else if (opt === 'landscape') cfg.isLandscape = true;
+    }
+  }
+
+  const parseGeomSpec = (specStr: string) => {
+    const items = specStr.split(',');
+    for (const item of items) {
+      const trimmed = item.trim();
+      if (!trimmed) continue;
+      const lower = trimmed.toLowerCase();
+      if (lower === 'a4paper') {
+        cfg.pageSize = 'a4';
+        continue;
+      }
+      if (lower === 'a5paper') {
+        cfg.pageSize = 'a5';
+        continue;
+      }
+      if (lower === 'letterpaper') {
+        cfg.pageSize = 'letter';
+        continue;
+      }
+      if (lower === 'landscape') {
+        cfg.isLandscape = true;
+        continue;
+      }
+      if (lower === 'portrait') {
+        cfg.isLandscape = false;
+        continue;
+      }
+      const kv = trimmed.match(/^([a-zA-Z]+)\s*=\s*(.+)$/);
+      if (!kv) continue;
+      const key = kv[1].toLowerCase();
+      const valPt = parseLatexLengthToPt(kv[2], 487.3, cfg.baseFontSizePt);
+      if (valPt === null || !Number.isFinite(valPt) || valPt <= 0) continue;
+      if (key === 'top' || key === 'tmargin') cfg.marginTopPt = valPt;
+      else if (key === 'bottom' || key === 'bmargin') cfg.marginBottomPt = valPt;
+      else if (key === 'left' || key === 'lmargin' || key === 'inner') cfg.marginLeftPt = valPt;
+      else if (key === 'right' || key === 'rmargin' || key === 'outer') cfg.marginRightPt = valPt;
+      else if (key === 'hmargin') {
+        cfg.marginLeftPt = valPt;
+        cfg.marginRightPt = valPt;
+      } else if (key === 'vmargin') {
+        cfg.marginTopPt = valPt;
+        cfg.marginBottomPt = valPt;
+      } else if (key === 'margin') {
+        cfg.marginTopPt = valPt;
+        cfg.marginRightPt = valPt;
+        cfg.marginBottomPt = valPt;
+        cfg.marginLeftPt = valPt;
+      }
+    }
+  };
+
+  const pkgGeomRe = /\\usepackage\s*\[([^\]]+)\]\s*\{geometry\}/g;
+  let gm: RegExpExecArray | null;
+  while ((gm = pkgGeomRe.exec(src)) !== null) {
+    parseGeomSpec(gm[1]);
+  }
+  const geomCmdRe = /\\geometry\s*\{([^}]+)\}/g;
+  while ((gm = geomCmdRe.exec(src)) !== null) {
+    parseGeomSpec(gm[1]);
+  }
+
+  if (/\\onehalfspacing(?![a-zA-Z])/.test(src)) cfg.defaultLineSpacing = 1.35;
+  else if (/\\doublespacing(?![a-zA-Z])/.test(src)) cfg.defaultLineSpacing = 1.75;
+  else if (/\\singlespacing(?![a-zA-Z])/.test(src)) cfg.defaultLineSpacing = 1.15;
+
+  const lsM = src.match(/\\linespread\s*\{([^}]+)\}/);
+  if (lsM) {
+    const f = parseFloat(lsM[1].trim());
+    if (Number.isFinite(f) && f > 0.5 && f <= 2.5) {
+      cfg.defaultLineSpacing = Math.max(1.0, Math.min(2.4, Math.round(f * 1.15 * 100) / 100));
+    }
+  }
+
+  if (/\\usepackage(?:\[[^\]]*\])?\{parskip\}/.test(src)) {
+    cfg.defaultParIndentPt = 0;
+    cfg.defaultParSkipPt = 6;
+  }
+
+  const parIndM = src.match(/\\setlength\s*\{\\parindent\}\s*\{([^}]+)\}/);
+  if (parIndM) {
+    const pt = parseLatexLengthToPt(parIndM[1], 487.3, cfg.baseFontSizePt);
+    if (pt !== null) cfg.defaultParIndentPt = Math.max(0, Math.min(72, pt));
+  }
+
+  const parSkipM = src.match(/\\setlength\s*\{\\parskip\}\s*\{([^}]+)\}/);
+  if (parSkipM) {
+    const pt = parseLatexLengthToPt(parSkipM[1], 487.3, cfg.baseFontSizePt);
+    if (pt !== null) cfg.defaultParSkipPt = Math.max(0, Math.min(36, pt));
+  }
+
+  const portraitW = cfg.pageSize === 'letter' ? 612 : cfg.pageSize === 'a5' ? 419.5 : 595.3;
+  const portraitH = cfg.pageSize === 'letter' ? 792 : cfg.pageSize === 'a5' ? 595.3 : 841.9;
+  const pageW = cfg.isLandscape ? portraitH : portraitW;
+  cfg.contentWidthPt = Math.max(200, pageW - cfg.marginLeftPt - cfg.marginRightPt);
+
+  return cfg;
+}
+
 function preprocessDocumentAndMacros(raw: string): {
   body: string;
   title?: string;
@@ -903,9 +1378,12 @@ function preprocessDocumentAndMacros(raw: string): {
   isVietnamese: boolean;
   customTheorems: Record<string, CustomTheoremDef>;
   customColors: Record<string, string>;
+  defaultTasksLabel?: string;
+  pageConfig: DocumentPageConfig;
 } {
   const normalized = stripLatexComments(raw.replace(/\r\n/g, '\n'));
   const hasDocBegin = /\\begin\{document\}/.test(normalized);
+  const pageConfig = parseDocumentPageConfig(normalized);
 
   const isVietnamese =
     /[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]/i.test(normalized) ||
@@ -1143,39 +1621,53 @@ function preprocessDocumentAndMacros(raw: string): {
     }
   }
 
-  // Parse \definecolor{name}{model}{spec}
-  const colRe = /\\definecolor\s*\{([^}]+)\}\s*\{([^}]+)\}\s*\{([^}]+)\}/g;
-  while ((m = colRe.exec(macroSrc)) !== null) {
-    const cname = m[1].trim().toLowerCase();
-    const model = m[2].trim();
-    const val = m[3].trim();
-    if (model.toUpperCase() === 'HTML' && /^[0-9a-fA-F]{6}$/.test(val)) {
-      customColors[cname] = `#${val.toUpperCase()}`;
-    } else if (model === 'RGB') {
-      const parts = val.split(',').map((p) => Math.max(0, Math.min(255, parseInt(p.trim(), 10) || 0)));
-      if (parts.length === 3) {
-        customColors[cname] =
-          '#' + parts.map((n) => n.toString(16).padStart(2, '0').toUpperCase()).join('');
-      }
-    } else if (model === 'rgb') {
-      const parts = val.split(',').map((p) => Math.max(0, Math.min(1, parseFloat(p.trim()) || 0)));
-      if (parts.length === 3) {
-        customColors[cname] =
-          '#' +
-          parts
-            .map((n) => Math.round(n * 255).toString(16).padStart(2, '0').toUpperCase())
-            .join('');
-      }
+  // Parse \definecolor, \providecolor, \xdefinecolor, and \colorlet in source order
+  const colDeclRe = /\\(definecolor|providecolor|xdefinecolor|colorlet)(?:\s*\[[^\]]*\])?\s*\{/g;
+  while ((m = colDeclRe.exec(macroSrc)) !== null) {
+    const cmd = m[1];
+    const firstBr = readBalancedBraces(macroSrc, m.index + m[0].length - 1);
+    if (!firstBr) continue;
+    const cname = firstBr.content.trim().toLowerCase();
+    if (!cname) continue;
+    let pos = skipSpaces(macroSrc, firstBr.endIdx + 1);
+    if (cmd === 'colorlet') {
+      if (macroSrc[pos] !== '{') continue;
+      const exprBr = readBalancedBraces(macroSrc, pos);
+      if (!exprBr) continue;
+      const resolved = resolveLatexColor(exprBr.content.trim(), customColors);
+      if (resolved) customColors[cname] = resolved;
+    } else {
+      if (macroSrc[pos] !== '{') continue;
+      const modelBr = readBalancedBraces(macroSrc, pos);
+      if (!modelBr) continue;
+      pos = skipSpaces(macroSrc, modelBr.endIdx + 1);
+      if (macroSrc[pos] !== '{') continue;
+      const specBr = readBalancedBraces(macroSrc, pos);
+      if (!specBr) continue;
+      if (cmd === 'providecolor' && customColors[cname]) continue;
+      const resolved = resolveLatexModelAndSpec(modelBr.content.trim(), specBr.content.trim(), customColors);
+      if (resolved) customColors[cname] = resolved;
+    }
+  }
+
+  // Parse \settasks{label=...}
+  let defaultTasksLabel: string | undefined;
+  const setTasksRe = /\\settasks\s*\{/g;
+  while ((m = setTasksRe.exec(macroSrc)) !== null) {
+    const br = readBalancedBraces(macroSrc, m.index + m[0].length - 1);
+    if (br) {
+      const lbl = extractBalancedKeyValOption(br.content, 'label');
+      if (lbl) defaultTasksLabel = lbl;
     }
   }
 
   // Safely strip non-macro preamble commands with balanced braces
   // (macro definitions are processed sequentially in scoped order below so per-figure \def/\pgfmathsetmacro never leaks globally)
-  const preambleThreeArgCmds = /\\(?:definecolor|DeclareMathAlphabet|SetMathAlphabet)(?![a-zA-Z])/;
+  const preambleThreeArgCmds = /\\(?:definecolor|providecolor|xdefinecolor|DeclareMathAlphabet|SetMathAlphabet)(?![a-zA-Z])/;
   const preambleTwoArgCmds =
     /\\(?:setlength|addtolength|setcounter|addtocounter|numberwithin|colorlet|fontsize|lstdefinestyle|DeclareTColorBox|newtcbox|inputansbox|inputans)(?![a-zA-Z])/;
   const preambleOneArgCmds =
-    /\\(?:documentclass|usepackage|RequirePackage|geometry|hypersetup|lstset|tikzset|pgfplotsset|tcbset|tcbuselibrary|setlist|pagestyle|thispagestyle|pagenumbering|bibliographystyle|bibliography|addbibresource|linespread|theoremstyle|newtheoremstyle|graphicspath|DeclareUnicodeCharacter|sisetup|captionsetup|AtBeginDocument|fancyhf|fancyhead|fancyfoot|rhead|lhead|chead|rfoot|lfoot|cfoot|setmainfont|setsansfont|setmonofont|newfontfamily|selectlanguage|usetikzlibrary|usepgfplotslibrary|tkzSetUpPoint|tkzSetUpLine|tkzSetUpLabel|tkzSetUpStyle|tkzTabSetup|titleformat|titlespacing|newtheorem\*?|input|include|allowdisplaybreaks|qedsymbol|showansEX|showans|hideansEX|hideans|ansEX|Opensolutionfile|Closesolutionfile|writelist)(?![a-zA-Z])/;
+    /\\(?:documentclass|usepackage|RequirePackage|geometry|hypersetup|lstset|tikzset|pgfplotsset|tcbset|tcbuselibrary|setlist|settasks|pagestyle|thispagestyle|pagenumbering|bibliographystyle|bibliography|addbibresource|linespread|theoremstyle|newtheoremstyle|graphicspath|DeclareUnicodeCharacter|sisetup|captionsetup|AtBeginDocument|fancyhf|fancyhead|fancyfoot|rhead|lhead|chead|rfoot|lfoot|cfoot|setmainfont|setsansfont|setmonofont|newfontfamily|selectlanguage|usetikzlibrary|usepgfplotslibrary|tkzSetUpPoint|tkzSetUpLine|tkzSetUpLabel|tkzSetUpStyle|tkzTabSetup|titleformat|titlespacing|newtheorem\*?|input|include|allowdisplaybreaks|qedsymbol|showansEX|showans|hideansEX|hideans|ansEX|Opensolutionfile|Closesolutionfile|writelist)(?![a-zA-Z])/;
   const preambleZeroArgCmds =
     /\\(?:onehalfspacing|doublespacing|singlespacing|frenchspacing|makeatletter|makeatother|tableofcontents|listoffigures|listoftables|printbibliography|phantomsection|frontmatter|mainmatter|backmatter|sloppy|fussy|raggedbottom|flushbottom|selectfont|hidesolution|showsolution)(?![a-zA-Z])\s*/g;
 
@@ -1823,14 +2315,18 @@ function preprocessDocumentAndMacros(raw: string): {
     .replace(/\\ifnum\s*\\count\d+\s*(?:<=|>=|<|>|=)\s*-?\d+\s*/g, '')
     .replace(/\\repeat(?![a-zA-Z])\s*/g, '');
 
-  // Break mid-line \noindent (e.g., "Chọn B.\noindent\textbf{Câu 5:}") onto a new line, then strip remaining \noindent
+  // Break mid-line \noindent (e.g., "Chọn B.\noindent\textbf{Câu 5:}") onto a new line
   body = body.replace(/([^\s\n{[\\%])\s*\\noindent(?![a-zA-Z])\s*/g, '$1\n');
-  body = body.replace(/\\noindent(?![a-zA-Z])\s*/g, '');
+  if (pageConfig.defaultParIndentPt > 0) {
+    body = body.replace(/\\noindent(?![a-zA-Z])[ \t]*/g, '\x00NOINDENT\x00');
+  } else {
+    body = body.replace(/\\noindent(?![a-zA-Z])\s*/g, '');
+  }
 
   const isFullLatexDoc =
     hasDocBegin ||
     Boolean(title || author) ||
-    /\\(?:section|subsection|paragraph|maketitle|makebox|dotfill|tikz|immini|begin\{(?:enumerate|itemize|itemchoice|description|tasks|table|tabular|tabularx|longtable|figure|tikzpicture|pgfpicture|picture|abstract|verbatim|lstlisting|tcolorbox|ex|bt|vd|theorem|lemma|definition|proposition|corollary|proof|center|align|subequations|thebibliography))/.test(
+    /\\(?:section|subsection|paragraph|maketitle|makebox|dotfill|tikz|immini|begin\{(?:enumerate|itemize|itemchoice|description|tasks|table|tabular|tabularx|longtable|figure|tikzpicture|pgfpicture|picture|abstract|verbatim|lstlisting|tcolorbox|framed|mdframed|shaded|ex|bt|vd|theorem|lemma|definition|proposition|corollary|proof|center|align|subequations|thebibliography|minipage|multicols))/.test(
       normalized
     ) ||
     Object.keys(customTheorems).some((env) => normalized.includes(`\\begin{${env}}`));
@@ -1846,15 +2342,31 @@ function preprocessDocumentAndMacros(raw: string): {
     isVietnamese,
     customTheorems,
     customColors,
+    defaultTasksLabel,
+    pageConfig,
   };
 }
 
-function normalizeMathContent(latex: string): string {
+function resolveColorsInMath(latex: string, customColors?: Record<string, string>): string {
+  if (!latex.includes('color')) return latex;
+  return latex.replace(
+    /\\(textcolor|color|mathcolor)\s*(?:\[([^\]]+)\])?\s*\{([^}]+)\}/g,
+    (full, cmd: string, model: string | undefined, spec: string) => {
+      const hex = resolveLatexModelAndSpec(model, spec, customColors);
+      if (!hex) return full;
+      const mappedCmd = cmd === 'mathcolor' ? 'textcolor' : cmd;
+      return `\\${mappedCmd}{${hex}}`;
+    }
+  );
+}
+
+function normalizeMathContent(latex: string, ctx?: ParserContext): string {
   let s = latex.trim();
   const eqMatch = s.match(/^\\begin\{(equation\*?|displaymath)\}([\s\S]*)\\end\{\1\}$/);
   if (eqMatch) {
     s = eqMatch[2].trim();
   }
+  s = resolveColorsInMath(s, ctx?.customColors);
   return s
     .replace(/\\label\{[^}]*\}/g, '')
     .replace(/\\tag\*?\{[^}]*\}/g, '')
@@ -2360,10 +2872,14 @@ function makeTextSegment(content: string, style: InlineStyle): InlineSegment {
   };
 }
 
-function makeMathSegment(content: string, style: InlineStyle): InlineSegment {
+function makeMathSegment(
+  content: string,
+  style: InlineStyle,
+  ctx?: ParserContext
+): InlineSegment {
   return {
     type: 'math',
-    content: normalizeMathContent(content),
+    content: normalizeMathContent(content, ctx),
     ...(style.bold ? { bold: true } : {}),
     ...(style.italic ? { italic: true } : {}),
     ...(style.font_size_pt ? { font_size_pt: style.font_size_pt } : {}),
@@ -2418,7 +2934,7 @@ function parseInlineSegmentText(
       const split = splitBareLatexTokens(textBuffer);
       for (const part of split) {
         if (part.type === 'math') {
-          out.push(makeMathSegment(part.content, currentStyle));
+          out.push(makeMathSegment(part.content, currentStyle, ctx));
         } else if (part.content) {
           const cleanTxt = unescapeLatexTextProse(part.content, ctx?.isVietnamese ?? true);
           if (cleanTxt) out.push(makeTextSegment(cleanTxt, currentStyle));
@@ -2446,7 +2962,7 @@ function parseInlineSegmentText(
       if (closeIdx !== -1) {
         flushText();
         const inner = text.slice(i + 2, closeIdx).trim();
-        if (inner) out.push(makeMathSegment(inner, currentStyle));
+        if (inner) out.push(makeMathSegment(inner, currentStyle, ctx));
         i = closeIdx + 2;
         continue;
       }
@@ -2458,7 +2974,7 @@ function parseInlineSegmentText(
       if (closeIdx !== -1) {
         flushText();
         const inner = text.slice(i + 2, closeIdx).trim();
-        if (inner) out.push(makeMathSegment(inner, currentStyle));
+        if (inner) out.push(makeMathSegment(inner, currentStyle, ctx));
         i = closeIdx + 2;
         continue;
       }
@@ -2470,7 +2986,7 @@ function parseInlineSegmentText(
       if (closeIdx !== -1) {
         flushText();
         const inner = text.slice(i + 2, closeIdx).trim();
-        if (inner) out.push(makeMathSegment(inner, currentStyle));
+        if (inner) out.push(makeMathSegment(inner, currentStyle, ctx));
         i = closeIdx + 2;
         continue;
       }
@@ -2492,39 +3008,59 @@ function parseInlineSegmentText(
       if (closeIdx !== -1) {
         flushText();
         const inner = text.slice(i + 1, closeIdx).trim();
-        if (inner) out.push(makeMathSegment(inner, currentStyle));
+        if (inner) out.push(makeMathSegment(inner, currentStyle, ctx));
         i = closeIdx + 1;
         continue;
       }
     }
 
-    // Group { \bf ... }, { \it ... }, { \color{red} ... }, { \Large ... }, or plain {...}
+    // Group { \bf ... }, { \it ... }, { \color{red} ... }, { \Large ... }, or chained switches
     if (text[i] === '{') {
       const br = readBalancedBraces(text, i);
       if (br) {
-        const innerTrimmed = br.content.trimStart();
-        const switchMatch = innerTrimmed.match(
-          /^\\(bfseries|bf|itshape|it|em|slshape|sl|ttfamily|tt|scshape|sc|sffamily|rmfamily|tiny|scriptsize|footnotesize|small|normalsize|large|Large|LARGE|huge|Huge)(?![a-zA-Z])\s*/
-        );
-        const colorSwitchMatch = innerTrimmed.match(/^\\color\{([^}]+)\}\s*/);
-        if (switchMatch || colorSwitchMatch) {
-          flushText();
-          const groupStyle: InlineStyle = { ...currentStyle };
-          let bodyStr = innerTrimmed;
-          if (switchMatch) {
-            const sw = switchMatch[1];
-            bodyStr = innerTrimmed.slice(switchMatch[0].length);
+        let bodyStr = br.content.trimStart();
+        const groupStyle: InlineStyle = { ...currentStyle };
+        let matchedSwitch = false;
+        while (bodyStr.length > 0) {
+          const swM = bodyStr.match(
+            /^\\(bfseries|bf|itshape|it|em|slshape|sl|ttfamily|tt|scshape|sc|sffamily|rmfamily|mdseries|upshape|normalfont|selectfont|normalcolor|tiny|scriptsize|footnotesize|small|normalsize|large|Large|LARGE|huge|Huge)(?![a-zA-Z])\s*/
+          );
+          if (swM) {
+            matchedSwitch = true;
+            const sw = swM[1];
+            bodyStr = bodyStr.slice(swM[0].length);
             if (sw === 'bf' || sw === 'bfseries') groupStyle.bold = true;
+            else if (sw === 'mdseries') groupStyle.bold = false;
             else if (sw === 'it' || sw === 'itshape' || sw === 'em' || sw === 'sl' || sw === 'slshape') {
               groupStyle.italic = true;
+            } else if (sw === 'upshape') groupStyle.italic = false;
+            else if (sw === 'normalfont') {
+              groupStyle.bold = baseStyle.bold;
+              groupStyle.italic = baseStyle.italic;
+              groupStyle.font_size_pt = baseStyle.font_size_pt;
+            } else if (sw === 'normalcolor') {
+              delete groupStyle.color;
             } else if (FONT_SIZE_PT_MAP[sw]) {
               groupStyle.font_size_pt = FONT_SIZE_PT_MAP[sw];
             }
-          } else if (colorSwitchMatch) {
-            bodyStr = innerTrimmed.slice(colorSwitchMatch[0].length);
-            const hex = resolveLatexColor(colorSwitchMatch[1], ctx?.customColors);
-            if (hex) groupStyle.color = hex;
+            continue;
           }
+          const colSwM = bodyStr.match(/^\\color(?:\s*\[([^\]]+)\])?\s*\{([^}]+)\}\s*/);
+          if (colSwM) {
+            matchedSwitch = true;
+            bodyStr = bodyStr.slice(colSwM[0].length);
+            const hex = resolveLatexModelAndSpec(colSwM[1], colSwM[2], ctx?.customColors);
+            if (isBlackLatexColor(colSwM[2], hex)) {
+              delete groupStyle.color;
+            } else if (hex) {
+              groupStyle.color = hex;
+            }
+            continue;
+          }
+          break;
+        }
+        if (matchedSwitch) {
+          flushText();
           out.push(...parseInlineSegmentText(bodyStr, groupStyle, mode, ctx));
           i = br.endIdx + 1;
           continue;
@@ -2549,24 +3085,36 @@ function parseInlineSegmentText(
         }
       }
 
-      // \textcolor{color}{content} or \colorbox{color}{content}
-      const tcMatch = rest.match(/^\\(?:textcolor|colorbox)\s*\{([^}]+)\}\s*\{/);
+      // \textcolor[model]{spec}{content} or \colorbox[model]{spec}{content}
+      const tcMatch = rest.match(/^\\(textcolor|colorbox)(?:\s*\[([^\]]+)\])?\s*\{([^}]+)\}\s*\{/);
       if (tcMatch) {
         const braceStart = i + tcMatch[0].length - 1;
         const br = readBalancedBraces(text, braceStart);
         if (br) {
           flushText();
-          const hex = rest.startsWith('\\textcolor')
-            ? resolveLatexColor(tcMatch[1], ctx?.customColors)
-            : undefined;
-          out.push(
-            ...parseInlineSegmentText(
-              br.content,
-              { ...currentStyle, ...(hex ? { color: hex } : {}) },
-              mode,
-              ctx
-            )
-          );
+          let nextStyle: InlineStyle = { ...currentStyle };
+          if (tcMatch[1] === 'textcolor') {
+            const hex = resolveLatexModelAndSpec(tcMatch[2], tcMatch[3], ctx?.customColors);
+            if (isBlackLatexColor(tcMatch[3], hex)) {
+              delete nextStyle.color;
+            } else if (hex) {
+              nextStyle.color = hex;
+            }
+          }
+          out.push(...parseInlineSegmentText(br.content, nextStyle, mode, ctx));
+          i = br.endIdx + 1;
+          continue;
+        }
+      }
+
+      // \fcolorbox[model]{border}{bg}{content}
+      const fcMatch = rest.match(/^\\fcolorbox(?:\s*\[([^\]]+)\])?\s*\{([^}]+)\}(?:\s*\[[^\]]*\])?\s*\{([^}]+)\}\s*\{/);
+      if (fcMatch) {
+        const braceStart = i + fcMatch[0].length - 1;
+        const br = readBalancedBraces(text, braceStart);
+        if (br) {
+          flushText();
+          out.push(...parseInlineSegmentText(br.content, currentStyle, mode, ctx));
           i = br.endIdx + 1;
           continue;
         }
@@ -2677,12 +3225,34 @@ function parseInlineSegmentText(
       }
 
       // \makebox[w][pos]{content} or \framebox[w][pos]{content}
-      const boxCmdMatch = rest.match(/^\\(makebox|framebox)\*?(?:\s*\[[^\]]*\])*\s*\{/);
+      const boxCmdMatch = rest.match(/^\\(makebox|framebox)\*?(?:\s*\[([^\]]*)\])?(?:\s*\[([^\]]*)\])?\s*\{/);
       if (boxCmdMatch) {
         const braceStart = i + boxCmdMatch[0].length - 1;
         const br = readBalancedBraces(text, braceStart);
         if (br) {
           flushText();
+          const fillOnlyM = br.content.trim().match(/^\\(dotfill|hrulefill|hfill)(?![a-zA-Z])\s*$/);
+          if (fillOnlyM) {
+            const wPt = boxCmdMatch[2]
+              ? parseLatexLengthToPt(boxCmdMatch[2], ctx?.pageConfig.contentWidthPt ?? 487.3, currentStyle.font_size_pt ?? 12)
+              : null;
+            const kind = fillOnlyM[1];
+            const leader: 'none' | 'dot' | 'underscore' =
+              kind === 'dotfill' ? 'dot' : kind === 'hrulefill' ? 'underscore' : 'none';
+            out.push({
+              type: 'text',
+              content: '',
+              tab_before: true,
+              tab_leader: leader,
+              ...(wPt && wPt > 0 ? { tab_width_pt: wPt } : {}),
+            });
+            let after = br.endIdx + 1;
+            while (after < text.length && (text[after] === ' ' || text[after] === '\t')) {
+              after++;
+            }
+            i = after;
+            continue;
+          }
           out.push(...parseInlineSegmentText(br.content, currentStyle, mode, ctx));
           let after = br.endIdx + 1;
           while (after < text.length && (text[after] === ' ' || text[after] === '\t')) {
@@ -2759,7 +3329,7 @@ function parseInlineSegmentText(
         if (br) {
           if (siOneMatch[1] === 'ce') {
             flushText();
-            out.push(makeMathSegment(`\\mathrm{${br.content}}`, currentStyle));
+            out.push(makeMathSegment(`\\mathrm{${br.content}}`, currentStyle, ctx));
           } else {
             textBuffer += br.content
               .replace(/\\per\b/g, '/')
@@ -2809,18 +3379,28 @@ function parseInlineSegmentText(
         }
       }
 
-      // Inline switch without braces: \bfseries, \itshape, \Large, \color{...}
+      // Inline switch without braces: \bfseries, \itshape, \Large, \normalcolor, \color[model]{spec}
       const inlineSwMatch = rest.match(
-        /^\\(bfseries|bf|itshape|it|em|slshape|sl|ttfamily|tt|scshape|sc|sffamily|rmfamily|mdseries|upshape|normalfont|selectfont|tiny|scriptsize|footnotesize|small|normalsize|large|Large|LARGE|huge|Huge)(?![a-zA-Z])\s*/
+        /^\\(bfseries|bf|itshape|it|em|slshape|sl|ttfamily|tt|scshape|sc|sffamily|rmfamily|mdseries|upshape|normalfont|selectfont|normalcolor|tiny|scriptsize|footnotesize|small|normalsize|large|Large|LARGE|huge|Huge)(?![a-zA-Z])\s*/
       );
       if (inlineSwMatch) {
         flushText();
         const sw = inlineSwMatch[1];
         if (sw === 'bf' || sw === 'bfseries') currentStyle = { ...currentStyle, bold: true };
+        else if (sw === 'mdseries') currentStyle = { ...currentStyle, bold: false };
         else if (sw === 'it' || sw === 'itshape' || sw === 'em' || sw === 'sl' || sw === 'slshape') {
           currentStyle = { ...currentStyle, italic: true };
-        } else if (sw === 'normalfont' || sw === 'mdseries' || sw === 'upshape') {
-          currentStyle = { ...baseStyle };
+        } else if (sw === 'upshape') currentStyle = { ...currentStyle, italic: false };
+        else if (sw === 'normalfont') {
+          currentStyle = {
+            ...currentStyle,
+            bold: baseStyle.bold,
+            italic: baseStyle.italic,
+            font_size_pt: baseStyle.font_size_pt,
+          };
+        } else if (sw === 'normalcolor') {
+          const { color: _c, ...withoutColor } = currentStyle;
+          currentStyle = withoutColor;
         } else if (FONT_SIZE_PT_MAP[sw]) {
           currentStyle = { ...currentStyle, font_size_pt: FONT_SIZE_PT_MAP[sw] };
         }
@@ -2828,11 +3408,16 @@ function parseInlineSegmentText(
         continue;
       }
 
-      const inlineColorMatch = rest.match(/^\\color\{([^}]+)\}\s*/);
+      const inlineColorMatch = rest.match(/^\\color(?:\s*\[([^\]]+)\])?\s*\{([^}]+)\}\s*/);
       if (inlineColorMatch) {
         flushText();
-        const hex = resolveLatexColor(inlineColorMatch[1], ctx?.customColors);
-        if (hex) currentStyle = { ...currentStyle, color: hex };
+        const hex = resolveLatexModelAndSpec(inlineColorMatch[1], inlineColorMatch[2], ctx?.customColors);
+        if (isBlackLatexColor(inlineColorMatch[2], hex)) {
+          const { color: _c, ...withoutColor } = currentStyle;
+          currentStyle = withoutColor;
+        } else if (hex) {
+          currentStyle = { ...currentStyle, color: hex };
+        }
         i += inlineColorMatch[0].length;
         continue;
       }
@@ -2875,15 +3460,37 @@ function parseInlineSegmentText(
         continue;
       }
 
+      // Handle \hfill, \dotfill, \hrulefill as explicit tab stop markers (coalescing repeats into tab_weight)
+      const fillMatch = rest.match(/^\\(hfill|dotfill|hrulefill)(?![a-zA-Z])[ \t]*/);
+      if (fillMatch) {
+        flushText();
+        const kind = fillMatch[1];
+        const leader: 'none' | 'dot' | 'underscore' =
+          kind === 'dotfill' ? 'dot' : kind === 'hrulefill' ? 'underscore' : 'none';
+        let repeatCount = 1;
+        let scanPos = i + fillMatch[0].length;
+        while (scanPos < text.length) {
+          const nextM = text.slice(scanPos).match(/^\\(hfill|dotfill|hrulefill)(?![a-zA-Z])[ \t]*/);
+          if (!nextM) break;
+          repeatCount++;
+          scanPos += nextM[0].length;
+        }
+        out.push({
+          type: 'text',
+          content: '',
+          tab_before: true,
+          tab_leader: leader,
+          ...(repeatCount > 1 ? { tab_weight: repeatCount } : {}),
+        });
+        i = scanPos;
+        continue;
+      }
+
       // Ignore benign layout/spacing macros in inline text
       const noopMatch = rest.match(
-        /^\\(?:noindent|indent|centering|raggedright|raggedleft|hspace\*?\{[^}]*\}|vspace\*?\{[^}]*\}|phantom\*?\{[^}]*\}|hphantom\{[^}]*\}|vphantom\{[^}]*\}|fontsize\{[^}]*\}\{[^}]*\}|hfill|vfill|smallskip|medskip|bigskip|par(?![a-zA-Z])|index\{[^}]*\}|phantomsection|protect|relax|ignorespaces|strut|leavevmode|null)\s*/
+        /^\\(?:noindent|indent|centering|raggedright|raggedleft|hspace\*?\{[^}]*\}|vspace\*?\{[^}]*\}|addvspace\{[^}]*\}|phantom\*?\{[^}]*\}|hphantom\{[^}]*\}|vphantom\{[^}]*\}|fontsize\{[^}]*\}\{[^}]*\}|vfill|smallskip|medskip|bigskip|par(?![a-zA-Z])|index\{[^}]*\}|phantomsection|protect|relax|ignorespaces|strut|leavevmode|null)\s*/
       );
       if (noopMatch) {
-        if (noopMatch[0].startsWith('\\hfill')) {
-          flushText();
-          out.push({ type: 'text', content: '    ', tab_before: true });
-        }
         i += noopMatch[0].length;
         continue;
       }
@@ -3194,32 +3801,79 @@ function parseTabularEnvironment(
   colSpecRaw: string,
   bodyRaw: string,
   mode: LatexPasteMode,
-  ctx?: ParserContext
+  ctx?: ParserContext,
+  containerWidthPt?: number
 ): DocumentBlock | null {
   const expandedSpec = expandColumnSpec(colSpecRaw);
-  const hasVertBorders = expandedSpec.includes('|');
-  const colAligns: BlockAlignment[] = [];
+  const availWidthPt = containerWidthPt ?? ctx?.pageConfig.contentWidthPt ?? 487.3;
+  const baseFontPt = ctx?.pageConfig.baseFontSizePt ?? 12;
+
+  interface ColSpecInfo {
+    align: BlockAlignment;
+    widthPt: number | null;
+    bold?: boolean;
+    italic?: boolean;
+  }
+  const colsInfo: ColSpecInfo[] = [];
+  const colBorders: boolean[] = [false];
+  let pendingModAlign: BlockAlignment | null = null;
+  let pendingModBold = false;
+  let pendingModItalic = false;
+
   for (let i = 0; i < expandedSpec.length; i++) {
     const ch = expandedSpec[i];
-    if (ch === 'l') colAligns.push('left');
-    else if (ch === 'c') colAligns.push('center');
-    else if (ch === 'r' || ch === 'S') colAligns.push(ch === 'S' ? 'right' : 'right');
-    else if (ch === 'p' || ch === 'm' || ch === 'b' || ch === 'X') {
-      colAligns.push('left');
+    if (ch === '|') {
+      colBorders[colBorders.length - 1] = true;
+      continue;
+    }
+    if (ch === '>' && expandedSpec[i + 1] === '{') {
+      const br = readBalancedBraces(expandedSpec, i + 1);
+      if (br) {
+        if (/\\centering\b/.test(br.content)) pendingModAlign = 'center';
+        else if (/\\raggedleft\b/.test(br.content)) pendingModAlign = 'right';
+        else if (/\\raggedright\b/.test(br.content)) pendingModAlign = 'left';
+        if (/\\(?:bfseries|bf)\b/.test(br.content)) pendingModBold = true;
+        if (/\\(?:itshape|it|em)\b/.test(br.content)) pendingModItalic = true;
+        i = br.endIdx;
+        continue;
+      }
+    }
+    if (ch === '<' || ch === '@' || ch === '!') {
       if (expandedSpec[i + 1] === '{') {
         const br = readBalancedBraces(expandedSpec, i + 1);
         if (br) i = br.endIdx;
       }
-    } else if ((ch === '>' || ch === '<' || ch === '@' || ch === '!') && expandedSpec[i + 1] === '{') {
-      const br = readBalancedBraces(expandedSpec, i + 1);
-      if (br) i = br.endIdx;
+      continue;
+    }
+    if (ch === 'l' || ch === 'c' || ch === 'r' || ch === 'S' || ch === 'p' || ch === 'm' || ch === 'b' || ch === 'X') {
+      let widthPt: number | null = null;
+      if ((ch === 'p' || ch === 'm' || ch === 'b') && expandedSpec[i + 1] === '{') {
+        const br = readBalancedBraces(expandedSpec, i + 1);
+        if (br) {
+          widthPt = parseLatexLengthToPt(br.content, availWidthPt, baseFontPt);
+          i = br.endIdx;
+        }
+      }
+      const align: BlockAlignment =
+        pendingModAlign ?? (ch === 'c' ? 'center' : ch === 'r' || ch === 'S' ? 'right' : 'left');
+      colsInfo.push({
+        align,
+        widthPt,
+        bold: pendingModBold || undefined,
+        italic: pendingModItalic || undefined,
+      });
+      colBorders.push(false);
+      pendingModAlign = null;
+      pendingModBold = false;
+      pendingModItalic = false;
     }
   }
 
-  const hasHline = /\\(?:hline|toprule|midrule|bottomrule|cline|cmidrule|specialrule)/.test(bodyRaw);
+  const hasVertBorders = colBorders.some(Boolean);
+  const hasBooktabs = /\\(?:toprule|midrule|bottomrule|cmidrule)\b/.test(bodyRaw);
+  const hasHline = hasBooktabs || /\\(?:hline|cline|Xhline|Xcline|specialrule)\b/.test(bodyRaw);
   const hasMidrule = /\\midrule\b/.test(bodyRaw);
 
-  // Strip longtable header/footer markers and \caption inside longtable
   let cleanedBody = bodyRaw
     .replace(/\\(?:endfirsthead|endhead|endfoot|endlastfoot)(?![a-zA-Z])/g, '')
     .replace(/\\addlinespace(?:\[[^\]]*\])?/g, '')
@@ -3228,10 +3882,31 @@ function parseTabularEnvironment(
 
   const rawRows = splitUnescaped(cleanedBody, '\\\\');
   const tableRows: TableCellData[][] = [];
-  const rowHadRuleAfter: boolean[] = [];
+  const rowHadRuleAbove: boolean[] = [];
+  const rowHadRuleBelow: boolean[] = [];
+  const rowRuleColsBelow: Array<Array<[number, number]> | null> = [];
+
+  const extractRuleInfo = (segment: string): { hasFullRule: boolean; clines: Array<[number, number]> } => {
+    const hasFullRule = /\\(?:hline|toprule|midrule|bottomrule|Xhline)(?![a-zA-Z])/.test(segment);
+    const clines: Array<[number, number]> = [];
+    const clineRe = /\\(?:cline|Xcline|cmidrule)(?:\([^)]*\))?(?:\[[^\]]*\])?\s*\{(\d+)\s*-\s*(\d+)\}/g;
+    let cm: RegExpExecArray | null;
+    while ((cm = clineRe.exec(segment)) !== null) {
+      const a = Math.max(0, parseInt(cm[1], 10) - 1);
+      const b = Math.max(a, parseInt(cm[2], 10) - 1);
+      clines.push([a, b]);
+    }
+    return { hasFullRule, clines };
+  };
+
+  let pendingRuleAboveNextRow = false;
 
   for (let rIdx = 0; rIdx < rawRows.length; rIdx++) {
     const rawRow = rawRows[rIdx].replace(/^\*?\s*\[[^\]]*\]\s*/, '');
+    const rowColorM = rawRow.match(/\\rowcolor(?:\[[^\]]*\])?\{([^}]+)\}/);
+    const rowFillHex = rowColorM ? resolveLatexColor(rowColorM[1], ctx?.customColors) : undefined;
+
+    const { hasFullRule: startsWithFullRule, clines: startClines } = extractRuleInfo(rawRow);
     const cleanedRow = rawRow
       .replace(/\\(?:hline|toprule|midrule|bottomrule)(?![a-zA-Z])(?:\[[^\]]*\])?/g, '')
       .replace(/\\(?:Xhline|Xcline|cline)\{[^}]*\}/g, '')
@@ -3240,20 +3915,28 @@ function parseTabularEnvironment(
       .trim();
 
     if (!cleanedRow) {
-      if (/\\(?:midrule|hline)\b/.test(rawRow) && rowHadRuleAfter.length > 0) {
-        rowHadRuleAfter[rowHadRuleAfter.length - 1] = true;
+      if ((hasFullRuleOnly(rawRow) || startsWithFullRule || startClines.length > 0) && tableRows.length > 0) {
+        if (startsWithFullRule) rowHadRuleBelow[rowHadRuleBelow.length - 1] = true;
+        if (startClines.length > 0) rowRuleColsBelow[rowRuleColsBelow.length - 1] = startClines;
+      } else if (startsWithFullRule) {
+        pendingRuleAboveNextRow = true;
       }
       continue;
     }
 
     const nextRow = (rawRows[rIdx + 1] ?? '').replace(/^\*?\s*\[[^\]]*\]\s*/, '');
-    const nextStartsWithRule = /^\s*\\(?:midrule|hline)\b/.test(nextRow);
+    const nextRuleInfo = extractRuleInfo(nextRow);
 
     const rawCells = splitUnescaped(cleanedRow, '&');
     const rowCells: TableCellData[] = [];
     let colIdx = 0;
 
     for (const rawCell of rawCells) {
+      const cellColorM = rawCell.match(/\\cellcolor(?:\[[^\]]*\])?\{([^}]+)\}/);
+      const cellFillHex = cellColorM
+        ? resolveLatexColor(cellColorM[1], ctx?.customColors)
+        : rowFillHex;
+
       let cellTrimmed = rawCell
         .replace(/\\cellcolor(?:\[[^\]]*\])?\{[^}]*\}/g, '')
         .trim();
@@ -3270,42 +3953,117 @@ function parseTabularEnvironment(
           : 'left';
         const br = readBalancedBraces(cellTrimmed, mcMatch[0].length - 1);
         const content = br ? unwrapMultirowCell(br.content).trim() : cellTrimmed;
+        const cInfo = colsInfo[colIdx];
         rowCells.push({
-          segments: parseInlineSegmentText(content, {}, mode, ctx),
+          segments: parseInlineSegmentText(
+            content,
+            { bold: cInfo?.bold, italic: cInfo?.italic },
+            mode,
+            ctx
+          ),
           alignment: mcAlign,
           col_span: span,
           is_header: false,
+          ...(cellFillHex ? { fill_color: cellFillHex } : {}),
         });
         colIdx += span;
       } else {
-        const align = colAligns[colIdx] ?? 'left';
+        const cInfo = colsInfo[colIdx];
+        const align = cInfo?.align ?? 'left';
         rowCells.push({
-          segments: parseInlineSegmentText(cellTrimmed, {}, mode, ctx),
+          segments: parseInlineSegmentText(
+            cellTrimmed,
+            { bold: cInfo?.bold, italic: cInfo?.italic },
+            mode,
+            ctx
+          ),
           alignment: align,
           is_header: false,
+          ...(cellFillHex ? { fill_color: cellFillHex } : {}),
         });
         colIdx++;
       }
     }
 
     if (rowCells.length > 0) {
+      const hasTopHere = startsWithFullRule || pendingRuleAboveNextRow;
+      pendingRuleAboveNextRow = false;
+      const hasBotHere = nextRuleInfo.hasFullRule;
       tableRows.push(rowCells);
-      rowHadRuleAfter.push(nextStartsWithRule);
+      rowHadRuleAbove.push(hasTopHere);
+      rowHadRuleBelow.push(hasBotHere);
+      rowRuleColsBelow.push(nextRuleInfo.clines.length > 0 ? nextRuleInfo.clines : null);
     }
+  }
+
+  function hasFullRuleOnly(s: string): boolean {
+    return /\\(?:hline|toprule|midrule|bottomrule|Xhline)(?![a-zA-Z])/.test(s);
   }
 
   if (tableRows.length === 0) return null;
 
-  // Mark header row if booktabs \midrule or \hline separates row 0 from data rows
-  if (tableRows.length > 1 && (hasMidrule || rowHadRuleAfter[0])) {
+  const maxCols = Math.max(...tableRows.map((r) => r.reduce((a, c) => a + (c.col_span ?? 1), 0)), 1);
+
+  // Assign width_pct if any column had explicit p{...}/m{...}/b{...} widths
+  if (colsInfo.some((c) => c.widthPt !== null && c.widthPt > 0)) {
+    const knownPt = colsInfo.reduce((s, c) => s + (c.widthPt ?? 0), 0);
+    const unknownCount = colsInfo.filter((c) => c.widthPt === null).length;
+    const remPt = Math.max(unknownCount * 42, availWidthPt - knownPt);
+    const fallbackW = unknownCount > 0 ? remPt / unknownCount : 0;
+    const rawWidths = Array.from({ length: maxCols }, (_, idx) => colsInfo[idx]?.widthPt ?? (fallbackW || 60));
+    const totalW = Math.max(1, rawWidths.reduce((a, b) => a + b, 0));
+    const pcts = rawWidths.map((w) => Math.round((w / totalW) * 1000) / 10);
+
+    for (const row of tableRows) {
+      let cCursor = 0;
+      for (const cell of row) {
+        const span = cell.col_span ?? 1;
+        if (span === 1 && pcts[cCursor] > 0) {
+          cell.width_pct = pcts[cCursor];
+        }
+        cCursor += span;
+      }
+    }
+  }
+
+  const tableStyle: DocumentBlock['table_style'] =
+    !hasVertBorders && !hasHline
+      ? 'borderless'
+      : hasBooktabs && !hasVertBorders
+      ? 'booktabs'
+      : !hasVertBorders && hasHline
+      ? 'booktabs'
+      : 'grid';
+
+  // Apply per-cell rule flags (critical for booktabs \toprule / \midrule / \bottomrule / \cline)
+  tableRows.forEach((row, rIdx) => {
+    const topRule = rowHadRuleAbove[rIdx] || (rIdx === 0 && tableStyle !== 'borderless');
+    const botRule = rowHadRuleBelow[rIdx] || (rIdx === tableRows.length - 1 && tableStyle !== 'borderless');
+    const clines = rowRuleColsBelow[rIdx];
+    let cCursor = 0;
+    row.forEach((cell) => {
+      const span = cell.col_span ?? 1;
+      if (topRule) cell.border_top = true;
+      if (botRule) cell.border_bottom = true;
+      if (clines) {
+        const hitsCline = clines.some(([a, b]) => cCursor <= b && cCursor + span - 1 >= a);
+        if (hitsCline) cell.border_bottom = true;
+      }
+      cCursor += span;
+    });
+  });
+
+  if (tableRows.length > 1 && (hasMidrule || rowHadRuleBelow[0])) {
     tableRows[0] = tableRows[0].map((c) => ({ ...c, is_header: true }));
   }
 
   return {
     block_type: 'table',
     alignment: 'center',
-    table_borderless: !(hasVertBorders || hasHline),
-    font_size_pt: 11,
+    table_borderless: tableStyle === 'borderless',
+    table_style: tableStyle,
+    ...(colBorders.length === maxCols + 1 ? { table_col_borders: colBorders } : {}),
+    font_size_pt: Math.min(baseFontPt, 11),
     line_spacing: 1.15,
     table_rows: tableRows,
   };
@@ -3374,11 +4132,11 @@ function stripLeadingInlineCommands(line: string): string {
   let s = line.trim();
   let prev = '';
   let guard = 0;
-  while (s !== prev && guard < 8) {
+  while (s !== prev && guard < 10) {
     prev = s;
     guard++;
     const styleCmdM = s.match(
-      /^\\(?:textbf|textit|emph|underline|text|mbox|hbox|centerline|makebox|framebox)(?:\[[^\]]*\])?\s*\{/
+      /^\\(?:textbf|textit|emph|underline|text|mbox|hbox|fbox|boxed|centerline|leftline|rightline|makebox|framebox)\*?(?:\s*\[[^\]]*\])*\s*\{/
     );
     if (styleCmdM) {
       const br = readBalancedBraces(s, styleCmdM[0].length - 1);
@@ -3389,7 +4147,7 @@ function stripLeadingInlineCommands(line: string): string {
         continue;
       }
     }
-    const tcM = s.match(/^\\textcolor\s*\{[^}]*\}\s*\{/);
+    const tcM = s.match(/^\\(?:textcolor|colorbox)(?:\s*\[[^\]]*\])?\s*\{[^}]*\}\s*\{/);
     if (tcM) {
       const br = readBalancedBraces(s, tcM[0].length - 1);
       if (br) {
@@ -3399,28 +4157,50 @@ function stripLeadingInlineCommands(line: string): string {
         continue;
       }
     }
+    const fcM = s.match(/^\\fcolorbox(?:\s*\[[^\]]*\])?\s*\{[^}]*\}(?:\s*\[[^\]]*\])?\s*\{[^}]*\}\s*\{/);
+    if (fcM) {
+      const br = readBalancedBraces(s, fcM[0].length - 1);
+      if (br) {
+        const restAfter = s.slice(br.endIdx + 1);
+        const sep = !restAfter || /^[\s.,;:!?)]/.test(restAfter) ? '' : ' ';
+        s = `${br.content}${sep}${restAfter}`.trim();
+        continue;
+      }
+    }
     s = s
-      .replace(/^\\(?:noindent|indent|centering|raggedright|raggedleft|par)(?![a-zA-Z])\s*/, '')
-      .replace(/^\{\s*\\(?:bf|bfseries|it|itshape|em|large|Large|LARGE|normalsize)\b\s*/, '')
+      .replace(/^\\(?:noindent|indent|centering|raggedright|raggedleft|par|normalcolor|normalfont|mdseries|upshape|qquad|quad|enspace)(?![a-zA-Z])\s*/, '')
+      .replace(/^\\(?:hspace\*?\{[^}]*\}|color(?:\s*\[[^\]]*\])?\s*\{[^}]*\})\s*/, '')
+      .replace(/^\\(?:tiny|scriptsize|footnotesize|small|normalsize|large|Large|LARGE|huge|Huge)(?![a-zA-Z])\s*/, '')
+      .replace(/^\{\s*\\(?:bf|bfseries|it|itshape|em|large|Large|LARGE|normalsize|color(?:\[[^\]]*\])?\{[^}]*\})\b\s*/, '')
+      .replace(/^~\s*/, '')
       .trim();
   }
   return s;
 }
 
-function normalizeChoiceMarkerLine(line: string): string {
-  return line
-    .trim()
-    .replace(/^\\textbf\s*\{\s*([A-D]\.|[a-d]\))\s*\}/, '$1')
-    .replace(/^\\textbf\s*\{\s*([A-D]|[a-d])\s*\}\s*([.\)])/, '$1$2')
-    .replace(/^\{\s*\\(?:bf|bfseries)\s+([A-D]\.|[a-d]\))\s*\}/, '$1')
-    .trim();
+function unwrapOuterLayoutBox(line: string): string {
+  let s = line.trim().replace(/\\\\\*?(?:\s*\[[^\]]*\])?\s*$/, '').trim();
+  s = s.replace(/\\(?:qquad|quad|hfill|enspace|hspace\*?\{[^}]*\}|par(?![a-zA-Z]))\s*$/, '').trim();
+  let guard = 0;
+  while (guard < 6) {
+    guard++;
+    const m = s.match(/^\\(?:makebox|framebox|parbox|fbox|mbox|hbox)\*?(?:\s*\[[^\]]*\])*(?:\s*\{[^}]*\}(?=\s*\{))?\s*\{/);
+    if (!m) break;
+    const br = readBalancedBraces(s, m[0].length - 1);
+    if (!br) break;
+    if (s.slice(br.endIdx + 1).trim()) break;
+    s = br.content.trim();
+  }
+  return s;
 }
 
 function isLineBreakBoundary(prevLine: string, nextLine: string): boolean {
   if (!prevLine || !nextLine) return true;
-  if (/\\\\(?:\[[^\]]*\])?\s*$/.test(prevLine) || /\\newline\s*$/.test(prevLine)) return true;
+  if (/\\\\(?:\[[^\]]*\])?\s*$/.test(prevLine) || /\\(?:newline|par)(?![a-zA-Z])\s*$/.test(prevLine)) {
+    return true;
+  }
   if (
-    /^\\(?:section|subsection|subsubsection|paragraph|subparagraph|chapter|part|item|bibitem|begin|end|hline|hrule|newpage|clearpage|cleardoublepage|pagebreak|maketitle|appendix|tableofcontents|listoffigures|listoftables|caption|includegraphics|makebox|framebox|parbox)/.test(
+    /^\\(?:section|subsection|subsubsection|paragraph|subparagraph|chapter|part|item|bibitem|begin|end|hline|hrule|newpage|clearpage|cleardoublepage|pagebreak|maketitle|appendix|tableofcontents|listoffigures|listoftables|caption|includegraphics|makebox|framebox|parbox|centerline|leftline|rightline|vspace|smallskip|medskip|bigskip|par(?![a-zA-Z])|Large|LARGE|large|huge|Huge|bfseries|color(?![a-zA-Z]))/.test(
       nextLine
     )
   ) {
@@ -3455,7 +4235,7 @@ function isLineBreakBoundary(prevLine: string, nextLine: string): boolean {
   ) {
     return true;
   }
-  if (/^([A-D]\.|[a-d]\))\s+/.test(cleanNext)) return true;
+  if (/^([A-D]\.|[a-d]\))(?:\s+|(?=\$|\\[\(\[]))/.test(cleanNext)) return true;
   if (isPureBareLatexLine(nextLine) || isPureBareLatexLine(prevLine)) return true;
   return false;
 }
@@ -3628,9 +4408,14 @@ function parseExEnvironment(
   body: string,
   envKind: 'ex' | 'bt' | 'vd',
   ctx: ParserContext,
-  mode: LatexPasteMode
+  mode: LatexPasteMode,
+  parentOpts?: BlockParseOptions
 ): DocumentBlock[] {
   const blocks: DocumentBlock[] = [];
+  const baseFontPt = parentOpts?.baseFontSizePt ?? ctx.pageConfig.baseFontSizePt ?? 12;
+  const lineSp = parentOpts?.defaultLineSpacing ?? ctx.pageConfig.defaultLineSpacing ?? 1.18;
+  const containerW = parentOpts?.containerWidthPt ?? ctx.pageConfig.contentWidthPt;
+
   const labelPrefix =
     envKind === 'ex'
       ? `Câu ${nextCounter(ctx, 'ex')}. `
@@ -3664,8 +4449,8 @@ function parseExEnvironment(
         shortAnsBlock = {
           block_type: 'paragraph',
           alignment: 'right',
-          font_size_pt: 12,
-          line_spacing: 1.15,
+          font_size_pt: baseFontPt,
+          line_spacing: lineSp,
           segments: [
             { type: 'text', content: 'Đáp án: ', bold: true, color: '#B91C1C' },
             ...parseInlineSegmentText(ansRaw, { bold: true, color: '#B91C1C' }, mode, ctx),
@@ -3697,6 +4482,9 @@ function parseExEnvironment(
         : cmdName === 'haicot'
         ? 2
         : 4;
+      const explicitColOverride = Boolean(
+        chMatch[2] || cmdName === 'motcot' || cmdName === 'haicot' || cmdName === 'boncot' || isTF
+      );
       const cells: TableCellData[] = extracted.args.map((arg, idx) => ({
         segments: [
           { type: 'text', content: `${labels[idx]} `, bold: true },
@@ -3716,7 +4504,8 @@ function parseExEnvironment(
         alignment: 'left',
         table_borderless: true,
         is_choice_block: true,
-        font_size_pt: 12,
+        preserve_col_count: explicitColOverride,
+        font_size_pt: baseFontPt,
         line_spacing: 1.15,
         table_rows: rows,
       };
@@ -3728,22 +4517,47 @@ function parseExEnvironment(
     defaultAlign: 'justify',
     isFullLatexDoc: true,
     listDepth: 0,
-    indentLeftPt: 0,
+    indentLeftPt: parentOpts?.indentLeftPt ?? 0,
+    containerWidthPt: containerW,
+    baseFontSizePt: baseFontPt,
+    defaultLineSpacing: lineSp,
+    defaultColor: parentOpts?.defaultColor,
   });
 
   if (stemPages.length > 0 && stemPages[0].length > 0) {
     const firstBlk = stemPages[0][0];
     if (firstBlk.block_type === 'paragraph' && firstBlk.segments) {
       firstBlk.segments = [
-        { type: 'text', content: labelPrefix, bold: true },
+        { type: 'text', content: labelPrefix, bold: true, ...(parentOpts?.defaultColor ? { color: parentOpts.defaultColor } : {}) },
         ...firstBlk.segments,
       ];
+    } else if (
+      firstBlk.block_type === 'table' &&
+      firstBlk.table_rows?.[0]?.[0]?.blocks &&
+      firstBlk.table_rows[0][0].blocks.length > 0
+    ) {
+      const innerFirst = firstBlk.table_rows[0][0].blocks[0];
+      if (innerFirst.block_type === 'paragraph' && innerFirst.segments) {
+        innerFirst.segments = [
+          { type: 'text', content: labelPrefix, bold: true, ...(parentOpts?.defaultColor ? { color: parentOpts.defaultColor } : {}) },
+          ...innerFirst.segments,
+        ];
+      } else {
+        firstBlk.table_rows[0][0].blocks.unshift({
+          block_type: 'paragraph',
+          alignment: 'left',
+          font_size_pt: baseFontPt,
+          line_spacing: lineSp,
+          segments: [{ type: 'text', content: labelPrefix.trim(), bold: true, ...(parentOpts?.defaultColor ? { color: parentOpts.defaultColor } : {}) }],
+        });
+      }
     } else {
       blocks.push({
         block_type: 'paragraph',
         alignment: 'left',
-        font_size_pt: 12,
-        segments: [{ type: 'text', content: labelPrefix.trim(), bold: true }],
+        font_size_pt: baseFontPt,
+        line_spacing: lineSp,
+        segments: [{ type: 'text', content: labelPrefix.trim(), bold: true, ...(parentOpts?.defaultColor ? { color: parentOpts.defaultColor } : {}) }],
       });
     }
     blocks.push(...stemPages.flat());
@@ -3751,8 +4565,9 @@ function parseExEnvironment(
     blocks.push({
       block_type: 'paragraph',
       alignment: 'left',
-      font_size_pt: 12,
-      segments: [{ type: 'text', content: labelPrefix.trim(), bold: true }],
+      font_size_pt: baseFontPt,
+      line_spacing: lineSp,
+      segments: [{ type: 'text', content: labelPrefix.trim(), bold: true, ...(parentOpts?.defaultColor ? { color: parentOpts.defaultColor } : {}) }],
     });
   }
 
@@ -3764,7 +4579,11 @@ function parseExEnvironment(
       defaultAlign: 'justify',
       isFullLatexDoc: true,
       listDepth: 0,
-      indentLeftPt: 0,
+      indentLeftPt: parentOpts?.indentLeftPt ?? 0,
+      containerWidthPt: containerW,
+      baseFontSizePt: baseFontPt,
+      defaultLineSpacing: lineSp,
+      defaultColor: parentOpts?.defaultColor,
     });
     const flatSol = solPages.flat();
     if (flatSol.length > 0) {
@@ -3783,8 +4602,8 @@ function parseExEnvironment(
         flatSol.unshift({
           block_type: 'paragraph',
           alignment: 'left',
-          font_size_pt: 12,
-          line_spacing: 1.18,
+          font_size_pt: baseFontPt,
+          line_spacing: lineSp,
           segments: [{ type: 'text', content: 'Lời giải.', bold: true, italic: true }],
         });
       }
@@ -3800,6 +4619,12 @@ interface BlockParseOptions {
   isFullLatexDoc: boolean;
   listDepth: number;
   indentLeftPt: number;
+  containerWidthPt?: number;
+  baseFontSizePt?: number;
+  defaultLineSpacing?: number;
+  defaultBold?: boolean;
+  defaultItalic?: boolean;
+  defaultColor?: string;
   meta?: { title?: string; author?: string; date?: string };
 }
 
@@ -3843,7 +4668,7 @@ function registerLabelsInMath(rawMath: string, envName: string, ctx: ParserConte
   }
 }
 
-function formatEnumItemBullet(
+function expandEnumPattern(
   enumLabelOpt: string | undefined,
   envName: string,
   nextDepth: number,
@@ -3860,26 +4685,47 @@ function formatEnumItemBullet(
     return `${String.fromCharCode(97 + (itemIdx % 26))}) `;
   }
   if (enumLabelOpt) {
-    if (/\\alph\*/.test(enumLabelOpt)) {
-      const ch = String.fromCharCode(97 + (itemIdx % 26));
-      return `${enumLabelOpt.replace(/\\alph\*/, ch).trim()} `;
+    let s = enumLabelOpt;
+    if (/\\alph\*/.test(s)) {
+      s = s.replace(/\\alph\*/g, String.fromCharCode(97 + (itemIdx % 26)));
     }
-    if (/\\Alph\*/.test(enumLabelOpt)) {
-      const ch = String.fromCharCode(65 + (itemIdx % 26));
-      return `${enumLabelOpt.replace(/\\Alph\*/, ch).trim()} `;
+    if (/\\Alph\*/.test(s)) {
+      s = s.replace(/\\Alph\*/g, String.fromCharCode(65 + (itemIdx % 26)));
     }
-    if (/\\roman\*/.test(enumLabelOpt)) {
+    if (/\\roman\*/.test(s)) {
       const romans = ['i', 'ii', 'iii', 'iv', 'v', 'vi', 'vii', 'viii', 'ix', 'x'];
-      const r = romans[itemIdx] ?? String(itemIdx + 1);
-      return `${enumLabelOpt.replace(/\\roman\*/, r).trim()} `;
+      s = s.replace(/\\roman\*/g, romans[itemIdx] ?? String(itemIdx + 1));
     }
-    if (/\\arabic\*/.test(enumLabelOpt)) {
-      return `${enumLabelOpt.replace(/\\arabic\*/, String(itemIdx + 1)).trim()} `;
+    if (/\\Roman\*/.test(s)) {
+      s = s.replace(/\\Roman\*/g, toRoman(itemIdx + 1));
     }
+    if (/\\arabic\*/.test(s)) {
+      s = s.replace(/\\arabic\*/g, String(itemIdx + 1));
+    }
+    return `${s.trim()} `;
   }
   return nextDepth === 1
     ? `${itemIdx + 1}. `
     : `(${String.fromCharCode(97 + (itemIdx % 26))}) `;
+}
+
+function buildEnumBulletSegments(
+  enumLabelOpt: string | undefined,
+  envName: string,
+  nextDepth: number,
+  itemIdx: number,
+  customLabel: string | undefined,
+  baseStyle: InlineStyle,
+  mode: LatexPasteMode,
+  ctx?: ParserContext
+): InlineSegment[] {
+  const expanded = expandEnumPattern(enumLabelOpt, envName, nextDepth, itemIdx, customLabel);
+  const defaultBold =
+    (envName === 'enumerate' || envName === 'enumerate*' || envName === 'inparaenum' || envName === 'itemchoice' || envName === 'description') &&
+    (!enumLabelOpt || /\\(?:textbf|bfseries|bf)\b/.test(enumLabelOpt));
+  const segs = parseInlineSegmentText(expanded, { ...baseStyle, bold: baseStyle.bold || defaultBold }, mode, ctx);
+  if (segs.length > 0) return segs;
+  return [{ type: 'text', content: expanded, ...baseStyle, ...(defaultBold ? { bold: true } : {}) }];
 }
 
 function toRoman(num: number): string {
@@ -3907,14 +4753,202 @@ function parseBodyBlocks(
   mode: LatexPasteMode,
   opts: BlockParseOptions
 ): DocumentBlock[][] {
+  const containerW = opts.containerWidthPt ?? ctx.pageConfig.contentWidthPt ?? 487.3;
+  const baseFontPt = opts.baseFontSizePt ?? ctx.pageConfig.baseFontSizePt ?? 12;
+  const defaultLineSp = opts.defaultLineSpacing ?? ctx.pageConfig.defaultLineSpacing ?? 1.18;
+
+  let scopeAlign: BlockAlignment = opts.defaultAlign;
+  let scopeFontSizePt = baseFontPt;
+  let scopeBold = opts.defaultBold ?? false;
+  let scopeItalic = opts.defaultItalic ?? false;
+  let scopeColor = opts.defaultColor;
+  let pendingSpaceBeforePt: number | null = null;
+
   const pages: DocumentBlock[][] = [[]];
   const pushBlock = (blk: DocumentBlock) => {
-    pages[pages.length - 1].push(blk);
+    let target = blk;
+    if (pendingSpaceBeforePt !== null) {
+      target = {
+        ...blk,
+        space_before_pt:
+          typeof blk.space_before_pt === 'number'
+            ? blk.space_before_pt + pendingSpaceBeforePt
+            : pendingSpaceBeforePt,
+      };
+      pendingSpaceBeforePt = null;
+    }
+    pages[pages.length - 1].push(target);
   };
   const pushPageBreak = () => {
     if (pages[pages.length - 1].length > 0) {
       pages.push([]);
     }
+  };
+
+  const buildTabStopSpecs = (
+    segs: InlineSegment[],
+    indentLeftPt: number,
+    fontPt: number
+  ): TabStopSpec[] | undefined => {
+    const tabIndices: number[] = [];
+    segs.forEach((s, idx) => {
+      if (s.tab_before) tabIndices.push(idx);
+    });
+    if (tabIndices.length === 0) return undefined;
+    const availW = Math.max(120, containerW - indentLeftPt);
+
+    const estimateSegGroupWidthPt = (group: InlineSegment[]): number => {
+      let w = 0;
+      for (const s of group) {
+        const pt = s.font_size_pt ?? fontPt;
+        const txt = (s.content ?? '').trim();
+        if (!txt) continue;
+        if (s.type === 'math') {
+          w += Math.max(12, txt.length * pt * 0.42);
+        } else {
+          w += txt.length * pt * (s.bold ? 0.51 : 0.47);
+        }
+      }
+      return w;
+    };
+
+    const groups: InlineSegment[][] = [];
+    groups.push(segs.slice(0, tabIndices[0]));
+    for (let k = 0; k < tabIndices.length; k++) {
+      const start = tabIndices[k];
+      const end = k + 1 < tabIndices.length ? tabIndices[k + 1] : segs.length;
+      groups.push(segs.slice(start, end));
+    }
+
+    const groupWidths = groups.map(estimateSegGroupWidthPt);
+    const totalGroupW = groupWidths.reduce((a, b) => a + b, 0);
+    const fixedTabsW = tabIndices.reduce((s, tIdx) => s + (segs[tIdx].tab_width_pt ?? 0), 0);
+    const totalStretchWeight = Math.max(
+      1,
+      tabIndices.reduce((s, tIdx) => s + (segs[tIdx].tab_width_pt ? 0 : segs[tIdx].tab_weight ?? 1), 0)
+    );
+    const remainingStretchW = Math.max(40, availW - totalGroupW - fixedTabsW);
+
+    const specs: TabStopSpec[] = [];
+    let cursorPt = indentLeftPt + groupWidths[0];
+
+    for (let k = 0; k < tabIndices.length; k++) {
+      const tSeg = segs[tabIndices[k]];
+      const leader = tSeg.tab_leader ?? 'none';
+      const weight = tSeg.tab_weight ?? 1;
+      const fixedW = tSeg.tab_width_pt;
+      const tabSpanW =
+        fixedW && fixedW > 0
+          ? fixedW
+          : remainingStretchW * (weight / totalStretchWeight);
+
+      if (k === tabIndices.length - 1) {
+        if (fixedW && fixedW > 0) {
+          const endPos = Math.min(indentLeftPt + availW, Math.round((cursorPt + fixedW) * 10) / 10);
+          specs.push({
+            pos_pt: endPos,
+            align: 'right',
+            leader,
+            fixed_width_pt: fixedW,
+          });
+        } else {
+          specs.push({
+            pos_pt: null,
+            align: 'right',
+            leader,
+            weight,
+          });
+        }
+      } else {
+        const isSymmetricCenterTwoTab =
+          tabIndices.length === 2 &&
+          k === 0 &&
+          !fixedW &&
+          !segs[tabIndices[1]].tab_width_pt &&
+          groupWidths[2] > 0 &&
+          weight === (segs[tabIndices[1]].tab_weight ?? 1);
+
+        if (isSymmetricCenterTwoTab) {
+          specs.push({
+            pos_pt: Math.round((indentLeftPt + availW * 0.5) * 10) / 10,
+            align: 'center',
+            leader,
+            weight,
+          });
+        } else {
+          const tabEnd = Math.min(indentLeftPt + availW - 24, Math.round((cursorPt + tabSpanW) * 10) / 10);
+          specs.push({
+            pos_pt: tabEnd,
+            align: 'left',
+            leader,
+            ...(fixedW && fixedW > 0 ? { fixed_width_pt: fixedW } : { weight }),
+          });
+        }
+      }
+      cursorPt += tabSpanW + groupWidths[k + 1];
+    }
+
+    return specs;
+  };
+
+  const splitTabLinesAndPushParagraph = (
+    segs: InlineSegment[],
+    align: BlockAlignment,
+    fontPt: number,
+    lineSp: number,
+    firstLineIndent?: number
+  ) => {
+    const hasTabs = segs.some((s) => s.tab_before);
+    if (!hasTabs) {
+      pushBlock({
+        block_type: 'paragraph',
+        alignment: align,
+        font_size_pt: fontPt,
+        line_spacing: lineSp,
+        indent_left_pt: opts.indentLeftPt > 0 ? opts.indentLeftPt : undefined,
+        ...(firstLineIndent !== undefined ? { first_line_indent_pt: firstLineIndent } : {}),
+        segments: segs,
+      });
+      return;
+    }
+
+    // Split segments on '\n' when tab stops are used so each line has independent right/center tab stops
+    const lineGroups: InlineSegment[][] = [[]];
+    for (const seg of segs) {
+      if (seg.type === 'text' && seg.content.includes('\n')) {
+        const parts = seg.content.split('\n');
+        parts.forEach((p, idx) => {
+          if (idx > 0) lineGroups.push([]);
+          if (p.length > 0 || (idx === 0 && seg.tab_before)) {
+            lineGroups[lineGroups.length - 1].push({
+              ...seg,
+              content: p,
+              tab_before: idx === 0 ? seg.tab_before : false,
+            });
+          }
+        });
+      } else {
+        lineGroups[lineGroups.length - 1].push(seg);
+      }
+    }
+
+    lineGroups.forEach((lg, lIdx) => {
+      if (lg.length === 0) return;
+      const tabSpecs = buildTabStopSpecs(lg, opts.indentLeftPt, fontPt);
+      pushBlock({
+        block_type: 'paragraph',
+        alignment: align,
+        font_size_pt: fontPt,
+        line_spacing: lineSp,
+        ...(lIdx > 0 ? { space_before_pt: 1.5 } : {}),
+        indent_left_pt: opts.indentLeftPt > 0 ? opts.indentLeftPt : undefined,
+        ...(lIdx === 0 && firstLineIndent !== undefined
+          ? { first_line_indent_pt: firstLineIndent }
+          : {}),
+        ...(tabSpecs ? { tab_stop_specs: tabSpecs } : {}),
+        segments: lg,
+      });
+    });
   };
 
   let textStart = 0;
@@ -3924,10 +4958,47 @@ function parseBodyBlocks(
     if (endIdx <= textStart) return;
     const rawSlice = src.slice(textStart, endIdx);
     const mergedParagraphs = mergeWrappedProseLines(rawSlice, opts.isFullLatexDoc);
+    const inlineBaseStyle: InlineStyle = {
+      ...(scopeBold ? { bold: true } : {}),
+      ...(scopeItalic ? { italic: true } : {}),
+      ...(scopeFontSizePt !== 12 ? { font_size_pt: scopeFontSizePt } : {}),
+      ...(scopeColor ? { color: scopeColor } : {}),
+    };
 
     let pIdx = 0;
+    let prevEndedWithDoubleBackslash = false;
+
     while (pIdx < mergedParagraphs.length) {
-      const pLine = mergedParagraphs[pIdx];
+      let pLine = mergedParagraphs[pIdx];
+      let hasExplicitNoindent = false;
+      if (pLine.includes('\x00NOINDENT\x00')) {
+        hasExplicitNoindent = pLine.trimStart().startsWith('\x00NOINDENT\x00');
+        pLine = pLine.replace(/\x00NOINDENT\x00/g, '').trim();
+        if (!pLine) {
+          pIdx++;
+          continue;
+        }
+      }
+
+      // Check trailing \\[len] before parsing
+      let nextLineExtraSpacePt: number | null = null;
+      const trailingBreakM = pLine.match(/\\\\\*?\s*(?:\[([^\]]+)\])?\s*$/);
+      if (trailingBreakM) {
+        if (trailingBreakM[1]) {
+          const parsedGap = parseLatexLengthToPt(trailingBreakM[1], containerW, scopeFontSizePt);
+          if (parsedGap !== null && parsedGap >= 0) nextLineExtraSpacePt = parsedGap;
+        }
+        pLine = pLine.slice(0, trailingBreakM.index).trim();
+      }
+
+      if (!pLine) {
+        if (nextLineExtraSpacePt !== null && nextLineExtraSpacePt > 0) {
+          pendingSpaceBeforePt = (pendingSpaceBeforePt ?? 0) + nextLineExtraSpacePt;
+        }
+        prevEndedWithDoubleBackslash = Boolean(trailingBreakM);
+        pIdx++;
+        continue;
+      }
 
       if (pLine.includes('\\par')) {
         const subParts = pLine.split(/\\par(?![a-zA-Z])\s*/);
@@ -3940,17 +5011,24 @@ function parseBodyBlocks(
             pushBlock(subChoice);
             continue;
           }
-          const segs = applyQuestionLabelBold(parseInlineSegmentText(st, {}, mode, ctx));
+          const segs = applyQuestionLabelBold(parseInlineSegmentText(st, inlineBaseStyle, mode, ctx));
           if (segs.length > 0) {
-            pushBlock({
-              block_type: 'paragraph',
-              alignment: opts.defaultAlign === 'left' && st.length > 55 ? 'justify' : opts.defaultAlign,
-              font_size_pt: 12,
-              line_spacing: 1.18,
-              indent_left_pt: opts.indentLeftPt > 0 ? opts.indentLeftPt : undefined,
-              segments: segs,
-            });
+            const align: BlockAlignment =
+              scopeAlign === 'left' && st.length > 55 ? 'justify' : scopeAlign;
+            const parInd =
+              !hasExplicitNoindent &&
+              ctx.pageConfig.defaultParIndentPt > 0 &&
+              opts.indentLeftPt === 0 &&
+              (align === 'left' || align === 'justify') &&
+              !segs.some((s) => s.tab_before)
+                ? ctx.pageConfig.defaultParIndentPt
+                : undefined;
+            splitTabLinesAndPushParagraph(segs, align, scopeFontSizePt, defaultLineSp, parInd);
           }
+        }
+        prevEndedWithDoubleBackslash = Boolean(trailingBreakM);
+        if (nextLineExtraSpacePt !== null && nextLineExtraSpacePt > 0) {
+          pendingSpaceBeforePt = (pendingSpaceBeforePt ?? 0) + nextLineExtraSpacePt;
         }
         pIdx++;
         continue;
@@ -3962,6 +5040,7 @@ function parseBodyBlocks(
           alignment: 'left',
           indent_left_pt: opts.indentLeftPt > 0 ? opts.indentLeftPt : undefined,
         });
+        prevEndedWithDoubleBackslash = false;
         pIdx++;
         continue;
       }
@@ -3970,9 +5049,10 @@ function parseBodyBlocks(
         pushBlock({
           block_type: 'equation',
           alignment: 'center',
-          latex: normalizeMathContent(pLine),
-          font_size_pt: 12,
+          latex: normalizeMathContent(pLine, ctx),
+          font_size_pt: scopeFontSizePt,
         });
+        prevEndedWithDoubleBackslash = Boolean(trailingBreakM);
         pIdx++;
         continue;
       }
@@ -3990,11 +5070,12 @@ function parseBodyBlocks(
             alignment: 'left',
             table_borderless: true,
             is_choice_block: true,
-            font_size_pt: 12,
+            font_size_pt: scopeFontSizePt,
             line_spacing: 1.15,
             indent_left_pt: opts.indentLeftPt > 0 ? opts.indentLeftPt : undefined,
             table_rows: combinedRows,
           });
+          prevEndedWithDoubleBackslash = Boolean(trailingBreakM);
           pIdx++;
           continue;
         }
@@ -4017,28 +5098,25 @@ function parseBodyBlocks(
         } else {
           pushBlock(inlineChoice);
         }
+        prevEndedWithDoubleBackslash = Boolean(trailingBreakM);
         pIdx++;
         continue;
       }
 
       if (
         pIdx + 3 < mergedParagraphs.length &&
-        /^A[\.\)](?:\s+|(?=\$|\\[\(\[]))/.test(normalizeChoiceMarkerLine(mergedParagraphs[pIdx])) &&
-        /^B[\.\)](?:\s+|(?=\$|\\[\(\[]))/.test(normalizeChoiceMarkerLine(mergedParagraphs[pIdx + 1])) &&
-        /^C[\.\)](?:\s+|(?=\$|\\[\(\[]))/.test(normalizeChoiceMarkerLine(mergedParagraphs[pIdx + 2])) &&
-        /^D[\.\)](?:\s+|(?=\$|\\[\(\[]))/.test(normalizeChoiceMarkerLine(mergedParagraphs[pIdx + 3]))
+        /^A[\.\)](?:\s+|(?=\$|\\[\(\[]))/.test(unwrapInlineBoxesForChoiceCheck(mergedParagraphs[pIdx])) &&
+        /^B[\.\)](?:\s+|(?=\$|\\[\(\[]))/.test(unwrapInlineBoxesForChoiceCheck(mergedParagraphs[pIdx + 1])) &&
+        /^C[\.\)](?:\s+|(?=\$|\\[\(\[]))/.test(unwrapInlineBoxesForChoiceCheck(mergedParagraphs[pIdx + 2])) &&
+        /^D[\.\)](?:\s+|(?=\$|\\[\(\[]))/.test(unwrapInlineBoxesForChoiceCheck(mergedParagraphs[pIdx + 3]))
       ) {
         const cells: TableCellData[] = [0, 1, 2, 3].map((offset) => {
-          const optText = normalizeChoiceMarkerLine(mergedParagraphs[pIdx + offset]);
-          const lm = optText.match(/^([A-D][\.\)])\s*([\s\S]*)$/);
-          const segs: InlineSegment[] = lm
-            ? [
-                { type: 'text', content: `${lm[1]} `, bold: true },
-                ...parseInlineSegmentText(lm[2], {}, mode, ctx),
-              ]
-            : parseInlineSegmentText(optText, {}, mode, ctx);
+          const unwrapped = unwrapOuterLayoutBox(mergedParagraphs[pIdx + offset]);
+          const parsedSegs = boldLeadingChoiceMarker(
+            parseInlineSegmentText(unwrapped, inlineBaseStyle, mode, ctx)
+          );
           return {
-            segments: segs,
+            segments: parsedSegs,
             alignment: 'left',
             width_pct: 25,
           };
@@ -4048,41 +5126,206 @@ function parseBodyBlocks(
           alignment: 'left',
           table_borderless: true,
           is_choice_block: true,
-          font_size_pt: 12,
+          font_size_pt: scopeFontSizePt,
           line_spacing: 1.15,
           indent_left_pt: opts.indentLeftPt > 0 ? opts.indentLeftPt : undefined,
           table_rows: [cells],
         });
+        prevEndedWithDoubleBackslash = false;
         pIdx += 4;
         continue;
       }
 
-      const segs = applyQuestionLabelBold(parseInlineSegmentText(pLine, {}, mode, ctx));
+      const segs = applyQuestionLabelBold(parseInlineSegmentText(pLine, inlineBaseStyle, mode, ctx));
       if (segs.length > 0) {
         const plainLen = segs.reduce((s, item) => s + item.content.length, 0);
-        const align: BlockAlignment =
-          opts.defaultAlign !== 'left'
-            ? opts.defaultAlign
-            : opts.isFullLatexDoc && plainLen > 45
-            ? 'justify'
-            : 'left';
-        pushBlock({
-          block_type: 'paragraph',
-          alignment: align,
-          font_size_pt: 12,
-          line_spacing: 1.18,
-          indent_left_pt: opts.indentLeftPt > 0 ? opts.indentLeftPt : undefined,
-          segments: segs,
-        });
+        const hasTabs = segs.some((s) => s.tab_before);
+        const align: BlockAlignment = hasTabs
+          ? 'left'
+          : scopeAlign !== 'left'
+          ? scopeAlign
+          : opts.isFullLatexDoc && plainLen > 45
+          ? 'justify'
+          : 'left';
+        if (prevEndedWithDoubleBackslash && pendingSpaceBeforePt === null) {
+          pendingSpaceBeforePt = 1.5;
+        }
+        const parInd =
+          !hasExplicitNoindent &&
+          !prevEndedWithDoubleBackslash &&
+          !hasTabs &&
+          ctx.pageConfig.defaultParIndentPt > 0 &&
+          opts.indentLeftPt === 0 &&
+          (align === 'left' || align === 'justify') &&
+          !/^(?:Câu|Bài|Ví dụ|Phần|Mục|Lời giải)\b/i.test(segs[0]?.content ?? '')
+            ? ctx.pageConfig.defaultParIndentPt
+            : undefined;
+        splitTabLinesAndPushParagraph(segs, align, scopeFontSizePt, defaultLineSp, parInd);
+      }
+      prevEndedWithDoubleBackslash = Boolean(trailingBreakM);
+      if (nextLineExtraSpacePt !== null && nextLineExtraSpacePt > 0) {
+        pendingSpaceBeforePt = (pendingSpaceBeforePt ?? 0) + nextLineExtraSpacePt;
       }
       pIdx++;
     }
   };
 
   const hasBlockContainerInside = (snippet: string): boolean =>
-    /\\begin\{(?:tikzpicture|pgfpicture|picture|tabular|tabular\*|tabularx|longtable|enumerate|itemize|itemchoice|description|figure|table|verbatim|lstlisting|minted|axis|ex|bt|vd|center|flushleft|flushright|minipage|tcolorbox)\}|\\(?:section|subsection|subsubsection|chapter|part|par(?![a-zA-Z]))|\n\s*\n/.test(
+    /\\begin\{(?:tikzpicture|pgfpicture|picture|tabular|tabular\*|tabularx|longtable|enumerate\*?|itemize|itemchoice|description|inparaenum|tasks|tabbing|figure|table|verbatim|lstlisting|minted|axis|ex|bt|vd|center|flushleft|flushright|minipage|tcolorbox|framed|mdframed|shaded|multicols)\}|\\(?:section|subsection|subsubsection|chapter|part|par(?![a-zA-Z])|centering|raggedright|raggedleft)|\n\s*\n/.test(
       snippet
     );
+
+  const startsWithBlockScopeSwitch = (snippet: string): boolean =>
+    /^\s*\\(?:centering|raggedright|raggedleft|Large|LARGE|large|huge|Huge|small|footnotesize|scriptsize|tiny|normalsize|bfseries|bf|itshape|it|normalfont|mdseries|upshape|normalcolor|color(?:\s*\[[^\]]*\])?\s*\{)(?![a-zA-Z])/.test(
+      snippet
+    );
+
+  const parseConsecutiveMakeboxBlock = (
+    startIdx: number
+  ): { block: DocumentBlock; endIdx: number } | null => {
+    interface ParsedMakeboxItem {
+      widthPt: number | null;
+      align: BlockAlignment;
+      content: string;
+    }
+    const lineGroups: Array<{ items: ParsedMakeboxItem[]; explicitBreakAfter: boolean }> = [];
+    let scanPos = startIdx;
+    let lastValidEnd = startIdx;
+
+    while (scanPos < src.length) {
+      const lineStart = scanPos;
+      const nlIdx = src.indexOf('\n', scanPos);
+      const lineEnd = nlIdx === -1 ? src.length : nlIdx;
+      const lineItems: ParsedMakeboxItem[] = [];
+      let p = lineStart;
+      let explicitBreakAfter = false;
+      let invalidToken = false;
+
+      while (p < lineEnd) {
+        while (p < lineEnd && (src[p] === ' ' || src[p] === '\t' || src[p] === '~')) p++;
+        if (p >= lineEnd) break;
+        const sub = src.slice(p);
+        const mbM = sub.match(/^\\(makebox|framebox)\*?(?:\s*\[([^\]]*)\])?(?:\s*\[([^\]]*)\])?\s*\{/);
+        if (mbM) {
+          const br = readBalancedBraces(src, p + mbM[0].length - 1);
+          if (!br) {
+            invalidToken = true;
+            break;
+          }
+          const wPt = mbM[2] ? parseLatexLengthToPt(mbM[2], containerW, scopeFontSizePt) : null;
+          const posOpt = (mbM[3] ?? '').trim().toLowerCase();
+          const align: BlockAlignment =
+            posOpt === 'c' ? 'center' : posOpt === 'r' ? 'right' : 'left';
+          lineItems.push({ widthPt: wPt, align, content: br.content });
+          p = br.endIdx + 1;
+          if (p > lineEnd) {
+            // Balanced braces spanned multiple lines; advance lineEnd to end of line containing br.endIdx
+            const nextNl = src.indexOf('\n', p);
+            scanPos = nextNl === -1 ? src.length : nextNl + 1;
+          }
+          continue;
+        }
+        const spM = sub.match(/^\\(?:hfill|quad|qquad|hspace\*?\{[^}]*\}|enspace)(?![a-zA-Z])/);
+        if (spM) {
+          p += spM[0].length;
+          continue;
+        }
+        const brkM = sub.match(/^\\\\\*?(?:\s*\[[^\]]*\])?\s*(?=\n|$)/);
+        if (brkM) {
+          explicitBreakAfter = true;
+          p += brkM[0].length;
+          break;
+        }
+        invalidToken = true;
+        break;
+      }
+
+      if (invalidToken || lineItems.length === 0) break;
+      lineGroups.push({ items: lineItems, explicitBreakAfter });
+      const actualEndOfLastLine = p > lineEnd ? (src.indexOf('\n', p) === -1 ? src.length : src.indexOf('\n', p) + 1) : nlIdx === -1 ? src.length : nlIdx + 1;
+      lastValidEnd = actualEndOfLastLine;
+      scanPos = actualEndOfLastLine;
+    }
+
+    const totalBoxes = lineGroups.reduce((s, g) => s + g.items.length, 0);
+    if (totalBoxes < 2) return null;
+
+    // Organize boxes into visual rows honoring explicit \\ breaks or container width overflow (> 108%)
+    const rawRows: ParsedMakeboxItem[][] = [[]];
+    let curRowWidth = 0;
+
+    for (const lg of lineGroups) {
+      for (const box of lg.items) {
+        const estW = box.widthPt ?? containerW / Math.max(2, totalBoxes);
+        if (rawRows[rawRows.length - 1].length > 0 && curRowWidth + estW > containerW * 1.08) {
+          rawRows.push([]);
+          curRowWidth = 0;
+        }
+        rawRows[rawRows.length - 1].push(box);
+        curRowWidth += estW;
+      }
+      if (lg.explicitBreakAfter && rawRows[rawRows.length - 1].length > 0) {
+        rawRows.push([]);
+        curRowWidth = 0;
+      }
+    }
+
+    const nonEmptyRows = rawRows.filter((r) => r.length > 0);
+    if (nonEmptyRows.length === 0) return null;
+
+    const allFlat = nonEmptyRows.flat();
+    const firstMarkers = allFlat.map((b) => unwrapInlineBoxesForChoiceCheck(b.content));
+    const isChoiceBlock =
+      allFlat.length >= 2 &&
+      allFlat.length <= 4 &&
+      firstMarkers.every((t) => /^(?:[A-D]\.|[a-d]\))(?:\s+|(?=\$|\\[\(\[]))/.test(t));
+
+    const maxCols = Math.max(...nonEmptyRows.map((r) => r.length), 1);
+    const baseStyle: InlineStyle = {
+      ...(scopeBold ? { bold: true } : {}),
+      ...(scopeItalic ? { italic: true } : {}),
+      ...(scopeFontSizePt !== 12 ? { font_size_pt: scopeFontSizePt } : {}),
+      ...(scopeColor ? { color: scopeColor } : {}),
+    };
+
+    const tableRows: TableCellData[][] = nonEmptyRows.map((row) => {
+      const rowTotalW =
+        row.reduce((s, b) => s + (b.widthPt ?? containerW / maxCols), 0) || containerW;
+      const cells: TableCellData[] = row.map((b) => {
+        const segs = parseInlineSegmentText(b.content.trim(), baseStyle, mode, ctx);
+        return {
+          segments: isChoiceBlock ? boldLeadingChoiceMarker(segs) : segs,
+          alignment: b.align,
+          v_align: 'top',
+          width_pct: Math.round(((b.widthPt ?? containerW / maxCols) / rowTotalW) * 1000) / 10,
+        };
+      });
+      while (cells.length < maxCols) {
+        cells.push({
+          segments: [],
+          alignment: 'left',
+          v_align: 'top',
+          width_pct: Math.round((100 / maxCols) * 10) / 10,
+        });
+      }
+      return cells;
+    });
+
+    return {
+      block: {
+        block_type: 'table',
+        alignment: 'left',
+        table_borderless: true,
+        table_style: 'borderless',
+        ...(isChoiceBlock ? { is_choice_block: true, preserve_col_count: maxCols > 1 } : {}),
+        font_size_pt: scopeFontSizePt,
+        line_spacing: defaultLineSp,
+        indent_left_pt: opts.indentLeftPt > 0 ? opts.indentLeftPt : undefined,
+        table_rows: tableRows,
+      },
+      endIdx: lastValidEnd,
+    };
+  };
 
   while (i < src.length) {
     // Escaped \$
@@ -4106,8 +5349,8 @@ function parseBodyBlocks(
             pushBlock({
               block_type: 'equation',
               alignment: 'center',
-              latex: normalizeMathContent(inner),
-              font_size_pt: 12,
+              latex: normalizeMathContent(inner, ctx),
+              font_size_pt: scopeFontSizePt,
             });
           }
           i = closeIdx + 2;
@@ -4178,8 +5421,8 @@ function parseBodyBlocks(
           pushBlock({
             block_type: 'equation',
             alignment: 'center',
-            latex: normalizeMathContent(inner),
-            font_size_pt: 12,
+            latex: normalizeMathContent(inner, ctx),
+            font_size_pt: scopeFontSizePt,
           });
         }
         i = closeIdx + 2;
@@ -4188,8 +5431,38 @@ function parseBodyBlocks(
       }
     }
 
+    // Block-level braced group: { \centering ... }, { \Large ... }, or containing blocks
+    if (src[i] === '{' && (isOnlySpacesBeforeOnLine(src, i) || i === textStart)) {
+      const br = readBalancedBraces(src, i);
+      if (
+        br &&
+        (hasBlockContainerInside(br.content) ||
+          (startsWithBlockScopeSwitch(br.content) && isOnlySpacesAfterOnLine(src, br.endIdx + 1)))
+      ) {
+        flushTextSlice(i);
+        const groupPages = parseBodyBlocks(br.content, ctx, mode, {
+          ...opts,
+          defaultAlign: scopeAlign,
+          containerWidthPt: containerW,
+          baseFontSizePt: scopeFontSizePt,
+          defaultLineSpacing: defaultLineSp,
+          defaultBold: scopeBold,
+          defaultItalic: scopeItalic,
+          defaultColor: scopeColor,
+        });
+        groupPages.forEach((pg, pIdx) => {
+          if (pIdx > 0) pushPageBreak();
+          pg.forEach(pushBlock);
+        });
+        i = br.endIdx + 1;
+        textStart = i;
+        continue;
+      }
+    }
+
     if (src[i] === '\\') {
       const rest = src.slice(i);
+      const atFreshSwitchStart = isOnlySpacesBeforeOnLine(src, i) || i === textStart;
 
       // Page breaks
       const pageBrMatch = rest.match(/^\\(?:newpage|clearpage|cleardoublepage|pagebreak)(?![a-zA-Z])\s*/);
@@ -4216,7 +5489,7 @@ function parseBodyBlocks(
 
       // Standalone \label{key} outside text (associates with previous heading/block)
       const standaloneLabelMatch = rest.match(/^\\label\s*\{([^}]+)\}\s*/);
-      if (standaloneLabelMatch && isOnlySpacesBeforeOnLine(src, i)) {
+      if (standaloneLabelMatch && atFreshSwitchStart) {
         if (ctx.lastNumberedTarget) {
           const key = standaloneLabelMatch[1].trim();
           ctx.labels[key] = ctx.lastNumberedTarget;
@@ -4261,9 +5534,151 @@ function parseBodyBlocks(
         continue;
       }
 
+      // Block-level scope switches: \centering, \raggedright, \raggedleft
+      const scopeAlignM = rest.match(/^\\(centering|raggedright|raggedleft)(?![a-zA-Z])\s*/);
+      if (scopeAlignM && atFreshSwitchStart) {
+        flushTextSlice(i);
+        scopeAlign =
+          scopeAlignM[1] === 'centering'
+            ? 'center'
+            : scopeAlignM[1] === 'raggedleft'
+            ? 'right'
+            : 'left';
+        i += scopeAlignM[0].length;
+        textStart = i;
+        continue;
+      }
+
+      // Block-level font/size/color scope switches (chaining cleanly when consecutive)
+      const scopeStyleM = rest.match(
+        /^\\(Large|LARGE|large|huge|Huge|small|footnotesize|scriptsize|tiny|normalsize|bfseries|bf|itshape|it|normalfont|mdseries|upshape|normalcolor)(?![a-zA-Z])\s*/
+      );
+      if (scopeStyleM && atFreshSwitchStart) {
+        flushTextSlice(i);
+        const sw = scopeStyleM[1];
+        if (sw === 'bf' || sw === 'bfseries') scopeBold = true;
+        else if (sw === 'mdseries') scopeBold = false;
+        else if (sw === 'it' || sw === 'itshape') scopeItalic = true;
+        else if (sw === 'upshape') scopeItalic = false;
+        else if (sw === 'normalfont') {
+          scopeBold = opts.defaultBold ?? false;
+          scopeItalic = opts.defaultItalic ?? false;
+          scopeFontSizePt = baseFontPt;
+        } else if (sw === 'normalcolor') {
+          scopeColor = undefined;
+        } else if (FONT_SIZE_PT_MAP[sw]) {
+          scopeFontSizePt = sw === 'normalsize' ? baseFontPt : FONT_SIZE_PT_MAP[sw];
+        }
+        i += scopeStyleM[0].length;
+        textStart = i;
+        continue;
+      }
+
+      const scopeColorM = rest.match(/^\\color(?:\s*\[([^\]]+)\])?\s*\{([^}]+)\}\s*/);
+      if (scopeColorM && atFreshSwitchStart) {
+        flushTextSlice(i);
+        const hex = resolveLatexModelAndSpec(scopeColorM[1], scopeColorM[2], ctx.customColors);
+        if (isBlackLatexColor(scopeColorM[2], hex)) {
+          scopeColor = undefined;
+        } else if (hex) {
+          scopeColor = hex;
+        }
+        i += scopeColorM[0].length;
+        textStart = i;
+        continue;
+      }
+
+      // Standalone \centerline{...}, \leftline{...}, \rightline{...}
+      const lineBoxM = rest.match(/^\\(centerline|leftline|rightline)\s*\{/);
+      if (lineBoxM && atFreshSwitchStart) {
+        const br = readBalancedBraces(src, i + lineBoxM[0].length - 1);
+        if (br && isOnlySpacesAfterOnLine(src, br.endIdx + 1)) {
+          flushTextSlice(i);
+          const lineAlign: BlockAlignment =
+            lineBoxM[1] === 'centerline' ? 'center' : lineBoxM[1] === 'rightline' ? 'right' : 'left';
+          const baseInline: InlineStyle = {
+            ...(scopeBold ? { bold: true } : {}),
+            ...(scopeItalic ? { italic: true } : {}),
+            ...(scopeFontSizePt !== 12 ? { font_size_pt: scopeFontSizePt } : {}),
+            ...(scopeColor ? { color: scopeColor } : {}),
+          };
+          const segs = parseInlineSegmentText(br.content.trim(), baseInline, mode, ctx);
+          if (segs.length > 0) {
+            splitTabLinesAndPushParagraph(segs, lineAlign, scopeFontSizePt, defaultLineSp);
+          }
+          i = br.endIdx + 1;
+          textStart = i;
+          continue;
+        }
+      }
+
+      // Block-level vertical spacing: \vspace*{len}, \vspace{len}, \addvspace{len}, \smallskip, \medskip, \bigskip
+      const vspaceCmdM = rest.match(/^\\(vspace\*?|addvspace)\s*\{([^}]+)\}[ \t]*\n?/);
+      if (vspaceCmdM && atFreshSwitchStart) {
+        flushTextSlice(i);
+        const pt = parseLatexLengthToPt(vspaceCmdM[2], containerW, scopeFontSizePt);
+        if (pt !== null && pt > 0) {
+          pendingSpaceBeforePt = (pendingSpaceBeforePt ?? 0) + pt;
+        }
+        i += vspaceCmdM[0].length;
+        textStart = i;
+        continue;
+      }
+      const skipCmdM = rest.match(/^\\(smallskip|medskip|bigskip)(?![a-zA-Z])[ \t]*\n?/);
+      if (skipCmdM && atFreshSwitchStart) {
+        flushTextSlice(i);
+        const pt = skipCmdM[1] === 'bigskip' ? 12 : skipCmdM[1] === 'medskip' ? 6 : 3;
+        pendingSpaceBeforePt = (pendingSpaceBeforePt ?? 0) + pt;
+        i += skipCmdM[0].length;
+        textStart = i;
+        continue;
+      }
+
+      // Multi-line or single-line consecutive \makebox[w][pos]{...} / \framebox[w][pos]{...} blocks
+      if (/^\\(?:makebox|framebox)\*/.test(rest) || /^\\(?:makebox|framebox)(?:\s*\[|\s*\{)/.test(rest)) {
+        if (atFreshSwitchStart) {
+          const mbResult = parseConsecutiveMakeboxBlock(i);
+          if (mbResult) {
+            flushTextSlice(i);
+            pushBlock(mbResult.block);
+            i = mbResult.endIdx;
+            textStart = i;
+            continue;
+          }
+        }
+      }
+
+      // Unwrap \resizebox / \scalebox / \adjustbox when wrapping block containers (e.g., tabular, tikzpicture)
+      const scaleWrapM = rest.match(
+        /^\\(?:resizebox\*?\s*\{[^}]*\}\s*\{[^}]*\}|scalebox(?:\s*\[[^\]]*\])?\s*\{[^}]*\}(?:\s*\[[^\]]*\])?|adjustbox\s*\{[^}]*\})\s*\{/
+      );
+      if (scaleWrapM) {
+        const br = readBalancedBraces(src, i + scaleWrapM[0].length - 1);
+        if (br && hasBlockContainerInside(br.content)) {
+          flushTextSlice(i);
+          const innerPages = parseBodyBlocks(br.content, ctx, mode, {
+            ...opts,
+            defaultAlign: scopeAlign,
+            containerWidthPt: containerW,
+            baseFontSizePt: scopeFontSizePt,
+            defaultLineSpacing: defaultLineSp,
+            defaultBold: scopeBold,
+            defaultItalic: scopeItalic,
+            defaultColor: scopeColor,
+          });
+          innerPages.forEach((pg, pIdx) => {
+            if (pIdx > 0) pushPageBreak();
+            pg.forEach(pushBlock);
+          });
+          i = br.endIdx + 1;
+          textStart = i;
+          continue;
+        }
+      }
+
       // Keep inline boxes/styling commands (\makebox, \framebox, \textbf, etc.) intact when they contain no block containers
       const inlineBoxCmdM = rest.match(
-        /^\\(?:makebox|framebox)\*?(?:\s*\[[^\]]*\])*\s*\{|^\\(?:textbf|textit|emph|underline|fbox|boxed|textrm|textsf|texttt|textsc|textsl|textnormal|textup|sout|uline|text|mbox|hbox|centerline|leftline|rightline)(?:\s*\[[^\]]*\])?\s*\{|^\\(?:parbox|raisebox|scalebox|textcolor|colorbox)(?:\s*\[[^\]]*\])*\s*\{[^}]*\}(?:\s*\[[^\]]*\])*\s*\{|^\\resizebox\*?\s*\{[^}]*\}\s*\{[^}]*\}\s*\{/
+        /^\\(?:makebox|framebox)\*?(?:\s*\[[^\]]*\])*\s*\{|^\\(?:textbf|textit|emph|underline|fbox|boxed|textrm|textsf|texttt|textsc|textsl|textnormal|textup|sout|uline|text|mbox|hbox|centerline|leftline|rightline)(?:\s*\[[^\]]*\])?\s*\{|^\\(?:parbox|raisebox|scalebox|textcolor|colorbox)(?:\s*\[[^\]]*\])*(?:\s*\{[^}]*\})+(?:\s*\[[^\]]*\])*\s*\{|^\\(?:fcolorbox)(?:\s*\[[^\]]*\])?\s*\{[^}]*\}(?:\s*\[[^\]]*\])?\s*\{[^}]*\}\s*\{|^\\resizebox\*?\s*\{[^}]*\}\s*\{[^}]*\}\s*\{/
       );
       if (inlineBoxCmdM) {
         const br = readBalancedBraces(src, i + inlineBoxCmdM[0].length - 1);
@@ -4361,36 +5776,145 @@ function parseBodyBlocks(
       }
 
       // \immini[opts]{text}{figure} (popular in Vietnamese ex_test exams)
-      const imminiMatch = rest.match(/^\\immini(?:\s*\[[^\]]*\])?\s*\{/);
+      const imminiMatch = rest.match(/^\\immini(?:\s*\[([^\]]*)\])?\s*\{/);
       if (imminiMatch) {
         const extracted = extractBalancedMacroArgs(src, i + imminiMatch[0].length - 1, 2);
         if (extracted) {
           flushTextSlice(i);
-          const leftPages = parseBodyBlocks(extracted.args[0], ctx, mode, opts);
-          const rightPages = parseBodyBlocks(extracted.args[1], ctx, mode, {
+          const imOptsRaw = imminiMatch[1] ?? '';
+          const widthOptM = imOptsRaw.match(/width\s*=\s*([^,\]]+)/i);
+          const explicitRightPt = widthOptM
+            ? parseLatexLengthToPt(widthOptM[1], containerW, scopeFontSizePt)
+            : null;
+
+          // First estimate figure width from right content, then parse left content with exact remaining column width
+          const rightPagesPre = parseBodyBlocks(extracted.args[1], ctx, mode, {
             ...opts,
             defaultAlign: 'center',
+            containerWidthPt: containerW * 0.45,
+            baseFontSizePt: scopeFontSizePt,
+            defaultLineSpacing: defaultLineSp,
+          });
+          const rightBlocks = rightPagesPre.flat();
+          let rightPct = 36;
+          if (explicitRightPt !== null && explicitRightPt > 40) {
+            rightPct = Math.max(20, Math.min(55, Math.round((explicitRightPt / containerW) * 100)));
+          } else {
+            const figBlk = rightBlocks.find((b) => b.block_type === 'figure' && b.croppedWidthPx);
+            if (figBlk && figBlk.croppedWidthPx) {
+              const estPt = figBlk.croppedWidthPx * (28.3465 / 42) + 14;
+              rightPct = Math.max(22, Math.min(50, Math.round((estPt / containerW) * 100)));
+            }
+          }
+          const leftPct = 100 - rightPct;
+          const leftColW = Math.max(140, (containerW * leftPct) / 100 - 8);
+
+          const leftPages = parseBodyBlocks(extracted.args[0], ctx, mode, {
+            ...opts,
+            containerWidthPt: leftColW,
+            baseFontSizePt: scopeFontSizePt,
+            defaultLineSpacing: defaultLineSp,
           });
           const leftBlocks = leftPages.flat();
-          const rightBlocks = rightPages.flat();
-          if (
-            leftBlocks.length === 1 &&
-            rightBlocks.length === 1 &&
-            rightBlocks[0].block_type === 'figure'
-          ) {
-            // Preserve side-by-side layout cleanly via borderless 2-column band or sequential blocks
+
+          if (leftBlocks.length > 0 && rightBlocks.length > 0) {
+            pushBlock({
+              block_type: 'table',
+              alignment: 'left',
+              table_borderless: true,
+              table_style: 'borderless',
+              font_size_pt: scopeFontSizePt,
+              line_spacing: defaultLineSp,
+              indent_left_pt: opts.indentLeftPt > 0 ? opts.indentLeftPt : undefined,
+              table_rows: [
+                [
+                  {
+                    segments: [],
+                    blocks: leftBlocks,
+                    alignment: 'left',
+                    v_align: 'top',
+                    width_pct: leftPct,
+                  },
+                  {
+                    segments: [],
+                    blocks: rightBlocks,
+                    alignment: 'center',
+                    v_align: 'top',
+                    width_pct: rightPct,
+                  },
+                ],
+              ],
+            });
+          } else {
             leftBlocks.forEach(pushBlock);
             rightBlocks.forEach(pushBlock);
-          } else {
-            leftPages.forEach((pg, pIdx) => {
-              if (pIdx > 0) pushPageBreak();
-              pg.forEach(pushBlock);
-            });
-            rightPages.forEach((pg) => pg.forEach(pushBlock));
           }
+
           i = extracted.endIdx;
           textStart = i;
           continue;
+        }
+      }
+
+      // Consecutive side-by-side \parbox[pos]{width}{content}
+      if (isOnlySpacesBeforeOnLine(src, i)) {
+        const parboxRe = /^\\parbox(?:\s*\[([^\]]*)\])?(?:\s*\[[^\]]*\])*\s*\{([^}]*)\}\s*\{/;
+        const pb0 = rest.match(parboxRe);
+        if (pb0) {
+          const collectedPbs: Array<{ widthPt: number; vAlign: 'top' | 'center' | 'bottom'; content: string }> = [];
+          let scanPos = i;
+          let lastEnd = i;
+          while (scanPos < src.length) {
+            const sub = src.slice(scanPos);
+            const m = sub.match(parboxRe);
+            if (!m) break;
+            const br = readBalancedBraces(src, scanPos + m[0].length - 1);
+            if (!br) break;
+            const vPos = (m[1] ?? '').trim().toLowerCase();
+            const vAlign: 'top' | 'center' | 'bottom' =
+              vPos === 'c' ? 'center' : vPos === 'b' ? 'bottom' : 'top';
+            const wPt = parseLatexLengthToPt(m[2], containerW, scopeFontSizePt) ?? containerW * 0.48;
+            collectedPbs.push({ widthPt: wPt, vAlign, content: br.content });
+            lastEnd = br.endIdx + 1;
+            const gapM = src
+              .slice(lastEnd)
+              .match(/^(?:[ \t]|\\(?:hfill|quad|qquad|hspace\*?\{[^}]*\})|~|\n(?![ \t]*\n))*/);
+            scanPos = lastEnd + (gapM ? gapM[0].length : 0);
+          }
+          if (collectedPbs.length >= 2) {
+            flushTextSlice(i);
+            const sumW = Math.max(1, collectedPbs.reduce((s, p) => s + p.widthPt, 0));
+            const rowCells: TableCellData[] = collectedPbs.map((pb) => {
+              const pct = Math.max(10, Math.round((pb.widthPt / sumW) * 1000) / 10);
+              const colBlocks = parseBodyBlocks(pb.content, ctx, mode, {
+                ...opts,
+                indentLeftPt: 0,
+                containerWidthPt: Math.max(100, pb.widthPt),
+                baseFontSizePt: scopeFontSizePt,
+                defaultLineSpacing: defaultLineSp,
+              }).flat();
+              return {
+                segments: [],
+                blocks: colBlocks,
+                v_align: pb.vAlign,
+                alignment: 'left',
+                width_pct: pct,
+              };
+            });
+            pushBlock({
+              block_type: 'table',
+              alignment: 'left',
+              table_borderless: true,
+              table_style: 'borderless',
+              font_size_pt: scopeFontSizePt,
+              line_spacing: defaultLineSp,
+              indent_left_pt: opts.indentLeftPt > 0 ? opts.indentLeftPt : undefined,
+              table_rows: [rowCells],
+            });
+            i = lastEnd;
+            textStart = i;
+            continue;
+          }
         }
       }
 
@@ -4529,16 +6053,26 @@ function parseBodyBlocks(
 
           const segs = parseInlineSegmentText(
             br.content,
-            { bold: true, font_size_pt: sizePt },
+            {
+              bold: true,
+              font_size_pt: sizePt,
+              ...(scopeColor ? { color: scopeColor } : {}),
+            },
             mode,
             ctx
           );
           if (prefix) {
-            segs.unshift({ type: 'text', content: prefix, bold: true, font_size_pt: sizePt });
+            segs.unshift({
+              type: 'text',
+              content: prefix,
+              bold: true,
+              font_size_pt: sizePt,
+              ...(scopeColor ? { color: scopeColor } : {}),
+            });
           }
           pushBlock({
             block_type: 'heading',
-            alignment: kind === 'part' || kind === 'chapter' ? 'center' : 'left',
+            alignment: kind === 'part' || kind === 'chapter' ? 'center' : scopeAlign !== 'left' ? scopeAlign : 'left',
             heading_level: level,
             font_size_pt: sizePt,
             segments: segs,
@@ -4567,8 +6101,8 @@ function parseBodyBlocks(
             pushBlock({
               block_type: 'equation',
               alignment: 'center',
-              latex: normalizeMathContent(fullMath),
-              font_size_pt: 12,
+              latex: normalizeMathContent(fullMath, ctx),
+              font_size_pt: scopeFontSizePt,
             });
             i = endIdx + closeToken.length;
             textStart = i;
@@ -4772,7 +6306,13 @@ function parseBodyBlocks(
                 pos = specBr.endIdx + 1;
               }
             }
-            const tblBlock = parseTabularEnvironment(colSpec, envRawBody.slice(pos), mode, ctx);
+            const tblBlock = parseTabularEnvironment(
+              colSpec,
+              envRawBody.slice(pos),
+              mode,
+              ctx,
+              containerW
+            );
             if (tblBlock) {
               if (opts.indentLeftPt > 0) tblBlock.indent_left_pt = opts.indentLeftPt;
               pushBlock(tblBlock);
@@ -4784,22 +6324,103 @@ function parseBodyBlocks(
 
           if (envName === 'minipage') {
             flushTextSlice(i);
-            let pos = skipSpaces(envRawBody, 0);
-            while (envRawBody[pos] === '[') {
-              const optBr = readBalancedBrackets(envRawBody, pos);
-              if (!optBr) break;
-              pos = skipSpaces(envRawBody, optBr.endIdx + 1);
+
+            const parseMinipageHeader = (rawBody: string) => {
+              let pos = skipSpaces(rawBody, 0);
+              let vAlign: 'top' | 'center' | 'bottom' = 'top';
+              let optIdx = 0;
+              while (rawBody[pos] === '[') {
+                const optBr = readBalancedBrackets(rawBody, pos);
+                if (!optBr) break;
+                if (optIdx === 0) {
+                  const v = optBr.content.trim().toLowerCase();
+                  if (v === 'c') vAlign = 'center';
+                  else if (v === 'b') vAlign = 'bottom';
+                }
+                optIdx++;
+                pos = skipSpaces(rawBody, optBr.endIdx + 1);
+              }
+              let widthPt = containerW;
+              if (rawBody[pos] === '{') {
+                const widthBr = readBalancedBraces(rawBody, pos);
+                if (widthBr) {
+                  widthPt = parseLatexLengthToPt(widthBr.content, containerW, scopeFontSizePt) ?? containerW;
+                  pos = widthBr.endIdx + 1;
+                }
+              }
+              return { vAlign, widthPt, innerBody: rawBody.slice(pos) };
+            };
+
+            const minipages: Array<{
+              vAlign: 'top' | 'center' | 'bottom';
+              widthPt: number;
+              innerBody: string;
+            }> = [parseMinipageHeader(envRawBody)];
+
+            let cursorEnd = endIdx + closeToken.length;
+            while (cursorEnd < src.length) {
+              const gapMatch = src
+                .slice(cursorEnd)
+                .match(/^(?:[ \t]|\\(?:hfill|quad|qquad|hspace\*?\{[^}]*\})|~|\n(?![ \t]*\n))*/);
+              const nextScanStart = cursorEnd + (gapMatch ? gapMatch[0].length : 0);
+              const nextMpOpen = src.slice(nextScanStart).match(/^\\begin\{minipage\}/);
+              if (!nextMpOpen) break;
+              const nextAfterOpen = nextScanStart + nextMpOpen[0].length;
+              const nextEndIdx = findMatchingEnvEnd(src, 'minipage', nextAfterOpen);
+              if (nextEndIdx === -1) break;
+              const parsedNext = parseMinipageHeader(src.slice(nextAfterOpen, nextEndIdx));
+              // Stop if accumulated widths clearly wrap onto the next line (> 108% of container width)
+              const accWidth = minipages.reduce((s, mp) => s + mp.widthPt, 0) + parsedNext.widthPt;
+              if (minipages.length >= 1 && accWidth > containerW * 1.08 && minipages.length >= 2) {
+                break;
+              }
+              minipages.push(parsedNext);
+              cursorEnd = nextEndIdx + '\\end{minipage}'.length;
             }
-            if (envRawBody[pos] === '{') {
-              const widthBr = readBalancedBraces(envRawBody, pos);
-              if (widthBr) pos = widthBr.endIdx + 1;
+
+            if (minipages.length >= 2) {
+              const totalMpWidth = Math.max(1, minipages.reduce((s, mp) => s + mp.widthPt, 0));
+              const rowCells: TableCellData[] = minipages.map((mp) => {
+                const pct = Math.max(10, Math.round((mp.widthPt / totalMpWidth) * 1000) / 10);
+                const colBlocks = parseBodyBlocks(mp.innerBody, ctx, mode, {
+                  ...opts,
+                  indentLeftPt: 0,
+                  containerWidthPt: Math.max(100, mp.widthPt),
+                  baseFontSizePt: scopeFontSizePt,
+                  defaultLineSpacing: defaultLineSp,
+                }).flat();
+                return {
+                  segments: [],
+                  blocks: colBlocks,
+                  v_align: mp.vAlign,
+                  alignment: 'left',
+                  width_pct: pct,
+                };
+              });
+              pushBlock({
+                block_type: 'table',
+                alignment: 'left',
+                table_borderless: true,
+                table_style: 'borderless',
+                font_size_pt: scopeFontSizePt,
+                line_spacing: defaultLineSp,
+                indent_left_pt: opts.indentLeftPt > 0 ? opts.indentLeftPt : undefined,
+                table_rows: [rowCells],
+              });
+            } else {
+              const innerPages = parseBodyBlocks(minipages[0].innerBody, ctx, mode, {
+                ...opts,
+                containerWidthPt: Math.max(120, minipages[0].widthPt),
+                baseFontSizePt: scopeFontSizePt,
+                defaultLineSpacing: defaultLineSp,
+              });
+              innerPages.forEach((pg, pIdx) => {
+                if (pIdx > 0) pushPageBreak();
+                pg.forEach(pushBlock);
+              });
             }
-            const innerPages = parseBodyBlocks(envRawBody.slice(pos), ctx, mode, opts);
-            innerPages.forEach((pg, pIdx) => {
-              if (pIdx > 0) pushPageBreak();
-              pg.forEach(pushBlock);
-            });
-            i = endIdx + closeToken.length;
+
+            i = cursorEnd;
             textStart = i;
             continue;
           }
@@ -4811,6 +6432,9 @@ function parseBodyBlocks(
             const childPages = parseBodyBlocks(envRawBody, ctx, mode, {
               ...opts,
               defaultAlign: childAlign,
+              containerWidthPt: containerW,
+              baseFontSizePt: scopeFontSizePt,
+              defaultLineSpacing: defaultLineSp,
             });
             childPages.forEach((pg, pIdx) => {
               if (pIdx > 0) pushPageBreak();
@@ -4822,9 +6446,6 @@ function parseBodyBlocks(
           }
 
           if (
-            envName === 'quote' ||
-            envName === 'quotation' ||
-            envName === 'abstract' ||
             envName === 'tcolorbox' ||
             envName === 'framed' ||
             envName === 'mdframed' ||
@@ -4832,48 +6453,251 @@ function parseBodyBlocks(
           ) {
             flushTextSlice(i);
             let boxBody = envRawBody.trimStart();
-            if (envName === 'tcolorbox' && boxBody.startsWith('[')) {
+            let boxTitle = '';
+            let colBackHex = envName === 'shaded' ? '#F1F5F9' : envName === 'tcolorbox' ? '#F8FAFC' : '#FFFFFF';
+            let colFrameHex = envName === 'shaded' ? '' : '#334155';
+            let colBackTitleHex = '#334155';
+            let colTitleHex = '#FFFFFF';
+            let colTextHex: string | undefined = scopeColor;
+
+            if ((envName === 'tcolorbox' || envName === 'mdframed') && boxBody.startsWith('[')) {
               const optBr = readBalancedBrackets(boxBody, 0);
               if (optBr) {
-                const titleM = optBr.content.match(/title\s*=\s*(?:\{([^}]*)\}|([^,\]]+))/);
-                const boxTitle = (titleM?.[1] ?? titleM?.[2] ?? '').trim();
-                if (boxTitle) {
-                  pushBlock({
-                    block_type: 'paragraph',
-                    alignment: 'left',
-                    font_size_pt: 12,
-                    indent_left_pt: opts.indentLeftPt + 16,
-                    segments: parseInlineSegmentText(boxTitle, { bold: true }, mode, ctx),
-                  });
+                const optStr = optBr.content;
+                boxTitle = extractBalancedKeyValOption(optStr, 'title') ?? '';
+
+                const cbVal =
+                  extractBalancedKeyValOption(optStr, 'colback') ??
+                  extractBalancedKeyValOption(optStr, 'backgroundcolor');
+                if (cbVal) colBackHex = resolveLatexColor(cbVal, ctx.customColors) ?? colBackHex;
+
+                const cfVal =
+                  extractBalancedKeyValOption(optStr, 'colframe') ??
+                  extractBalancedKeyValOption(optStr, 'linecolor');
+                if (cfVal) colFrameHex = resolveLatexColor(cfVal, ctx.customColors) ?? colFrameHex;
+
+                const cbtVal = extractBalancedKeyValOption(optStr, 'colbacktitle');
+                if (cbtVal) {
+                  colBackTitleHex = resolveLatexColor(cbtVal, ctx.customColors) ?? colBackTitleHex;
+                } else if (cfVal && colFrameHex) {
+                  colBackTitleHex = colFrameHex;
                 }
+
+                const ctVal = extractBalancedKeyValOption(optStr, 'coltitle');
+                if (ctVal) colTitleHex = resolveLatexColor(ctVal, ctx.customColors) ?? colTitleHex;
+
+                const ctxtVal = extractBalancedKeyValOption(optStr, 'coltext');
+                if (ctxtVal) {
+                  const resolvedCtxt = resolveLatexColor(ctxtVal, ctx.customColors);
+                  if (isBlackLatexColor(ctxtVal, resolvedCtxt)) colTextHex = undefined;
+                  else if (resolvedCtxt) colTextHex = resolvedCtxt;
+                }
+
                 boxBody = boxBody.slice(optBr.endIdx + 1);
               }
             }
+
+            const childBlocks = parseBodyBlocks(boxBody, ctx, mode, {
+              ...opts,
+              defaultAlign: 'justify',
+              indentLeftPt: 0,
+              containerWidthPt: Math.max(140, containerW - 24),
+              baseFontSizePt: scopeFontSizePt,
+              defaultLineSpacing: defaultLineSp,
+              defaultBold: scopeBold,
+              defaultItalic: scopeItalic,
+              defaultColor: colTextHex,
+            }).flat();
+
+            const boxRows: TableCellData[][] = [];
+            if (boxTitle) {
+              boxRows.push([
+                {
+                  segments: parseInlineSegmentText(
+                    boxTitle,
+                    { bold: true, color: colTitleHex },
+                    mode,
+                    ctx
+                  ),
+                  alignment: 'left',
+                  is_header: true,
+                  fill_color: colBackTitleHex,
+                  border_color: colFrameHex || undefined,
+                  border_top: Boolean(colFrameHex),
+                  border_bottom: Boolean(colFrameHex),
+                  border_left: Boolean(colFrameHex),
+                  border_right: Boolean(colFrameHex),
+                  width_pct: 100,
+                },
+              ]);
+            }
+            boxRows.push([
+              {
+                segments: [],
+                blocks:
+                  childBlocks.length > 0
+                    ? childBlocks
+                    : [{ block_type: 'paragraph', alignment: 'left', segments: [] }],
+                alignment: 'left',
+                v_align: 'top',
+                fill_color: colBackHex,
+                border_color: colFrameHex || undefined,
+                border_top: Boolean(colFrameHex),
+                border_bottom: Boolean(colFrameHex),
+                border_left: Boolean(colFrameHex),
+                border_right: Boolean(colFrameHex),
+                width_pct: 100,
+              },
+            ]);
+
+            pushBlock({
+              block_type: 'table',
+              alignment: 'left',
+              table_borderless: !colFrameHex,
+              table_style: 'box',
+              font_size_pt: scopeFontSizePt,
+              line_spacing: defaultLineSp,
+              indent_left_pt: opts.indentLeftPt > 0 ? opts.indentLeftPt : undefined,
+              table_rows: boxRows,
+            });
+            i = endIdx + closeToken.length;
+            textStart = i;
+            continue;
+          }
+
+          if (envName === 'quote' || envName === 'quotation' || envName === 'abstract') {
+            flushTextSlice(i);
             if (envName === 'abstract') {
               pushBlock({
                 block_type: 'heading',
                 alignment: 'center',
                 heading_level: 3,
-                font_size_pt: 12,
+                font_size_pt: scopeFontSizePt,
                 segments: [
                   {
                     type: 'text',
                     content: ctx.isVietnamese ? 'Tóm tắt' : 'Abstract',
                     bold: true,
-                    font_size_pt: 12,
+                    font_size_pt: scopeFontSizePt,
+                    ...(scopeColor ? { color: scopeColor } : {}),
                   },
                 ],
               });
             }
-            const childPages = parseBodyBlocks(boxBody, ctx, mode, {
+            const childPages = parseBodyBlocks(envRawBody, ctx, mode, {
               ...opts,
               defaultAlign: 'justify',
               indentLeftPt: opts.indentLeftPt + 24,
+              containerWidthPt: Math.max(140, containerW - 48),
+              baseFontSizePt: scopeFontSizePt,
+              defaultLineSpacing: defaultLineSp,
+              defaultColor: scopeColor,
             });
             childPages.forEach((pg, pIdx) => {
               if (pIdx > 0) pushPageBreak();
               pg.forEach(pushBlock);
             });
+            i = endIdx + closeToken.length;
+            textStart = i;
+            continue;
+          }
+
+          if (envName === 'enumerate*' || envName === 'inparaenum') {
+            flushTextSlice(i);
+            let listBody = envRawBody.trimStart();
+            let enumLabelOpt: string | undefined;
+            if (listBody.startsWith('[')) {
+              const optBr = readBalancedBrackets(listBody, 0);
+              if (optBr) {
+                const rawOpt = optBr.content.trim();
+                const lblVal = extractBalancedKeyValOption(rawOpt, 'label');
+                if (lblVal) {
+                  enumLabelOpt = lblVal;
+                } else if (/^[aAiI1][.)]?$|^\([aAiI1]\)$/.test(rawOpt)) {
+                  enumLabelOpt = rawOpt
+                    .replace(/a/g, '\\alph*')
+                    .replace(/A/g, '\\Alph*')
+                    .replace(/i/g, '\\roman*')
+                    .replace(/I/g, '\\Roman*')
+                    .replace(/1/g, '\\arabic*');
+                }
+                listBody = listBody.slice(optBr.endIdx + 1);
+              }
+            }
+            const items = splitListItems(listBody);
+            if (items.length > 0) {
+              const itemBaseStyle: InlineStyle = {
+                ...(scopeBold ? { bold: true } : {}),
+                ...(scopeItalic ? { italic: true } : {}),
+                ...(scopeFontSizePt !== 12 ? { font_size_pt: scopeFontSizePt } : {}),
+                ...(scopeColor ? { color: scopeColor } : {}),
+              };
+              const isChoiceLike =
+                items.length >= 2 &&
+                items.length <= 4 &&
+                ((enumLabelOpt && /\\(?:Alph|alph)\*/.test(enumLabelOpt)) ||
+                  items.every((_, idx) => {
+                    const b = expandEnumPattern(enumLabelOpt, envName, opts.listDepth + 1, idx, items[idx].customLabel).trim();
+                    return /^(?:[A-D]\.|[a-d]\))$/.test(b);
+                  }));
+
+              if (isChoiceLike) {
+                const pct = Math.round((100 / items.length) * 10) / 10;
+                const rowCells: TableCellData[] = items.map((item, itemIdx) => ({
+                  segments: [
+                    ...buildEnumBulletSegments(
+                      enumLabelOpt,
+                      envName,
+                      opts.listDepth + 1,
+                      itemIdx,
+                      item.customLabel,
+                      itemBaseStyle,
+                      mode,
+                      ctx
+                    ),
+                    ...parseInlineSegmentText(item.content, itemBaseStyle, mode, ctx),
+                  ],
+                  alignment: 'left',
+                  width_pct: pct,
+                }));
+                pushBlock({
+                  block_type: 'table',
+                  alignment: 'left',
+                  table_borderless: true,
+                  is_choice_block: true,
+                  font_size_pt: scopeFontSizePt,
+                  line_spacing: defaultLineSp,
+                  indent_left_pt: opts.indentLeftPt > 0 ? opts.indentLeftPt : undefined,
+                  table_rows: [rowCells],
+                });
+              } else {
+                const joinedSegs: InlineSegment[] = [];
+                items.forEach((item, itemIdx) => {
+                  if (itemIdx > 0) joinedSegs.push({ type: 'text', content: '   ', ...itemBaseStyle });
+                  joinedSegs.push(
+                    ...buildEnumBulletSegments(
+                      enumLabelOpt,
+                      envName,
+                      opts.listDepth + 1,
+                      itemIdx,
+                      item.customLabel,
+                      itemBaseStyle,
+                      mode,
+                      ctx
+                    ),
+                    ...parseInlineSegmentText(item.content, itemBaseStyle, mode, ctx)
+                  );
+                });
+                pushBlock({
+                  block_type: 'paragraph',
+                  alignment: scopeAlign,
+                  font_size_pt: scopeFontSizePt,
+                  line_spacing: defaultLineSp,
+                  indent_left_pt: opts.indentLeftPt > 0 ? opts.indentLeftPt : undefined,
+                  segments: joinedSegs,
+                });
+              }
+            }
             i = endIdx + closeToken.length;
             textStart = i;
             continue;
@@ -4892,9 +6716,9 @@ function parseBodyBlocks(
               const optBr = readBalancedBrackets(listBody, 0);
               if (optBr) {
                 const rawOpt = optBr.content.trim();
-                const lblM = rawOpt.match(/label\s*=\s*(?:\{([^}]*)\}|([^\s,\]]+))/);
-                if (lblM) {
-                  enumLabelOpt = (lblM[1] ?? lblM[2])?.trim();
+                const lblVal = extractBalancedKeyValOption(rawOpt, 'label');
+                if (lblVal) {
+                  enumLabelOpt = lblVal;
                 } else if (/^[aAiI1][.)]?$|^\([aAiI1]\)$/.test(rawOpt)) {
                   enumLabelOpt = rawOpt
                     .replace(/a/g, '\\alph*')
@@ -4909,57 +6733,57 @@ function parseBodyBlocks(
             const items = splitListItems(listBody);
             const nextDepth = opts.listDepth + 1;
             const listIndentPt = opts.indentLeftPt + 20;
+            const bulletBaseStyle: InlineStyle = {
+              ...(scopeFontSizePt !== 12 ? { font_size_pt: scopeFontSizePt } : {}),
+              ...(scopeColor ? { color: scopeColor } : {}),
+            };
 
             items.forEach((item, itemIdx) => {
-              const bullet =
+              const bulletSegs =
                 envName === 'description'
-                  ? item.customLabel
-                    ? `${item.customLabel} `
-                    : '• '
-                  : formatEnumItemBullet(
+                  ? buildEnumBulletSegments(
+                      undefined,
+                      envName,
+                      nextDepth,
+                      itemIdx,
+                      item.customLabel ?? '•',
+                      bulletBaseStyle,
+                      mode,
+                      ctx
+                    )
+                  : buildEnumBulletSegments(
                       enumLabelOpt,
                       envName,
                       nextDepth,
                       itemIdx,
-                      item.customLabel
+                      item.customLabel,
+                      bulletBaseStyle,
+                      mode,
+                      ctx
                     );
 
               const itemPages = parseBodyBlocks(item.content, ctx, mode, {
                 ...opts,
                 listDepth: nextDepth,
                 indentLeftPt: listIndentPt,
+                baseFontSizePt: scopeFontSizePt,
+                defaultLineSpacing: defaultLineSp,
+                defaultBold: scopeBold,
+                defaultItalic: scopeItalic,
+                defaultColor: scopeColor,
               });
               const flat = itemPages.flat();
               if (flat.length > 0 && flat[0].block_type === 'paragraph' && flat[0].segments) {
                 flat[0].first_line_indent_pt = -16;
-                flat[0].segments = [
-                  {
-                    type: 'text',
-                    content: bullet,
-                    bold:
-                      envName === 'enumerate' ||
-                      envName === 'itemchoice' ||
-                      envName === 'description',
-                  },
-                  ...flat[0].segments,
-                ];
+                flat[0].segments = [...bulletSegs, ...flat[0].segments];
               } else {
                 pushBlock({
                   block_type: 'paragraph',
                   alignment: 'left',
-                  font_size_pt: 12,
+                  font_size_pt: scopeFontSizePt,
                   indent_left_pt: listIndentPt,
                   first_line_indent_pt: -16,
-                  segments: [
-                    {
-                      type: 'text',
-                      content: bullet,
-                      bold:
-                        envName === 'enumerate' ||
-                        envName === 'itemchoice' ||
-                        envName === 'description',
-                    },
-                  ],
+                  segments: bulletSegs,
                 });
               }
               flat.forEach(pushBlock);
@@ -5035,7 +6859,13 @@ function parseBodyBlocks(
 
           if (envName === 'ex' || envName === 'bt' || envName === 'vd') {
             flushTextSlice(i);
-            const exBlocks = parseExEnvironment(envRawBody, envName, ctx, mode);
+            const exBlocks = parseExEnvironment(envRawBody, envName, ctx, mode, {
+              ...opts,
+              containerWidthPt: containerW,
+              baseFontSizePt: scopeFontSizePt,
+              defaultLineSpacing: defaultLineSp,
+              defaultColor: scopeColor,
+            });
             exBlocks.forEach(pushBlock);
             i = endIdx + closeToken.length;
             textStart = i;
@@ -5098,6 +6928,9 @@ function parseBodyBlocks(
             const innerPages = parseBodyBlocks(bodyTrimmed, ctx, mode, {
               ...opts,
               defaultAlign: 'justify',
+              baseFontSizePt: scopeFontSizePt,
+              defaultLineSpacing: defaultLineSp,
+              defaultColor: scopeColor,
             });
             const flat = innerPages.flat();
             if (flat.length > 0 && flat[0].block_type === 'paragraph' && flat[0].segments) {
@@ -5153,35 +6986,69 @@ function parseBodyBlocks(
                 mBody = mBody.slice(colBr.endIdx + 1);
               }
             }
-            const innerBlocks = parseBodyBlocks(mBody, ctx, mode, opts).flat();
-            if (innerBlocks.length > 0) {
-              const rowCells: TableCellData[] = [];
-              const rows: TableCellData[][] = [];
-              const pct = Math.round((100 / cols) * 10) / 10;
-              innerBlocks.forEach((b) => {
-                const segs =
-                  b.segments ??
-                  (b.block_type === 'equation' && b.latex
-                    ? [{ type: 'math' as const, content: b.latex }]
-                    : []);
-                rowCells.push({
-                  segments: segs,
-                  alignment: 'left',
-                  width_pct: pct,
-                });
-                if (rowCells.length === cols) {
-                  rows.push([...rowCells]);
-                  rowCells.length = 0;
+            const colWidthPt = Math.max(100, containerW / cols - 8);
+            const colParseOpts: BlockParseOptions = {
+              ...opts,
+              indentLeftPt: 0,
+              containerWidthPt: colWidthPt,
+              baseFontSizePt: scopeFontSizePt,
+              defaultLineSpacing: defaultLineSp,
+            };
+            const explicitColParts = mBody.split(/\\columnbreak(?![a-zA-Z])\s*/);
+            let columnsBlocks: DocumentBlock[][];
+
+            if (explicitColParts.length >= 2) {
+              columnsBlocks = explicitColParts
+                .slice(0, cols)
+                .map((part) => parseBodyBlocks(part, ctx, mode, colParseOpts).flat());
+              while (columnsBlocks.length < cols) columnsBlocks.push([]);
+            } else {
+              const innerBlocks = parseBodyBlocks(mBody, ctx, mode, colParseOpts).flat();
+              const estimateWeight = (b: DocumentBlock): number => {
+                if (b.block_type === 'figure') return Math.max(4, (b.croppedHeightPx ?? 160) / 28);
+                if (b.block_type === 'equation') return 3.2;
+                if (b.block_type === 'table') return (b.table_rows?.length ?? 1) * 2.2;
+                const txtLen = (b.segments ?? []).reduce((s, seg) => s + (seg.content?.length ?? 0), 0);
+                return Math.max(1.5, Math.ceil(txtLen / 45));
+              };
+              const weights = innerBlocks.map(estimateWeight);
+              const totalWeight = weights.reduce((a, b) => a + b, 0);
+              const targetPerCol = totalWeight / cols;
+              columnsBlocks = Array.from({ length: cols }, () => []);
+              let curCol = 0;
+              let curW = 0;
+              innerBlocks.forEach((blk, idx) => {
+                if (
+                  curCol < cols - 1 &&
+                  columnsBlocks[curCol].length > 0 &&
+                  curW + weights[idx] * 0.5 > targetPerCol
+                ) {
+                  curCol++;
+                  curW = 0;
                 }
+                columnsBlocks[curCol].push(blk);
+                curW += weights[idx];
               });
-              if (rowCells.length > 0) rows.push(rowCells);
+            }
+
+            if (columnsBlocks.some((col) => col.length > 0)) {
+              const pct = Math.round((100 / cols) * 10) / 10;
+              const rowCells: TableCellData[] = columnsBlocks.map((colBlks) => ({
+                segments: [],
+                blocks: colBlks,
+                alignment: 'left',
+                v_align: 'top',
+                width_pct: pct,
+              }));
               pushBlock({
                 block_type: 'table',
                 alignment: 'left',
                 table_borderless: true,
-                font_size_pt: 12,
-                line_spacing: 1.15,
-                table_rows: rows,
+                table_style: 'borderless',
+                font_size_pt: scopeFontSizePt,
+                line_spacing: defaultLineSp,
+                indent_left_pt: opts.indentLeftPt > 0 ? opts.indentLeftPt : undefined,
+                table_rows: [rowCells],
               });
             }
             i = endIdx + closeToken.length;
@@ -5232,26 +7099,53 @@ function parseBodyBlocks(
             flushTextSlice(i);
             let tBody = envRawBody.trimStart();
             let cols = 2;
+            let hasExplicitCols = false;
+            let tasksLabelOpt: string | undefined = ctx.defaultTasksLabel;
             if (tBody.startsWith('[')) {
               const optBr = readBalancedBrackets(tBody, 0);
-              if (optBr) tBody = tBody.slice(optBr.endIdx + 1).trimStart();
+              if (optBr) {
+                const lblVal = extractBalancedKeyValOption(optBr.content, 'label');
+                if (lblVal) tasksLabelOpt = lblVal;
+                tBody = tBody.slice(optBr.endIdx + 1).trimStart();
+              }
             }
             const colParenM = tBody.match(/^\((\d+)\)/);
             if (colParenM) {
               cols = Math.max(1, Math.min(4, parseInt(colParenM[1], 10) || 2));
+              hasExplicitCols = true;
               tBody = tBody.slice(colParenM[0].length);
             }
+            const effectiveLabelOpt = tasksLabelOpt ?? '\\alph*)';
+            const isChoiceTasks =
+              /\\(?:Alph|alph)\*/.test(effectiveLabelOpt) ||
+              effectiveLabelOpt === '\\alph*)';
+
             const taskParts = tBody.split(/\\task\*?(?:\[[^\]]*\])?(?![a-zA-Z])\s*/).slice(1);
             if (taskParts.length > 0) {
               const rows: TableCellData[][] = [];
               let currentRow: TableCellData[] = [];
               const pct = Math.round((100 / cols) * 10) / 10;
+              const taskBaseStyle: InlineStyle = {
+                ...(scopeBold ? { bold: true } : {}),
+                ...(scopeItalic ? { italic: true } : {}),
+                ...(scopeFontSizePt !== 12 ? { font_size_pt: scopeFontSizePt } : {}),
+                ...(scopeColor ? { color: scopeColor } : {}),
+              };
               taskParts.forEach((tp, idx) => {
-                const lbl = `${String.fromCharCode(97 + (idx % 26))}) `;
+                const lblSegs = buildEnumBulletSegments(
+                  effectiveLabelOpt,
+                  'enumerate',
+                  1,
+                  idx,
+                  undefined,
+                  taskBaseStyle,
+                  mode,
+                  ctx
+                );
                 currentRow.push({
                   segments: [
-                    { type: 'text', content: lbl, bold: true },
-                    ...parseInlineSegmentText(tp.trim(), {}, mode, ctx),
+                    ...lblSegs,
+                    ...parseInlineSegmentText(tp.trim(), taskBaseStyle, mode, ctx),
                   ],
                   alignment: 'left',
                   width_pct: pct,
@@ -5261,16 +7155,138 @@ function parseBodyBlocks(
                   currentRow = [];
                 }
               });
-              if (currentRow.length > 0) rows.push(currentRow);
+              if (currentRow.length > 0) {
+                while (currentRow.length < cols) {
+                  currentRow.push({ segments: [], alignment: 'left', width_pct: pct });
+                }
+                rows.push(currentRow);
+              }
               pushBlock({
                 block_type: 'table',
                 alignment: 'left',
                 table_borderless: true,
-                font_size_pt: 12,
-                line_spacing: 1.15,
+                ...(isChoiceTasks ? { is_choice_block: true, preserve_col_count: hasExplicitCols } : {}),
+                font_size_pt: scopeFontSizePt,
+                line_spacing: defaultLineSp,
+                indent_left_pt: opts.indentLeftPt > 0 ? opts.indentLeftPt : undefined,
                 table_rows: rows,
               });
             }
+            i = endIdx + closeToken.length;
+            textStart = i;
+            continue;
+          }
+
+          if (envName === 'tabbing') {
+            flushTextSlice(i);
+            const normalizedTabbingBody = envRawBody.replace(/\\kill(?![a-zA-Z])[ \t]*\n?/g, '\x00KILL\x00\\\\');
+            const rawLines = splitTopLevelDoubleBackslash(normalizedTabbingBody);
+            let rulerWidths: number[] | null = null;
+            const parsedLines: string[][] = [];
+            for (const rawLine of rawLines) {
+              const isKill = rawLine.includes('\x00KILL\x00');
+              const cleaned = rawLine
+                .replace(/\x00KILL\x00/g, '')
+                .replace(/\\(?:pushtabs|poptabs)(?![a-zA-Z])\s*/g, '')
+                .replace(/\\[+-](?![a-zA-Z])/g, '');
+              if (!cleaned.trim()) continue;
+              const cols = cleaned.split(/\\(?:=|>)\\?/);
+              if (isKill) {
+                rulerWidths = cols.map((c) => {
+                  let extraPt = 0;
+                  const hsRe = /\\hspace\*?\s*\{([^}]+)\}/g;
+                  let hm: RegExpExecArray | null;
+                  while ((hm = hsRe.exec(c)) !== null) {
+                    const pt = parseLatexLengthToPt(hm[1], containerW, scopeFontSizePt);
+                    if (pt && pt > 0) extraPt += pt;
+                  }
+                  const plainLen = c
+                    .replace(/\\hspace\*?\s*\{[^}]+\}/g, '')
+                    .replace(/\\[a-zA-Z]+\*?|\$|\{|\}/g, '')
+                    .trim().length;
+                  return Math.max(24, plainLen * scopeFontSizePt * 0.55 + extraPt);
+                });
+                continue;
+              }
+              parsedLines.push(cols);
+            }
+            if (parsedLines.length > 0) {
+              const maxCols = Math.max(...parsedLines.map((r) => r.length), 1);
+              const totalRulerW = rulerWidths && rulerWidths.length >= maxCols
+                ? rulerWidths.slice(0, maxCols).reduce((a, b) => a + b, 0) || 1
+                : 0;
+              const tabBaseStyle: InlineStyle = {
+                ...(scopeBold ? { bold: true } : {}),
+                ...(scopeItalic ? { italic: true } : {}),
+                ...(scopeFontSizePt !== 12 ? { font_size_pt: scopeFontSizePt } : {}),
+                ...(scopeColor ? { color: scopeColor } : {}),
+              };
+              const tableRows: TableCellData[][] = parsedLines.map((rowCols) =>
+                Array.from({ length: maxCols }, (_, colIdx) => {
+                  const pct =
+                    totalRulerW > 0 && rulerWidths?.[colIdx]
+                      ? Math.round((rulerWidths[colIdx] / totalRulerW) * 1000) / 10
+                      : Math.round((100 / maxCols) * 10) / 10;
+                  return {
+                    segments: parseInlineSegmentText((rowCols[colIdx] ?? '').trim(), tabBaseStyle, mode, ctx),
+                    alignment: 'left',
+                    v_align: 'top',
+                    width_pct: pct,
+                  };
+                })
+              );
+              pushBlock({
+                block_type: 'table',
+                alignment: 'left',
+                table_borderless: true,
+                table_style: 'borderless',
+                font_size_pt: scopeFontSizePt,
+                line_spacing: defaultLineSp,
+                indent_left_pt: opts.indentLeftPt > 0 ? opts.indentLeftPt : undefined,
+                table_rows: tableRows,
+              });
+            }
+            i = endIdx + closeToken.length;
+            textStart = i;
+            continue;
+          }
+
+          if (
+            FONT_SIZE_PT_MAP[envName] ||
+            envName === 'bfseries' ||
+            envName === 'itshape' ||
+            envName === 'em' ||
+            envName === 'mdseries' ||
+            envName === 'upshape' ||
+            envName === 'rmfamily' ||
+            envName === 'sffamily' ||
+            envName === 'ttfamily'
+          ) {
+            flushTextSlice(i);
+            const innerPages = parseBodyBlocks(envRawBody, ctx, mode, {
+              ...opts,
+              defaultAlign: scopeAlign,
+              containerWidthPt: containerW,
+              baseFontSizePt: FONT_SIZE_PT_MAP[envName]
+                ? envName === 'normalsize'
+                  ? baseFontPt
+                  : FONT_SIZE_PT_MAP[envName]
+                : scopeFontSizePt,
+              defaultLineSpacing: defaultLineSp,
+              defaultBold:
+                envName === 'bfseries' ? true : envName === 'mdseries' ? false : scopeBold,
+              defaultItalic:
+                envName === 'itshape' || envName === 'em'
+                  ? true
+                  : envName === 'upshape'
+                  ? false
+                  : scopeItalic,
+              defaultColor: scopeColor,
+            });
+            innerPages.forEach((pg, pIdx) => {
+              if (pIdx > 0) pushPageBreak();
+              pg.forEach(pushBlock);
+            });
             i = endIdx + closeToken.length;
             textStart = i;
             continue;
@@ -5287,7 +7303,16 @@ function parseBodyBlocks(
             envName === 'adjustbox'
           ) {
             flushTextSlice(i);
-            const innerPages = parseBodyBlocks(envRawBody, ctx, mode, opts);
+            const innerPages = parseBodyBlocks(envRawBody, ctx, mode, {
+              ...opts,
+              defaultAlign: scopeAlign,
+              containerWidthPt: containerW,
+              baseFontSizePt: scopeFontSizePt,
+              defaultLineSpacing: defaultLineSp,
+              defaultBold: scopeBold,
+              defaultItalic: scopeItalic,
+              defaultColor: scopeColor,
+            });
             innerPages.forEach((pg, pIdx) => {
               if (pIdx > 0) pushPageBreak();
               pg.forEach(pushBlock);
@@ -5304,7 +7329,73 @@ function parseBodyBlocks(
   }
 
   flushTextSlice(src.length);
-  return pages.filter((p) => p.length > 0);
+  return pages
+    .map((pg) => consolidateChoiceParagraphRuns(pg))
+    .filter((p) => p.length > 0);
+}
+
+function consolidateChoiceParagraphRuns(blocks: DocumentBlock[]): DocumentBlock[] {
+  if (blocks.length < 4) return blocks;
+
+  const getParaPlainPrefix = (blk: DocumentBlock): string => {
+    if (blk.block_type !== 'paragraph' || !blk.segments || blk.segments.length === 0) return '';
+    if (blk.segments.some((s) => s.tab_before)) return '';
+    let acc = '';
+    for (const s of blk.segments) {
+      if (s.type === 'text') acc += s.content;
+      else if (s.type === 'math') acc += `$${s.content}$`;
+      if (acc.length > 220) break;
+    }
+    return acc.trim();
+  };
+
+  const out: DocumentBlock[] = [];
+  let idx = 0;
+
+  while (idx < blocks.length) {
+    if (idx + 3 < blocks.length) {
+      const slice4 = [blocks[idx], blocks[idx + 1], blocks[idx + 2], blocks[idx + 3]];
+      const prefixes = slice4.map(getParaPlainPrefix);
+      const isUpper4 =
+        prefixes.every((p) => p.length > 0 && p.length <= 180) &&
+        /^A[\.\)](?:\s+|\$)/.test(prefixes[0]) &&
+        /^B[\.\)](?:\s+|\$)/.test(prefixes[1]) &&
+        /^C[\.\)](?:\s+|\$)/.test(prefixes[2]) &&
+        /^D[\.\)](?:\s+|\$)/.test(prefixes[3]);
+      const isLower4 =
+        !isUpper4 &&
+        prefixes.every((p) => p.length > 0 && p.length <= 80) &&
+        /^a\)(?:\s+|\$)/.test(prefixes[0]) &&
+        /^b\)(?:\s+|\$)/.test(prefixes[1]) &&
+        /^c\)(?:\s+|\$)/.test(prefixes[2]) &&
+        /^d\)(?:\s+|\$)/.test(prefixes[3]);
+
+      if (isUpper4 || isLower4) {
+        const firstBlk = slice4[0];
+        const cells: TableCellData[] = slice4.map((b) => ({
+          segments: boldLeadingChoiceMarker(b.segments ?? []),
+          alignment: 'left',
+          width_pct: 25,
+        }));
+        out.push({
+          block_type: 'table',
+          alignment: 'left',
+          table_borderless: true,
+          is_choice_block: true,
+          font_size_pt: firstBlk.font_size_pt ?? 12,
+          line_spacing: firstBlk.line_spacing ?? 1.15,
+          ...(firstBlk.space_before_pt !== undefined ? { space_before_pt: firstBlk.space_before_pt } : {}),
+          ...(firstBlk.indent_left_pt !== undefined ? { indent_left_pt: firstBlk.indent_left_pt } : {}),
+          table_rows: [cells],
+        });
+        idx += 4;
+        continue;
+      }
+    }
+    out.push(blocks[idx]);
+    idx++;
+  }
+  return out;
 }
 
 export function normalizeTextToDollarLatex(rawText: string): string {
@@ -5778,24 +7869,31 @@ export function normalizeSegmentListInlineMath(
   return promoteNumbersAndSignsToMathSegments(splitResult, options);
 }
 
+function normalizeBlockListInlineMath(blocks: DocumentBlock[]): DocumentBlock[] {
+  return blocks.map((blk) => ({
+    ...blk,
+    ...(blk.segments ? { segments: normalizeSegmentListInlineMath(blk.segments) } : {}),
+    ...(blk.table_rows
+      ? {
+          table_rows: blk.table_rows.map((row) =>
+            row.map((cell) => ({
+              ...cell,
+              segments:
+                normalizeSegmentListInlineMath(cell.segments, { isTableCell: true }) ?? [],
+              ...(cell.blocks && cell.blocks.length > 0
+                ? { blocks: normalizeBlockListInlineMath(cell.blocks) }
+                : {}),
+            }))
+          ),
+        }
+      : {}),
+  }));
+}
+
 export function normalizePagesInlineMath(pages: PageExtraction[]): PageExtraction[] {
   return pages.map((page) => ({
     ...page,
-    blocks: page.blocks.map((blk) => ({
-      ...blk,
-      ...(blk.segments ? { segments: normalizeSegmentListInlineMath(blk.segments) } : {}),
-      ...(blk.table_rows
-        ? {
-            table_rows: blk.table_rows.map((row) =>
-              row.map((cell) => ({
-                ...cell,
-                segments:
-                  normalizeSegmentListInlineMath(cell.segments, { isTableCell: true }) ?? [],
-              }))
-            ),
-          }
-        : {}),
-    })),
+    blocks: normalizeBlockListInlineMath(page.blocks),
   }));
 }
 
@@ -5815,6 +7913,8 @@ export function parsePastedLatexToPages(
     isVietnamese,
     customTheorems,
     customColors,
+    defaultTasksLabel,
+    pageConfig,
   } = preprocessDocumentAndMacros(rawText);
   if (!body.trim()) return [];
 
@@ -5822,13 +7922,18 @@ export function parsePastedLatexToPages(
     isVietnamese,
     customTheorems,
     customColors,
+    defaultTasksLabel,
     figureAssets,
+    pageConfig,
   };
   const parseOpts: BlockParseOptions = {
     defaultAlign: 'left',
     isFullLatexDoc,
     listDepth: 0,
     indentLeftPt: 0,
+    containerWidthPt: pageConfig.contentWidthPt,
+    baseFontSizePt: pageConfig.baseFontSizePt,
+    defaultLineSpacing: pageConfig.defaultLineSpacing,
     meta: { title, author, date },
   };
 
@@ -5847,10 +7952,23 @@ export function parsePastedLatexToPages(
 
   if (pageBlockGroups.length === 0) return [];
 
+  const baseW = pageConfig.pageSize === 'letter' ? 1275 : pageConfig.pageSize === 'a5' ? 874 : 1240;
+  const baseH = pageConfig.pageSize === 'letter' ? 1650 : pageConfig.pageSize === 'a5' ? 1240 : 1754;
+  const pageWidthPx = pageConfig.isLandscape ? baseH : baseW;
+  const pageHeightPx = pageConfig.isLandscape ? baseW : baseH;
+
   const pages: PageExtraction[] = pageBlockGroups.map((blocks, idx) => ({
     pageNumber: idx + 1,
-    pageWidthPx: 1240,
-    pageHeightPx: 1754,
+    pageWidthPx,
+    pageHeightPx,
+    page_size: pageConfig.pageSize,
+    is_landscape: pageConfig.isLandscape,
+    margin_top_pt: pageConfig.marginTopPt,
+    margin_right_pt: pageConfig.marginRightPt,
+    margin_bottom_pt: pageConfig.marginBottomPt,
+    margin_left_pt: pageConfig.marginLeftPt,
+    base_font_size_pt: pageConfig.baseFontSizePt,
+    default_line_spacing: pageConfig.defaultLineSpacing,
     blocks,
   }));
 

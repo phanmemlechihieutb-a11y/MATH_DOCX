@@ -32,6 +32,7 @@ import {
   groupSegmentsByTabs,
   isChoiceTableBlock,
   isValidBox,
+  normalizeBoxHexColor,
   normalizeHexColor,
   transformBlocksForChoiceLayout,
   type PageGeometry,
@@ -88,15 +89,17 @@ const JUSTIFY_FLEX_MAP: Record<DocumentBlock['alignment'], string> = {
   justify: 'justify-start',
 };
 
-function getBlockFontSizePt(blk: DocumentBlock): number {
+function getBlockFontSizePt(blk: DocumentBlock, pageBaseFontPt = 12): number {
   if (typeof blk.font_size_pt === 'number' && Number.isFinite(blk.font_size_pt)) {
     return Math.max(7, Math.min(48, blk.font_size_pt));
   }
+  const base = Number.isFinite(pageBaseFontPt) ? Math.max(8, Math.min(20, pageBaseFontPt)) : 12;
   if (blk.block_type === 'heading') {
-    return blk.heading_level === 1 ? 15 : blk.heading_level === 3 ? 12 : 13;
+    const delta = base - 12;
+    return blk.heading_level === 1 ? 15 + delta : blk.heading_level === 3 ? 12 + delta : 13 + delta;
   }
-  if (blk.block_type === 'table') return 11;
-  return 12;
+  if (blk.block_type === 'table') return Math.min(base, 11);
+  return base;
 }
 
 function RenderSegments({
@@ -519,6 +522,44 @@ function InlineBlockEditor({
   }
 
   if (block.block_type === 'table') {
+    const hasNestedContainerBlocks = (block.table_rows ?? []).some((row) =>
+      row.some((cell) => Array.isArray(cell.blocks) && cell.blocks.length > 0)
+    );
+    if (hasNestedContainerBlocks) {
+      return (
+        <div
+          className="my-2 p-3.5 bg-slate-50 border border-blue-500 rounded-lg shadow-xs font-sans space-y-3"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="text-xs font-semibold text-slate-800">
+            Khối bố cục nhiều cột / hộp khung (tcolorbox, minipage, multicols, immini)
+          </div>
+          <p className="text-xs text-slate-600 leading-relaxed">
+            Khối này chứa nhiều đoạn văn, công thức hoặc hình vẽ lồng nhau. Hãy chỉnh sửa trực tiếp ở khung mã LaTeX bên trái để bảo toàn 100% cấu trúc bố cục.
+          </p>
+          <div className="flex items-center justify-end gap-2 pt-1">
+            {onDelete && (
+              <button
+                type="button"
+                onClick={onDelete}
+                className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-red-700 hover:bg-red-50 rounded-md transition-colors cursor-pointer mr-auto"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                Xóa khối
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={onCancel}
+              className="px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-300 hover:bg-slate-100 rounded-md transition-colors cursor-pointer"
+            >
+              Đóng
+            </button>
+          </div>
+        </div>
+      );
+    }
+
     const isChoice = isChoiceTableBlock(block);
     const activeCellText =
       activeCell && draftRows[activeCell.r]?.[activeCell.c] !== undefined
@@ -954,6 +995,7 @@ function RenderSingleBlock({
   indentLeftPt,
   indentRightPt,
   firstLineIndentPt,
+  pageBaseFontPt = 12,
   mathFormat = 'omml',
   disableEquationInspect = false,
   onSelectEquation,
@@ -966,12 +1008,13 @@ function RenderSingleBlock({
   indentLeftPt: number;
   indentRightPt: number;
   firstLineIndentPt: number;
+  pageBaseFontPt?: number;
   mathFormat?: MathOutputFormat;
   disableEquationInspect?: boolean;
   onSelectEquation?: (latex: string, isDisplay: boolean) => void;
 }) {
   const alignClass = ALIGN_CLASS_MAP[blk.alignment] ?? 'text-left';
-  const baseFontPt = getBlockFontSizePt(blk);
+  const baseFontPt = getBlockFontSizePt(blk, pageBaseFontPt);
   const lineHeight =
     typeof blk.line_spacing === 'number' && Number.isFinite(blk.line_spacing)
       ? Math.max(1.0, Math.min(2.4, blk.line_spacing))
@@ -1022,6 +1065,78 @@ function RenderSingleBlock({
 
   if (blk.block_type === 'paragraph') {
     const segs = blk.segments ?? [];
+    const tabSpecs = Array.isArray(blk.tab_stop_specs) ? blk.tab_stop_specs : null;
+    if (tabSpecs && tabSpecs.length > 0 && segs.some((s) => s.tab_before)) {
+      const groups = groupSegmentsByTabs(segs);
+      const hasContent = (grp: InlineSegment[]) =>
+        grp.some((s) => s.type === 'math' || (s.content ?? '').length > 0);
+      return (
+        <p
+          style={{
+            ...wrapperStyle,
+            textIndent: undefined,
+            display: 'flex',
+            flexWrap: 'nowrap',
+            alignItems: 'baseline',
+            width: '100%',
+            gap: '4px',
+          }}
+        >
+          {groups.map((grp, gIdx) => {
+            const spec = gIdx > 0 ? tabSpecs[gIdx - 1] ?? tabSpecs[tabSpecs.length - 1] : null;
+            const leader = spec?.leader ?? 'none';
+            const leaderBorder =
+              leader === 'dot'
+                ? '1.5px dotted #334155'
+                : leader === 'underscore'
+                ? '1px solid #1E293B'
+                : undefined;
+            const showGroup = hasContent(grp);
+            return (
+              <span
+                key={gIdx}
+                className={gIdx > 0 ? 'contents' : 'shrink-0'}
+              >
+                {gIdx > 0 && (
+                  <span
+                    className={spec?.fixed_width_pt ? 'shrink-0' : 'min-w-[16px]'}
+                    style={
+                      spec?.fixed_width_pt
+                        ? {
+                            width: `${spec.fixed_width_pt * scale}px`,
+                            borderBottom: leaderBorder,
+                            height: leaderBorder ? '0.82em' : undefined,
+                          }
+                        : {
+                            flexGrow: spec?.weight && spec.weight > 0 ? spec.weight : 1,
+                            flexShrink: 1,
+                            flexBasis: 0,
+                            borderBottom: leaderBorder,
+                            height: leaderBorder ? '0.82em' : undefined,
+                          }
+                    }
+                    aria-hidden="true"
+                  />
+                )}
+                {showGroup && (
+                  <span className="shrink-0">
+                    <RenderSegments
+                      segments={grp}
+                      baseFontPt={baseFontPt}
+                      scale={scale}
+                      mathFormat={mathFormat}
+                      disableEquationInspect={disableEquationInspect}
+                      onSelectEquation={onSelectEquation}
+                    />
+                  </span>
+                )}
+              </span>
+            );
+          })}
+        </p>
+      );
+    }
+
     const hasTabs =
       segs.some((s) => s.tab_before) &&
       Array.isArray(blk.tab_stops_pt) &&
@@ -1159,7 +1274,13 @@ function RenderSingleBlock({
   }
 
   if (blk.block_type === 'table' && blk.table_rows && blk.table_rows.length > 0) {
-    const isBorderless = Boolean(blk.table_borderless);
+    const tableStyle = blk.table_style ?? (blk.table_borderless ? 'borderless' : 'grid');
+    const isBorderless = tableStyle === 'borderless';
+    const isBooktabs = tableStyle === 'booktabs';
+    const isBox = tableStyle === 'box';
+    const isGrid = tableStyle === 'grid';
+    const colBorders = Array.isArray(blk.table_col_borders) ? blk.table_col_borders : null;
+
     const maxCols = Math.max(
       ...blk.table_rows.map((r) => r.reduce((acc, c) => acc + Math.max(1, c.col_span ?? 1), 0)),
       1
@@ -1176,6 +1297,8 @@ function RenderSingleBlock({
         })()
       : null;
 
+    const totalRows = blk.table_rows.length;
+
     return (
       <div
         style={{
@@ -1186,9 +1309,7 @@ function RenderSingleBlock({
         className="overflow-x-auto"
       >
         <table
-          className={`w-full border-collapse ${
-            isBorderless ? '' : 'border border-slate-400'
-          }`}
+          className="w-full border-collapse"
           style={{ tableLayout: colPcts ? 'fixed' : 'auto' }}
         >
           {colPcts && (
@@ -1199,38 +1320,223 @@ function RenderSingleBlock({
             </colgroup>
           )}
           <tbody>
-            {blk.table_rows.map((row, rIdx) => (
-              <tr key={rIdx}>
-                {row.map((cell, cIdx) => {
-                  const isHeader = Boolean(cell.is_header) && !isBorderless;
-                  const cellAlign = cell.alignment ?? (isHeader ? 'center' : 'left');
-                  const cellAlignClass = ALIGN_CLASS_MAP[cellAlign] ?? 'text-left';
-                  return (
-                    <td
-                      key={cIdx}
-                      colSpan={cell.col_span && cell.col_span > 1 ? cell.col_span : undefined}
-                      className={`${
-                        isBorderless
-                          ? 'px-1 py-0.5 align-top'
-                          : `border border-slate-300 px-2.5 py-1.5 ${
-                              isHeader ? 'bg-slate-100' : ''
-                            }`
-                      } ${cellAlignClass}`}
-                    >
-                      <RenderSegments
-                        segments={cell.segments}
-                        defaultBold={false}
-                        baseFontPt={isBorderless ? baseFontPt : Math.min(baseFontPt, 11)}
-                        scale={scale}
-                        mathFormat={mathFormat}
-                        disableEquationInspect={disableEquationInspect}
-                        onSelectEquation={onSelectEquation}
-                      />
-                    </td>
-                  );
-                })}
-              </tr>
-            ))}
+            {blk.table_rows.map((row, rIdx) => {
+              let colCursor = 0;
+              const rowWidthSum = row.reduce((s, c) => s + (c.width_pct ?? 0), 0) || 100;
+              return (
+                <tr key={rIdx}>
+                  {row.map((cell, cIdx) => {
+                    const span = Math.max(1, cell.col_span ?? 1);
+                    const startCol = colCursor;
+                    colCursor += span;
+
+                    const isHeader = Boolean(cell.is_header) && !isBorderless;
+                    const cellAlign = cell.alignment ?? (isHeader && !isBox ? 'center' : 'left');
+                    const cellAlignClass = ALIGN_CLASS_MAP[cellAlign] ?? 'text-left';
+                    const vAlignClass =
+                      cell.v_align === 'center'
+                        ? 'align-middle'
+                        : cell.v_align === 'bottom'
+                        ? 'align-bottom'
+                        : isBorderless || isBox || (cell.blocks && cell.blocks.length > 0)
+                        ? 'align-top'
+                        : 'align-middle';
+
+                    const customFill = normalizeBoxHexColor(cell.fill_color);
+                    const defaultHeaderFill = isHeader && isGrid && !colBorders;
+                    const borderHex =
+                      normalizeBoxHexColor(cell.border_color) ??
+                      (isBooktabs ? '0F172A' : isBox ? '334155' : '94A3B8');
+
+                    const cellStyle: CSSProperties = {};
+                    if (customFill) {
+                      cellStyle.backgroundColor = `#${customFill}`;
+                    }
+
+                    if (isBooktabs) {
+                      if (cell.border_top) {
+                        cellStyle.borderTop = `${rIdx === 0 ? 2 : 1}px solid #${borderHex}`;
+                      }
+                      if (cell.border_bottom) {
+                        cellStyle.borderBottom = `${
+                          rIdx === totalRows - 1 ? 2 : 1
+                        }px solid #${borderHex}`;
+                      }
+                      if (cell.border_left) {
+                        cellStyle.borderLeft = `1px solid #${borderHex}`;
+                      }
+                      if (cell.border_right) {
+                        cellStyle.borderRight = `1px solid #${borderHex}`;
+                      }
+                    } else if (isBox) {
+                      const drawTop =
+                        cell.border_top !== undefined && cell.border_top !== null
+                          ? cell.border_top
+                          : !blk.table_borderless;
+                      const drawBottom =
+                        cell.border_bottom !== undefined && cell.border_bottom !== null
+                          ? cell.border_bottom
+                          : !blk.table_borderless;
+                      const drawLeft =
+                        cell.border_left !== undefined && cell.border_left !== null
+                          ? cell.border_left
+                          : !blk.table_borderless;
+                      const drawRight =
+                        cell.border_right !== undefined && cell.border_right !== null
+                          ? cell.border_right
+                          : !blk.table_borderless;
+                      if (drawTop) cellStyle.borderTop = `1.5px solid #${borderHex}`;
+                      if (drawBottom) cellStyle.borderBottom = `1.5px solid #${borderHex}`;
+                      if (drawLeft) cellStyle.borderLeft = `1.5px solid #${borderHex}`;
+                      if (drawRight) cellStyle.borderRight = `1.5px solid #${borderHex}`;
+                    } else if (isGrid) {
+                      if (colBorders) {
+                        if (cell.border_top) cellStyle.borderTop = `1px solid #${borderHex}`;
+                        if (cell.border_bottom) cellStyle.borderBottom = `1px solid #${borderHex}`;
+                        const drawLeft =
+                          cell.border_left !== undefined && cell.border_left !== null
+                            ? cell.border_left
+                            : Boolean(colBorders[startCol]);
+                        const drawRight =
+                          cell.border_right !== undefined && cell.border_right !== null
+                            ? cell.border_right
+                            : Boolean(colBorders[startCol + span]);
+                        if (drawLeft) cellStyle.borderLeft = `1px solid #${borderHex}`;
+                        if (drawRight) cellStyle.borderRight = `1px solid #${borderHex}`;
+                      } else {
+                        cellStyle.borderTop =
+                          cell.border_top === false ? 'none' : `1px solid #CBD5E1`;
+                        cellStyle.borderBottom =
+                          cell.border_bottom === false ? 'none' : `1px solid #CBD5E1`;
+                        cellStyle.borderLeft =
+                          cell.border_left === false ? 'none' : `1px solid #CBD5E1`;
+                        cellStyle.borderRight =
+                          cell.border_right === false ? 'none' : `1px solid #CBD5E1`;
+                      }
+                    } else if (isBorderless) {
+                      if (cell.border_top) cellStyle.borderTop = `1px solid #${borderHex}`;
+                      if (cell.border_bottom) cellStyle.borderBottom = `1px solid #${borderHex}`;
+                      if (cell.border_left) cellStyle.borderLeft = `1px solid #${borderHex}`;
+                      if (cell.border_right) cellStyle.borderRight = `1px solid #${borderHex}`;
+                    }
+
+                    const hasNestedBlocks = Array.isArray(cell.blocks) && cell.blocks.length > 0;
+                    const cellFrac =
+                      cell.width_pct && cell.width_pct > 0
+                        ? cell.width_pct / rowWidthSum
+                        : span / maxCols;
+                    const cellContentW = Math.max(110, geom.contentWidthPt * cellFrac - 12);
+                    const cellGeom: PageGeometry = {
+                      ...geom,
+                      contentWidthPt: cellContentW,
+                      contentWidthTwips: Math.round(cellContentW * 20),
+                    };
+
+                    const padClass = isBox
+                      ? isHeader
+                        ? 'px-3.5 py-2'
+                        : 'px-3.5 py-2.5'
+                      : isBorderless
+                      ? 'px-1.5 py-0.5'
+                      : 'px-2.5 py-1.5';
+
+                    return (
+                      <td
+                        key={cIdx}
+                        colSpan={span > 1 ? span : undefined}
+                        style={cellStyle}
+                        className={`${padClass} ${vAlignClass} ${
+                          defaultHeaderFill ? 'bg-slate-100' : ''
+                        } ${cellAlignClass}`}
+                      >
+                        {hasNestedBlocks ? (
+                          <div>
+                            {groupBlocksIntoVisualBands(cell.blocks ?? [], cellGeom).map(
+                              (cBand, cbIdx) => {
+                                if (cBand.kind === 'single') {
+                                  return (
+                                    <RenderSingleBlock
+                                      key={cbIdx}
+                                      blk={cBand.block}
+                                      pageNumber={pageNumber}
+                                      geom={cellGeom}
+                                      scale={scale}
+                                      spaceBeforePt={cBand.spaceBeforePt}
+                                      indentLeftPt={cBand.indentLeftPt}
+                                      indentRightPt={cBand.indentRightPt}
+                                      firstLineIndentPt={cBand.firstLineIndentPt}
+                                      pageBaseFontPt={pageBaseFontPt}
+                                      mathFormat={mathFormat}
+                                      disableEquationInspect={disableEquationInspect}
+                                      onSelectEquation={onSelectEquation}
+                                    />
+                                  );
+                                }
+                                return (
+                                  <div
+                                    key={cbIdx}
+                                    style={{
+                                      marginTop: `${cBand.spaceBeforePt * scale}px`,
+                                      display: 'grid',
+                                      gridTemplateColumns: `${cBand.leftWidthPct}% ${cBand.rightWidthPct}%`,
+                                      gap: '10px',
+                                      alignItems: 'start',
+                                    }}
+                                  >
+                                    <div>
+                                      <RenderSingleBlock
+                                        blk={cBand.left}
+                                        pageNumber={pageNumber}
+                                        geom={cellGeom}
+                                        scale={scale}
+                                        spaceBeforePt={0}
+                                        indentLeftPt={0}
+                                        indentRightPt={0}
+                                        firstLineIndentPt={0}
+                                        pageBaseFontPt={pageBaseFontPt}
+                                        mathFormat={mathFormat}
+                                        disableEquationInspect={disableEquationInspect}
+                                        onSelectEquation={onSelectEquation}
+                                      />
+                                    </div>
+                                    <div>
+                                      <RenderSingleBlock
+                                        blk={cBand.right}
+                                        pageNumber={pageNumber}
+                                        geom={cellGeom}
+                                        scale={scale}
+                                        spaceBeforePt={0}
+                                        indentLeftPt={0}
+                                        indentRightPt={0}
+                                        firstLineIndentPt={0}
+                                        pageBaseFontPt={pageBaseFontPt}
+                                        mathFormat={mathFormat}
+                                        disableEquationInspect={disableEquationInspect}
+                                        onSelectEquation={onSelectEquation}
+                                      />
+                                    </div>
+                                  </div>
+                                );
+                              }
+                            )}
+                          </div>
+                        ) : (
+                          <RenderSegments
+                            segments={cell.segments}
+                            defaultBold={false}
+                            baseFontPt={isBorderless || isBox ? baseFontPt : Math.min(baseFontPt, 11)}
+                            scale={scale}
+                            mathFormat={mathFormat}
+                            disableEquationInspect={disableEquationInspect}
+                            onSelectEquation={onSelectEquation}
+                          />
+                        )}
+                      </td>
+                    );
+                  })}
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>
@@ -1477,6 +1783,7 @@ export function DocumentPreview({
                 indentLeftPt={options.indentLeftPt}
                 indentRightPt={options.indentRightPt}
                 firstLineIndentPt={options.firstLineIndentPt}
+                pageBaseFontPt={page.base_font_size_pt ?? 12}
                 mathFormat={mathFormat}
                 disableEquationInspect={isEditMode}
                 onSelectEquation={onSelectEquation}

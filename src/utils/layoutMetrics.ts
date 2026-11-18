@@ -76,15 +76,24 @@ export function isValidBox(box?: number[] | null): box is [number, number, numbe
 export function computePageGeometry(page: PageExtraction): PageGeometry {
   const wPx = page.pageWidthPx ?? 1240;
   const hPx = page.pageHeightPx ?? 1754;
-  const isLandscape = wPx > hPx;
+  const isLandscape =
+    typeof page.is_landscape === 'boolean' ? page.is_landscape : wPx > hPx;
   const aspect = wPx / Math.max(1, hPx);
 
   const a4Aspect = isLandscape ? 11.69 / 8.27 : 8.27 / 11.69;
   const letterAspect = isLandscape ? 11 / 8.5 : 8.5 / 11;
-  const useLetter = Math.abs(aspect - letterAspect) < Math.abs(aspect - a4Aspect);
+  const useLetter =
+    page.page_size === 'letter' ||
+    (page.page_size !== 'a4' &&
+      page.page_size !== 'a5' &&
+      Math.abs(aspect - letterAspect) < Math.abs(aspect - a4Aspect));
 
-  const portraitW = useLetter ? 612 : 595.3;
-  const portraitH = useLetter ? 792 : 841.9;
+  let portraitW = useLetter ? 612 : 595.3;
+  let portraitH = useLetter ? 792 : 841.9;
+  if (page.page_size === 'a5') {
+    portraitW = 419.5;
+    portraitH = 595.3;
+  }
 
   const pageWidthPt = isLandscape ? portraitH : portraitW;
   const pageHeightPt = isLandscape ? portraitW : portraitH;
@@ -106,18 +115,47 @@ export function computePageGeometry(page: PageExtraction): PageGeometry {
   }
 
   const defaultMarginPt = 54;
-  const marginLeftPt = hasAnyBox
-    ? clamp((minX / 1000) * pageWidthPt, 24, 96)
-    : defaultMarginPt;
-  const marginRightPt = hasAnyBox
-    ? clamp(((1000 - maxX) / 1000) * pageWidthPt, 24, 96)
-    : defaultMarginPt;
-  const marginTopPt = hasAnyBox
-    ? clamp((minY / 1000) * pageHeightPt, 24, 96)
-    : defaultMarginPt;
-  const marginBottomPt = hasAnyBox
-    ? clamp(((1000 - maxY) / 1000) * pageHeightPt, 28, 96)
-    : defaultMarginPt;
+  const explicitLeft =
+    typeof page.margin_left_pt === 'number' && Number.isFinite(page.margin_left_pt)
+      ? clamp(page.margin_left_pt, 14, 180)
+      : null;
+  const explicitRight =
+    typeof page.margin_right_pt === 'number' && Number.isFinite(page.margin_right_pt)
+      ? clamp(page.margin_right_pt, 14, 180)
+      : null;
+  const explicitTop =
+    typeof page.margin_top_pt === 'number' && Number.isFinite(page.margin_top_pt)
+      ? clamp(page.margin_top_pt, 14, 180)
+      : null;
+  const explicitBottom =
+    typeof page.margin_bottom_pt === 'number' && Number.isFinite(page.margin_bottom_pt)
+      ? clamp(page.margin_bottom_pt, 14, 180)
+      : null;
+
+  const marginLeftPt =
+    explicitLeft !== null
+      ? explicitLeft
+      : hasAnyBox
+      ? clamp((minX / 1000) * pageWidthPt, 24, 96)
+      : defaultMarginPt;
+  const marginRightPt =
+    explicitRight !== null
+      ? explicitRight
+      : hasAnyBox
+      ? clamp(((1000 - maxX) / 1000) * pageWidthPt, 24, 96)
+      : defaultMarginPt;
+  const marginTopPt =
+    explicitTop !== null
+      ? explicitTop
+      : hasAnyBox
+      ? clamp((minY / 1000) * pageHeightPt, 24, 96)
+      : defaultMarginPt;
+  const marginBottomPt =
+    explicitBottom !== null
+      ? explicitBottom
+      : hasAnyBox
+      ? clamp(((1000 - maxY) / 1000) * pageHeightPt, 28, 96)
+      : defaultMarginPt;
 
   const pageWidthTwips = Math.round(pageWidthPt * 20);
   const pageHeightTwips = Math.round(pageHeightPt * 20);
@@ -156,13 +194,21 @@ function getCellPlainText(cell: TableCellData): string {
 
 export function isChoiceTableBlock(blk: DocumentBlock): boolean {
   if (blk.block_type !== 'table' || !blk.table_rows || blk.table_rows.length === 0) return false;
-  // Tuyệt đối không phá vỡ bảng có khung viền, bảng có tiêu đề hoặc bảng có ô gộp cột (col_span)
+  // Tuyệt đối không phá vỡ bảng có khung viền, bảng có tiêu đề, bảng booktabs/box, bảng lồng khối hoặc bảng có ô gộp cột (col_span)
   if (blk.table_borderless !== true) return false;
+  if (blk.table_style === 'box' || blk.table_style === 'booktabs' || blk.table_style === 'grid') {
+    return false;
+  }
 
-  const hasHeaderOrMergedCell = blk.table_rows.some((row) =>
-    row.some((c) => c.is_header === true || (c.col_span ?? 1) > 1)
+  const hasHeaderMergedOrNested = blk.table_rows.some((row) =>
+    row.some(
+      (c) =>
+        c.is_header === true ||
+        (c.col_span ?? 1) > 1 ||
+        (Array.isArray(c.blocks) && c.blocks.length > 0)
+    )
   );
-  if (hasHeaderOrMergedCell) return false;
+  if (hasHeaderMergedOrNested) return false;
 
   let choiceCellCount = 0;
   for (const row of blk.table_rows) {
@@ -439,7 +485,8 @@ function reflowChoiceTableIfNeeded(blk: DocumentBlock, geom: PageGeometry): Docu
     ...cells.map((c) => estimateSegmentsWidthPt(c.segments ?? [], fontSizePt))
   );
   const colAvail = availWidthPt / currentCols - 10;
-  if (maxCellW <= colAvail) return blk;
+  const allowTolerance = blk.preserve_col_count ? 1.38 : 1.0;
+  if (maxCellW <= colAvail * allowTolerance) return blk;
 
   const twoColAvail = availWidthPt / 2 - 12;
   if (cells.length === 4 && currentCols >= 3 && maxCellW <= twoColAvail) {
@@ -480,6 +527,7 @@ function ensureTabStopsOnChoiceParagraph(
   geom: PageGeometry
 ): DocumentBlock[] {
   if (blk.block_type !== 'paragraph' || !blk.segments || blk.segments.length === 0) return [blk];
+  if (Array.isArray(blk.tab_stop_specs) && blk.tab_stop_specs.length > 0) return [blk];
   const groups = splitSegmentsIntoChoiceGroups(blk.segments);
   if (!groups || groups.length < 2) return [blk];
 
@@ -529,6 +577,28 @@ export function transformBlocksForChoiceLayout(
   const result: DocumentBlock[] = [];
 
   for (const blk of blocks) {
+    if (blk.block_type === 'table' && blk.table_rows && blk.table_rows.some((r) => r.some((c) => c.blocks && c.blocks.length > 0))) {
+      const transformedRows = blk.table_rows.map((row) => {
+        const totalPct = row.reduce((s, c) => s + (c.width_pct ?? 0), 0) || 100;
+        return row.map((cell) => {
+          if (!cell.blocks || cell.blocks.length === 0) return cell;
+          const frac = cell.width_pct && cell.width_pct > 0 ? cell.width_pct / totalPct : 1 / Math.max(1, row.length);
+          const cellContentWidthPt = Math.max(110, geom.contentWidthPt * frac - 12);
+          const cellGeom: PageGeometry = {
+            ...geom,
+            contentWidthPt: cellContentWidthPt,
+            contentWidthTwips: Math.round(cellContentWidthPt * 20),
+          };
+          return {
+            ...cell,
+            blocks: transformBlocksForChoiceLayout(cell.blocks, choiceLayout, cellGeom),
+          };
+        });
+      });
+      result.push({ ...blk, table_rows: transformedRows });
+      continue;
+    }
+
     if (choiceLayout === 'tabs') {
       if (isChoiceTableBlock(blk)) {
         const reflowed = reflowChoiceTableIfNeeded(blk, geom);
@@ -638,8 +708,13 @@ function computeSpaceBeforePt(
   currTopNorm: number | null,
   geom: PageGeometry,
   isFirstOnPage: boolean,
-  blockType?: DocumentBlock['block_type']
+  blockType?: DocumentBlock['block_type'],
+  explicitSpaceBeforePt?: number | null
 ): number {
+  if (typeof explicitSpaceBeforePt === 'number' && Number.isFinite(explicitSpaceBeforePt)) {
+    return clamp(Math.round(explicitSpaceBeforePt * 10) / 10, 0, 240);
+  }
+
   if (currTopNorm !== null) {
     if (isFirstOnPage) {
       const topGapPt = (currTopNorm / 1000) * geom.pageHeightPt - geom.marginTopPt;
@@ -723,7 +798,8 @@ export function groupBlocksIntoVisualBands(
       currBox ? currBox[0] : null,
       geom,
       bands.length === 0,
-      curr.block_type
+      curr.block_type,
+      curr.space_before_pt
     );
     const { indentLeftPt, indentRightPt, firstLineIndentPt } = computeBlockHorizontalOffsets(
       curr,
@@ -815,4 +891,23 @@ export function normalizeHexColor(color?: string | null): string | null {
   if (!/^[0-9A-F]{6}$/.test(cleaned)) return null;
   if (cleaned === '000000' || cleaned === '0F172A' || cleaned === '111827') return null;
   return cleaned;
+}
+
+export function normalizeBoxHexColor(color?: string | null): string | null {
+  if (!color || typeof color !== 'string') return null;
+  const raw = color.trim();
+  if (!raw) return null;
+  const cleaned = raw.replace(/^#/, '').toUpperCase();
+  if (/^[0-9A-F]{6}$/.test(cleaned)) return cleaned;
+  if (/^[0-9A-F]{3}$/.test(cleaned)) {
+    return cleaned
+      .split('')
+      .map((ch) => ch + ch)
+      .join('');
+  }
+  const lower = raw.toLowerCase();
+  if (lower === 'white') return 'FFFFFF';
+  if (lower === 'black') return '0F172A';
+  if (NAMED_HEX_COLORS[lower]) return NAMED_HEX_COLORS[lower];
+  return null;
 }

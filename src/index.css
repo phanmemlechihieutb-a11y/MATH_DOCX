@@ -16,5 +16,17 @@
 }
 
 .doc-serif {
-  font-family: "Times New Roman", "Noto Serif", Georgia, serif;
+  font-family: "Times New Roman", "Liberation Serif", "Nimbus Roman", "Noto Serif", Georgia, serif;
+}
+
+.doc-serif .katex {
+  font-size: 1.03em;
+}
+
+.doc-serif .katex-display {
+  margin: 0.25em 0;
+}
+
+.doc-serif .katex-display > .katex {
+  font-size: 1.08em;
 }

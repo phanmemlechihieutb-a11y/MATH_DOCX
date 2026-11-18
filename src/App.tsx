@@ -404,20 +404,22 @@ export default function App() {
   }, [handlePasteEventForImage]);
 
   const svgDataUrlToPngDataUrl = useCallback(
-    async (svgUrl: string, fallbackW = 420, fallbackH = 300): Promise<string> => {
-      if (!svgUrl.startsWith('data:image/svg+xml')) return svgUrl;
+    async (dataUrl: string, fallbackW = 420, fallbackH = 300): Promise<string> => {
+      const isSvg = dataUrl.startsWith('data:image/svg+xml');
+      const isWebp = dataUrl.startsWith('data:image/webp');
+      if (!isSvg && !isWebp) return dataUrl;
       return await new Promise<string>((resolve) => {
         const img = new Image();
         img.onload = () => {
           const w = Math.max(40, img.naturalWidth || fallbackW);
           const h = Math.max(40, img.naturalHeight || fallbackH);
-          const scale = 2.5;
+          const scale = isSvg ? 2.5 : 1;
           const canvas = document.createElement('canvas');
           canvas.width = Math.round(w * scale);
           canvas.height = Math.round(h * scale);
           const ctx = canvas.getContext('2d');
           if (!ctx) {
-            resolve(svgUrl);
+            resolve(dataUrl);
             return;
           }
           ctx.fillStyle = '#FFFFFF';
@@ -425,8 +427,8 @@ export default function App() {
           ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
           resolve(canvas.toDataURL('image/png'));
         };
-        img.onerror = () => resolve(svgUrl);
-        img.src = svgUrl;
+        img.onerror = () => resolve(dataUrl);
+        img.src = dataUrl;
       });
     },
     []
@@ -440,25 +442,84 @@ export default function App() {
       layout: ChoiceLayoutMode,
       format: MathOutputFormat
     ) => {
+      const prepareBlockMedia = async (blk: DocumentBlock): Promise<DocumentBlock> => {
+        if (
+          blk.block_type === 'figure' &&
+          (blk.croppedImageDataUrl?.startsWith('data:image/svg+xml') ||
+            blk.croppedImageDataUrl?.startsWith('data:image/webp'))
+        ) {
+          const pngUrl = await svgDataUrlToPngDataUrl(
+            blk.croppedImageDataUrl,
+            blk.croppedWidthPx ?? 420,
+            blk.croppedHeightPx ?? 300
+          );
+          return { ...blk, croppedImageDataUrl: pngUrl };
+        }
+        if (blk.block_type === 'table' && blk.table_rows) {
+          const hasNestedBlocks = blk.table_rows.some((r) =>
+            r.some((c) => Array.isArray(c.blocks) && c.blocks.length > 0)
+          );
+          if (hasNestedBlocks) {
+            const nextRows = await Promise.all(
+              blk.table_rows.map((row) =>
+                Promise.all(
+                  row.map(async (cell) =>
+                    Array.isArray(cell.blocks) && cell.blocks.length > 0
+                      ? { ...cell, blocks: await Promise.all(cell.blocks.map(prepareBlockMedia)) }
+                      : cell
+                  )
+                )
+              )
+            );
+            return { ...blk, table_rows: nextRows };
+          }
+        }
+        return blk;
+      };
+
+      const downscaleBlockMedia = async (
+        blk: DocumentBlock,
+        scale: number
+      ): Promise<DocumentBlock> => {
+        if (
+          blk.block_type === 'figure' &&
+          blk.croppedImageDataUrl &&
+          blk.croppedImageDataUrl.length > 180_000
+        ) {
+          const smaller = await downscalePngDataUrl(blk.croppedImageDataUrl, scale);
+          return { ...blk, croppedImageDataUrl: smaller };
+        }
+        if (blk.block_type === 'table' && blk.table_rows) {
+          const hasNestedBlocks = blk.table_rows.some((r) =>
+            r.some((c) => Array.isArray(c.blocks) && c.blocks.length > 0)
+          );
+          if (hasNestedBlocks) {
+            const nextRows = await Promise.all(
+              blk.table_rows.map((row) =>
+                Promise.all(
+                  row.map(async (cell) =>
+                    Array.isArray(cell.blocks) && cell.blocks.length > 0
+                      ? {
+                          ...cell,
+                          blocks: await Promise.all(
+                            cell.blocks.map((cb) => downscaleBlockMedia(cb, scale))
+                          ),
+                        }
+                      : cell
+                  )
+                )
+              )
+            );
+            return { ...blk, table_rows: nextRows };
+          }
+        }
+        return blk;
+      };
+
       const preparedPages: PageExtraction[] = await Promise.all(
         pagesToExport.map(async (page) => ({
           ...page,
-          blocks: await Promise.all(
-            page.blocks.map(async (blk) => {
-              if (
-                blk.block_type === 'figure' &&
-                blk.croppedImageDataUrl?.startsWith('data:image/svg+xml')
-              ) {
-                const pngUrl = await svgDataUrlToPngDataUrl(
-                  blk.croppedImageDataUrl,
-                  blk.croppedWidthPx ?? 420,
-                  blk.croppedHeightPx ?? 300
-                );
-                return { ...blk, croppedImageDataUrl: pngUrl };
-              }
-              return blk;
-            })
-          ),
+          blocks: await Promise.all(page.blocks.map(prepareBlockMedia)),
         }))
       );
 
@@ -476,17 +537,7 @@ export default function App() {
             preparedPages.map(async (page) => ({
               ...page,
               blocks: await Promise.all(
-                page.blocks.map(async (blk) => {
-                  if (
-                    blk.block_type === 'figure' &&
-                    blk.croppedImageDataUrl &&
-                    blk.croppedImageDataUrl.length > 180_000
-                  ) {
-                    const smaller = await downscalePngDataUrl(blk.croppedImageDataUrl, scale);
-                    return { ...blk, croppedImageDataUrl: smaller };
-                  }
-                  return blk;
-                })
+                page.blocks.map((blk) => downscaleBlockMedia(blk, scale))
               ),
             }))
           );
@@ -549,19 +600,26 @@ export default function App() {
           }
         };
 
-        for (const p of normalizedPages) {
-          for (const blk of p.blocks) {
-            if (blk.block_type === 'equation' && blk.latex) addEq(blk.latex, true);
-            for (const seg of blk.segments ?? []) {
-              if (seg.type === 'math' && seg.content) addEq(seg.content, false);
-            }
-            for (const row of blk.table_rows ?? []) {
-              for (const cell of row) {
-                for (const seg of cell.segments ?? []) {
-                  if (seg.type === 'math' && seg.content) addEq(seg.content, false);
-                }
+        const collectFromBlock = (blk: DocumentBlock) => {
+          if (blk.block_type === 'equation' && blk.latex) addEq(blk.latex, true);
+          for (const seg of blk.segments ?? []) {
+            if (seg.type === 'math' && seg.content) addEq(seg.content, false);
+          }
+          for (const row of blk.table_rows ?? []) {
+            for (const cell of row) {
+              for (const seg of cell.segments ?? []) {
+                if (seg.type === 'math' && seg.content) addEq(seg.content, false);
+              }
+              for (const nestedBlk of cell.blocks ?? []) {
+                collectFromBlock(nestedBlk);
               }
             }
+          }
+        };
+
+        for (const p of normalizedPages) {
+          for (const blk of p.blocks) {
+            collectFromBlock(blk);
           }
         }
 
@@ -860,19 +918,26 @@ export default function App() {
         }
       };
 
-      for (const p of normalizedPages) {
-        for (const blk of p.blocks) {
-          if (blk.block_type === 'equation' && blk.latex) addEq(blk.latex, true);
-          for (const seg of blk.segments ?? []) {
-            if (seg.type === 'math' && seg.content) addEq(seg.content, false);
-          }
-          for (const row of blk.table_rows ?? []) {
-            for (const cell of row) {
-              for (const seg of cell.segments ?? []) {
-                if (seg.type === 'math' && seg.content) addEq(seg.content, false);
-              }
+      const collectFromBlock = (blk: DocumentBlock) => {
+        if (blk.block_type === 'equation' && blk.latex) addEq(blk.latex, true);
+        for (const seg of blk.segments ?? []) {
+          if (seg.type === 'math' && seg.content) addEq(seg.content, false);
+        }
+        for (const row of blk.table_rows ?? []) {
+          for (const cell of row) {
+            for (const seg of cell.segments ?? []) {
+              if (seg.type === 'math' && seg.content) addEq(seg.content, false);
+            }
+            for (const nestedBlk of cell.blocks ?? []) {
+              collectFromBlock(nestedBlk);
             }
           }
+        }
+      };
+
+      for (const p of normalizedPages) {
+        for (const blk of p.blocks) {
+          collectFromBlock(blk);
         }
       }
 
@@ -1115,29 +1180,36 @@ export default function App() {
         }
       };
 
-      for (const p of finalPages) {
-        for (const blk of p.blocks) {
-          if (blk.block_type === 'equation' && blk.latex) {
-            addEqQuery(blk.latex, true);
-          }
-          if (blk.segments) {
-            for (const seg of blk.segments) {
-              if (seg.type === 'math' && seg.content) {
-                addEqQuery(seg.content, false);
-              }
+      const collectFromBlock = (blk: DocumentBlock) => {
+        if (blk.block_type === 'equation' && blk.latex) {
+          addEqQuery(blk.latex, true);
+        }
+        if (blk.segments) {
+          for (const seg of blk.segments) {
+            if (seg.type === 'math' && seg.content) {
+              addEqQuery(seg.content, false);
             }
           }
-          if (blk.table_rows) {
-            for (const row of blk.table_rows) {
-              for (const cell of row) {
-                for (const seg of cell.segments ?? []) {
-                  if (seg.type === 'math' && seg.content) {
-                    addEqQuery(seg.content, false);
-                  }
+        }
+        if (blk.table_rows) {
+          for (const row of blk.table_rows) {
+            for (const cell of row) {
+              for (const seg of cell.segments ?? []) {
+                if (seg.type === 'math' && seg.content) {
+                  addEqQuery(seg.content, false);
                 }
               }
+              for (const nestedBlk of cell.blocks ?? []) {
+                collectFromBlock(nestedBlk);
+              }
             }
           }
+        }
+      };
+
+      for (const p of finalPages) {
+        for (const blk of p.blocks) {
+          collectFromBlock(blk);
         }
       }
 
@@ -1399,47 +1471,53 @@ export default function App() {
   const equationsList = useMemo<ExtractedEquationItem[]>(() => {
     const items: ExtractedEquationItem[] = [];
     let counter = 1;
-    for (const page of displayPreviewPages) {
-      for (const blk of page.blocks) {
-        if (blk.block_type === 'equation' && blk.latex) {
-          items.push({
-            id: counter++,
-            pageNumber: page.pageNumber,
-            isDisplay: true,
-            latex: blk.latex,
-            ommlPreview: ommlMap[`D:${blk.latex}`],
-          });
-        }
-        if (blk.segments) {
-          for (const seg of blk.segments) {
-            if (seg.type === 'math' && seg.content) {
-              items.push({
-                id: counter++,
-                pageNumber: page.pageNumber,
-                isDisplay: false,
-                latex: seg.content,
-                ommlPreview: ommlMap[`I:${seg.content}`],
-              });
-            }
+    const visitBlock = (blk: DocumentBlock, pageNumber: number) => {
+      if (blk.block_type === 'equation' && blk.latex) {
+        items.push({
+          id: counter++,
+          pageNumber,
+          isDisplay: true,
+          latex: blk.latex,
+          ommlPreview: ommlMap[`D:${blk.latex}`],
+        });
+      }
+      if (blk.segments) {
+        for (const seg of blk.segments) {
+          if (seg.type === 'math' && seg.content) {
+            items.push({
+              id: counter++,
+              pageNumber,
+              isDisplay: false,
+              latex: seg.content,
+              ommlPreview: ommlMap[`I:${seg.content}`],
+            });
           }
         }
-        if (blk.table_rows) {
-          for (const row of blk.table_rows) {
-            for (const cell of row) {
-              for (const seg of cell.segments ?? []) {
-                if (seg.type === 'math' && seg.content) {
-                  items.push({
-                    id: counter++,
-                    pageNumber: page.pageNumber,
-                    isDisplay: false,
-                    latex: seg.content,
-                    ommlPreview: ommlMap[`I:${seg.content}`],
-                  });
-                }
+      }
+      if (blk.table_rows) {
+        for (const row of blk.table_rows) {
+          for (const cell of row) {
+            for (const seg of cell.segments ?? []) {
+              if (seg.type === 'math' && seg.content) {
+                items.push({
+                  id: counter++,
+                  pageNumber,
+                  isDisplay: false,
+                  latex: seg.content,
+                  ommlPreview: ommlMap[`I:${seg.content}`],
+                });
               }
             }
+            for (const nestedBlk of cell.blocks ?? []) {
+              visitBlock(nestedBlk, pageNumber);
+            }
           }
         }
+      }
+    };
+    for (const page of displayPreviewPages) {
+      for (const blk of page.blocks) {
+        visitBlock(blk, page.pageNumber);
       }
     }
     return items;
@@ -1448,18 +1526,30 @@ export default function App() {
   const figuresList = useMemo<CroppedFigureItem[]>(() => {
     const list: CroppedFigureItem[] = [];
     let counter = 1;
+    const visitBlock = (blk: DocumentBlock, pageNumber: number) => {
+      if (blk.block_type === 'figure' && blk.croppedImageDataUrl) {
+        list.push({
+          id: counter++,
+          pageNumber,
+          dataUrl: blk.croppedImageDataUrl,
+          width: blk.croppedWidthPx ?? 0,
+          height: blk.croppedHeightPx ?? 0,
+          caption: blk.caption,
+        });
+      }
+      if (blk.table_rows) {
+        for (const row of blk.table_rows) {
+          for (const cell of row) {
+            for (const nestedBlk of cell.blocks ?? []) {
+              visitBlock(nestedBlk, pageNumber);
+            }
+          }
+        }
+      }
+    };
     for (const page of displayPreviewPages) {
       for (const blk of page.blocks) {
-        if (blk.block_type === 'figure' && blk.croppedImageDataUrl) {
-          list.push({
-            id: counter++,
-            pageNumber: page.pageNumber,
-            dataUrl: blk.croppedImageDataUrl,
-            width: blk.croppedWidthPx ?? 0,
-            height: blk.croppedHeightPx ?? 0,
-            caption: blk.caption,
-          });
-        }
+        visitBlock(blk, page.pageNumber);
       }
     }
     return list;
