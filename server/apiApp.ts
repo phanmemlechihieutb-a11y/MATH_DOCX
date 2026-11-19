@@ -4,6 +4,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import type { PageExtraction } from '../src/types/document.ts';
 import { normalizePagesInlineMath } from '../src/utils/latexParser.ts';
+import { normalizePagesTableGrids } from '../src/utils/layoutMetrics.ts';
 import { buildDocxBuffer } from './docxBuilder.ts';
 import { latexToOmmlXml } from './omml.ts';
 
@@ -58,7 +59,7 @@ const inlineSegmentSchema = {
     color: {
       type: Type.STRING,
       description:
-        '6-digit hex color like #DC2626 or #1D4ED8 whenever the text/symbol/math color in the PDF is NOT black/dark-gray. Omit for black text.',
+        'Exact 6-digit hex color "#RRGGBB" matching the true ink color on the page (e.g. #FF0000 pure red, #C00000 dark red, #0000FF pure blue, #0070C0 Office blue, #002060 navy, #008000 green, #7030A0 purple, #E36C0A orange) whenever the text/symbol/math is NOT black. Omit for black ink.',
     },
     tab_before: {
       type: Type.BOOLEAN,
@@ -120,6 +121,16 @@ const pageExtractionSchema = {
             type: Type.STRING,
             description: 'Pure LaTeX for standalone display equation (without $$).',
           },
+          bold: {
+            type: Type.BOOLEAN,
+            description:
+              'For block_type="equation" only: true ONLY if the entire standalone equation is visually boldface.',
+          },
+          color: {
+            type: Type.STRING,
+            description:
+              'For block_type="equation" only: exact 6-digit hex color "#RRGGBB" if the standalone equation is colored (not black). Omit for black.',
+          },
           table_borderless: {
             type: Type.BOOLEAN,
             description:
@@ -132,6 +143,8 @@ const pageExtractionSchema = {
           },
           table_rows: {
             type: Type.ARRAY,
+            description:
+              'CRITICAL: Every row MUST span the EXACT same total number of columns (sum of col_span) as the header row! Never omit empty leading/middle cells or cells covered by a vertical merge (rowspan) from a row above: ALWAYS include an empty placeholder cell {"segments": []} (with v_merge="continue" if vertically merged from above) at the exact column position so subsequent columns never shift left.',
             items: {
               type: Type.ARRAY,
               items: {
@@ -152,7 +165,15 @@ const pageExtractionSchema = {
                   },
                   col_span: {
                     type: Type.INTEGER,
-                    description: 'Number of columns spanned by this cell (default 1).',
+                    description: 'Number of columns spanned horizontally by this cell (default 1).',
+                  },
+                  row_span: {
+                    type: Type.INTEGER,
+                    description: 'Number of rows spanned vertically by this cell if vertically merged (default 1).',
+                  },
+                  v_merge: {
+                    type: Type.STRING,
+                    description: "Set 'restart' on the top cell of a vertically merged column group, and 'continue' on each empty placeholder cell below it in the same column.",
                   },
                 },
                 required: ['segments'],
@@ -185,12 +206,14 @@ Quy tắc bắt buộc:
    - BẮT BUỘC trả về box_2d=[ymin, xmin, ymax, xmax] trên thang chuẩn hóa 0..1000 cho MỌI khối (heading, paragraph, equation, table, figure, horizontal_rule).
    - Hệ thống dùng box_2d để tính chính xác lề trang, khoảng cách dọc giữa các đoạn, vị trí thụt lề ngang, độ rộng hình vẽ và bố cục đặt cạnh nhau (ví dụ: đề bài bên trái, hình vẽ bên phải).
 2. ĐỊNH DẠNG IN ĐẬM / IN NGHIÊNG / GẠCH CHÂN / CỠ CHỮ / MÀU SẮC (ĐÚNG 100% THEO TRANG PDF GỐC):
-   - IN ĐẬM (bold): Quan sát thật kỹ độ dày nét chữ (stroke weight) trên ảnh PDF. CHỈ đặt bold=true cho các từ/cụm từ THỰC SỰ IN ĐẬM (nét chữ dày đậm rõ rệt hơn văn bản thường). MỌI chữ có nét mảnh/bình thường — kể cả tiêu đề phụ, dòng căn giữa, dòng cỡ chữ lớn hơn, chữ in nghiêng, ghi chú trong ngoặc, hàng tiêu đề bảng không in đậm, phần đề bài sau "Câu 1.", hoặc nội dung đáp án sau "A.", "B.", "C.", "D." — TUYỆT ĐỐI KHÔNG được gán bold=true (bắt buộc bỏ qua hoặc để bold=false).
+   - IN ĐẬM (bold): Quan sát thật kỹ độ dày nét chữ (stroke weight) của TỪNG TỪ, TỪNG SỐ và TỪNG Ô BẢNG trên ảnh PDF. CHỈ đặt bold=true khi nét chữ thực sự dày đậm rõ rệt hơn văn bản thường. MỌI chữ/số có nét mảnh bình thường — kể cả tiêu đề phụ, dòng căn giữa, dòng cỡ chữ lớn hơn, chữ in nghiêng, ghi chú trong ngoặc, hàng tiêu đề bảng không in đậm, cột điểm số (như "1,0", "0,25", "0,5" nằm cùng hàng với "Bài 1" in đậm), phần đề bài sau "Câu 1.", hoặc nội dung đáp án sau "A.", "B.", "C.", "D." — TUYỆT ĐỐI KHÔNG được gán bold=true (bắt buộc bỏ qua hoặc để bold=false). TUYỆT ĐỐI KHÔNG để trạng thái bold=true của ô cột 1 (ví dụ "Bài 1") lây lan sang ô cột 2 hoặc cột 3 ("1,0") trên cùng hàng! Ngược lại, mọi chữ thực sự in đậm (nhãn "Câu 1.", "Bài 1", "PHẦN I", tiêu đề đậm, từ nhấn mạnh đậm) BẮT BUỘC phải giữ đúng bold=true.
    - IN NGHIÊNG (italic): Quan sát kỹ độ nghiêng nét chữ trên ảnh PDF. BẮT BUỘC đặt italic=true cho MỌI từ/cụm từ/ghi chú/tiêu đề phụ/câu trích dẫn thực sự in nghiêng trên PDF (ví dụ: "(Đề gồm 04 trang)", "(Thí sinh không được sử dụng tài liệu)", "Hướng dẫn giải", "Chú ý:", chữ nghiêng xen giữa câu). Nếu chữ vừa đậm vừa nghiêng -> đặt CẢ bold=true và italic=true; nếu chỉ nghiêng nét mảnh -> CHỈ đặt italic=true, TUYỆT ĐỐI KHÔNG đặt bold=true.
    - GẠCH CHÂN (underline): Đặt underline=true cho mọi chữ có đường gạch chân bên dưới.
-   - MÀU SẮC CHỮ (color): Quan sát kỹ màu mực thực tế của từng chữ, nhãn câu, tiêu đề, công thức và ô bảng trên PDF! Với chữ màu đen bình thường thì bỏ qua trường color. Với BẤT KỲ chữ/số/công thức nào có màu khác đen (đỏ, xanh dương, xanh lá, tím, cam, nâu, xám nhạt...): BẮT BUỘC gán đúng mã màu hex 6 ký tự dạng "#RRGGBB" (ví dụ: đỏ "#DC2626" hoặc "#FF0000", xanh dương "#1D4ED8" hoặc "#0000FF", xanh lá "#15803D", tím "#7C3AED", cam "#EA580C"). Không được bỏ sót chữ có màu!
+   - MÀU SẮC CHỮ (color): Quan sát thật kỹ ĐÚNG SẮC ĐỘ MÀU MỰC THỰC TẾ của từng chữ, nhãn câu, tiêu đề, công thức (cả inline math lẫn block_type="equation") và từng ô bảng trên PDF!
+     + Với chữ màu đen thực sự: bỏ qua trường color (không tự ý đổi sang màu xanh hay xám).
+     + Với BẤT KỲ chữ/số/công thức nào có màu khác đen: BẮT BUỘC lấy ĐÚNG mã màu hex 6 ký tự "#RRGGBB" gần sát nhất với màu mực thực tế trên ảnh (KHÔNG tự ý làm nhạt hoặc đổi tông màu): đỏ tươi "#FF0000", đỏ đậm/đỏ đô "#C00000" hoặc "#990000", xanh dương thuần "#0000FF", xanh dương Word "#0070C0", xanh đậm/navy "#002060", xanh lá "#008000" hoặc "#00B050", tím "#7030A0", cam "#E36C0A" hoặc "#FF6600", nâu "#804000", xám "#666666". Không được bỏ sót màu của chữ hoặc công thức, và không được gán màu cho chữ màu đen!
    - BẮT BUỘC tách thành các segment riêng NGAY TẠI ranh giới đổi định dạng (đổi đậm/thường, đứng/nghiêng, gạch chân, đổi màu, đổi cỡ chữ) trên cùng một dòng! Ví dụ:
-     + "Câu 1. Cho hàm số..." -> segment 1 ("Câu 1. ", bold: true, kèm color nếu Câu 1. có màu), segment 2 ("Cho hàm số...", bold: false).
+     + "Câu 1. Cho hàm số..." -> segment 1 ("Câu 1. ", bold: true, kèm đúng color nếu Câu 1. có màu), segment 2 ("Cho hàm số...", bold: false).
      + "A. x = 2" -> nếu chỉ "A." in đậm thì tách segment 1 ("A. ", bold: true) và segment 2 (math "x = 2"); nếu "A." không in đậm thì KHÔNG gán bold=true.
      + Trong block heading hoặc ô bảng is_header=true: hệ thống KHÔNG tự động tô đậm. Chỉ segment nào thực sự in đậm trên PDF mới đặt bold=true; segment nét thường hoặc chỉ in nghiêng phải để bold=false.
 3. VỊ TRÍ CHỮ, CĂN LỀ, THỤT ĐẦU DÒNG & BỐ CỤC NHIỀU CỘT (CHÍNH XÁC 100%):
@@ -201,8 +224,13 @@ Quy tắc bắt buộc:
    - Với đường kẻ ngang phân cách (như dưới tiêu đề đề thi), xuất block_type="horizontal_rule" kèm box_2d.
 4. CÔNG THỨC TOÁN, CHỮ SỐ, DẤU +/- & BẢNG BIỂU:
    - MỌI biểu thức toán học, ký hiệu biến số, phân số, căn thức, tích phân, giới hạn, ma trận, hệ phương trình PHẢI tách thành segment type="math" (nếu nằm cùng dòng với chữ) hoặc block_type="equation" (nếu đứng riêng một dòng độc lập, giữ đúng alignment của công thức). Luôn xuất mã LaTeX chuẩn xác, KHÔNG bọc bằng $, $$, \\[ \\] hay \\( \\).
+   - DẤU NGOẶC NHỌN TẬP HỢP & TÁCH CHỮ TIẾNG VIỆT KHỎI MATH: Với ký hiệu tập hợp trong LaTeX math, BẮT BUỘC phải dùng \\{ và \\} (ví dụ: B = \\{x \\in \\mathbb{Z} \\mid x^2 - 3x + 2 = 0\\}, B = \\{1; 2\\}), TUYỆT ĐỐI KHÔNG viết { } trần. TUYỆT ĐỐI KHÔNG gom từ tiếng Việt (như "a) Phương trình", "Do", "nên", "hoặc", "với", "suy ra") vào bên trong segment type="math" — mọi chữ tiếng Việt PHẢI nằm ở segment type="text", chỉ phần công thức toán mới đặt type="math".
    - BẮT BUỘC đưa TẤT CẢ các số mang ý nghĩa toán học (số nguyên, số thập phân, số âm/dương như 0, 1, -2, +3, 2,5...) và các dấu cộng (+), dấu trừ (-) đứng riêng hoặc gắn với số (ví dụ: "dấu +", "dấu -", "+∞", "-∞") vào segment type="math" (KHÔNG để ở type="text"). Chỉ giữ trong type="text" các số thứ tự nhãn như "Câu 1.", "Bài 2.", "Hình 1", "Bảng 1".
-   - Bảng số liệu thông thường (bảng thống kê, bảng tần số, bảng điểm, bảng giá trị chỉ gồm chữ/số trong ô, KHÔNG có mũi tên biến thiên): BẮT BUỘC giữ nguyên thành block_type="table" với table_borderless=false và is_choice_block=false, ghi đủ 100% số hàng/cột, col_span, is_header và segments.
+   - Bảng số liệu thông thường (bảng thống kê, bảng tần số, bảng điểm, bảng hướng dẫn chấm "Bài | Nội dung | Điểm", bảng giá trị chỉ gồm chữ/số trong ô, KHÔNG có mũi tên biến thiên): BẮT BUỘC giữ nguyên thành block_type="table" với table_borderless=false và is_choice_block=false, ghi đủ 100% số hàng/cột, col_span, is_header và segments.
+   - QUY TẮC TUYỆT ĐỐI CHO BẢNG CÓ Ô TRỐNG HOẶC Ô GỘP DỌC (ROWSPAN — NHƯ BẢNG "Bài | Nội dung | Điểm"):
+     + MỌI hàng trong table_rows BẮT BUỘC phải có tổng số cột (tổng col_span) BẰNG NHAU và bằng đúng số cột của hàng tiêu đề!
+     + Khi một cột ở đầu hàng hoặc giữa hàng bị TRỐNG (ví dụ cột "Bài" trống ở các dòng lời giải tiếp theo dưới "Bài 1") HOẶC bị GỘP DỌC từ hàng trên xuống (rowspan), BẮT BUỘC VẪN PHẢI xuất một ô rỗng {"segments": []} (kèm v_merge="continue" nếu gộp dọc, và v_merge="restart" ở ô đầu tiên phía trên) tại ĐÚNG vị trí cột đó!
+     + TUYỆT ĐỐI KHÔNG ĐƯỢC bỏ qua ô trống ở cột 1 khiến nội dung cột 2 ("Nội dung") bị dịch sang cột 1 ("Bài") và cột 3 ("Điểm") bị dịch sang cột 2 ("Nội dung")!
    - TUYỆT ĐỐI KHÔNG chuyển Bảng biến thiên (bảng có dòng x, y'/f'(x), y/f(x) kèm mũi tên tăng giảm ↗ ↘ hoặc hai gạch đứng ∥) thành block_type="table".
 5. HÌNH VẼ MINH HỌA & BẢNG BIẾN THIÊN (CHỤP CẮT ẢNH CHÍNH XÁC):
    - Với mọi hình học không gian/phẳng, đồ thị hàm số, trục số, biểu đồ, ảnh chụp nhúng VÀ MỌI BẢNG BIẾN THIÊN (có dòng x, y'/f'(x), y/f(x) và mũi tên ↗, ↘, dấu +, -, hai gạch đứng ∥), BẮT BUỘC phải xuất thành MỘT block_type="figure" duy nhất, alignment đúng vị trí ('left'/'center'/'right').
@@ -407,9 +435,9 @@ export async function handleOcrPage(req: RequestWithOptionalBody, res: ServerRes
     const rawJson = (response.text ?? '{"blocks":[]}').trim();
     const parsed = JSON.parse(rawJson) as { blocks?: PageExtraction['blocks'] };
     const rawBlocks = Array.isArray(parsed.blocks) ? parsed.blocks : [];
-    const [normalizedPage] = normalizePagesInlineMath([
-      { pageNumber: pageNumber ?? 1, blocks: rawBlocks },
-    ]);
+    const [normalizedPage] = normalizePagesTableGrids(
+      normalizePagesInlineMath([{ pageNumber: pageNumber ?? 1, blocks: rawBlocks }])
+    );
     sendJson(res, 200, {
       pageNumber: pageNumber ?? 1,
       blocks: normalizedPage?.blocks ?? rawBlocks,
@@ -487,9 +515,10 @@ export async function handleExportDocx(req: RequestWithOptionalBody, res: Server
       addPageBreaks?: boolean;
       choiceLayout?: 'table' | 'tabs';
       mathFormat?: 'omml' | 'latex';
+      underlineCorrectChoice?: boolean;
     }>(req);
 
-    const { pages, filename, addPageBreaks, choiceLayout, mathFormat } = body;
+    const { pages, filename, addPageBreaks, choiceLayout, mathFormat, underlineCorrectChoice } = body;
 
     if (!Array.isArray(pages) || pages.length === 0) {
       sendJson(res, 400, { error: 'Chưa có dữ liệu trang đã OCR để xuất file Word.' });
@@ -502,6 +531,7 @@ export async function handleExportDocx(req: RequestWithOptionalBody, res: Server
       addPageBreaks: addPageBreaks !== false,
       choiceLayout: choiceLayout === 'table' ? 'table' : 'tabs',
       mathFormat: resolvedMathFormat,
+      underlineCorrectChoice: Boolean(underlineCorrectChoice),
     });
 
     const safeBase = (filename || 'tai_lieu_toan')

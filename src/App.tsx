@@ -6,6 +6,7 @@ import {
   Code2,
   Crop,
   Download,
+  FileArchive,
   FileImage,
   FileText,
   ImagePlus,
@@ -21,6 +22,7 @@ import type {
   ChoiceLayoutMode,
   DocumentBlock,
   ExtractedEquationItem,
+  LatexExportFormat,
   MathOutputFormat,
   PageExtraction,
   RenderedPage,
@@ -35,6 +37,7 @@ import {
   findLatexCursorForPreviewClick,
   pagesToLatexSource,
 } from './utils/latexSerializer';
+import { buildLatexZipBlob } from './utils/latexZipExporter';
 import {
   cropFiguresFromPage,
   generateSampleMathWorksheet,
@@ -142,7 +145,10 @@ export default function App() {
   const [addPageBreaks, setAddPageBreaks] = useState<boolean>(true);
   const [autoCropFigures, setAutoCropFigures] = useState<boolean>(true);
   const [choiceLayout, setChoiceLayout] = useState<ChoiceLayoutMode>('tabs');
+  const [underlineCorrectChoice, setUnderlineCorrectChoice] = useState<boolean>(false);
   const [mathFormat, setMathFormat] = useState<MathOutputFormat>('omml');
+  const [latexExportFormat, setLatexExportFormat] = useState<LatexExportFormat>('auto');
+  const [isExportingLatexZip, setIsExportingLatexZip] = useState<boolean>(false);
   const [inputSource, setInputSource] = useState<'file' | 'paste' | 'docx'>('file');
 
   const [pendingDocxPages, setPendingDocxPages] = useState<PageExtraction[]>([]);
@@ -150,6 +156,13 @@ export default function App() {
   const [figureAssets, setFigureAssets] = useState<Record<string, EmbeddedFigureAsset>>({});
   const latexTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const [isExportingPaste, setIsExportingPaste] = useState<boolean>(false);
+
+  const isExTestLatexInput = useMemo(() => {
+    if (inputSource !== 'paste' || !pastedLatex.trim()) return false;
+    return /\\usepackage(?:\[[^\]]*\])?\{ex_test\}|\\begin\{(?:ex|bt|vd)\}|\\(?:choice(?:TF)?|motcot|haicot|boncot)\b|\\True(?![a-zA-Z])/.test(
+      pastedLatex
+    );
+  }, [inputSource, pastedLatex]);
 
   const [isLoadingFile, setIsLoadingFile] = useState<boolean>(false);
   const [isConverting, setIsConverting] = useState<boolean>(false);
@@ -440,7 +453,8 @@ export default function App() {
       filename: string,
       pageBreaks: boolean,
       layout: ChoiceLayoutMode,
-      format: MathOutputFormat
+      format: MathOutputFormat,
+      underlineCorrect = false
     ) => {
       const prepareBlockMedia = async (blk: DocumentBlock): Promise<DocumentBlock> => {
         if (
@@ -529,6 +543,7 @@ export default function App() {
         addPageBreaks: pageBreaks,
         choiceLayout: layout,
         mathFormat: format,
+        underlineCorrectChoice: underlineCorrect,
       });
 
       if (exportPayload.length > 3_600_000) {
@@ -547,6 +562,7 @@ export default function App() {
             addPageBreaks: pageBreaks,
             choiceLayout: layout,
             mathFormat: format,
+            underlineCorrectChoice: underlineCorrect,
           });
           if (exportPayload.length <= 3_600_000) break;
         }
@@ -658,7 +674,8 @@ export default function App() {
             sourceFilename || fallbackName,
             addPageBreaks,
             choiceLayout,
-            mathFormat
+            mathFormat,
+            isExTestLatexInput && underlineCorrectChoice
           ),
         ]);
 
@@ -677,7 +694,16 @@ export default function App() {
         }
       }
     },
-    [addPageBreaks, choiceLayout, inputSource, mathFormat, rebuildDocxExport, sourceFilename]
+    [
+      addPageBreaks,
+      choiceLayout,
+      inputSource,
+      isExTestLatexInput,
+      mathFormat,
+      rebuildDocxExport,
+      sourceFilename,
+      underlineCorrectChoice,
+    ]
   );
 
   const isBoxMostlyInsideAnyFigure = (
@@ -814,7 +840,8 @@ export default function App() {
           sourceFilename || 'tai_lieu_toan',
           addPageBreaks,
           choiceLayout,
-          mathFormat
+          mathFormat,
+          isExTestLatexInput && underlineCorrectChoice
         );
       }
     } catch (err) {
@@ -840,9 +867,46 @@ export default function App() {
           sourceFilename || 'tai_lieu_toan',
           addPageBreaks,
           nextLayout,
-          mathFormat
+          mathFormat,
+          isExTestLatexInput && underlineCorrectChoice
         );
         setStatusMessage('Đã cập nhật file Word theo định dạng phương án đã chọn.');
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Không thể cập nhật tệp Word.';
+        setErrorMessage(msg);
+      }
+    }
+  };
+
+  const handleUnderlineCorrectChoiceChange = async (nextEnabled: boolean) => {
+    setUnderlineCorrectChoice(nextEnabled);
+    const activePages =
+      editedPages ??
+      (inputSource === 'paste' && pastedLatex.trim()
+        ? normalizePagesInlineMath(parsePastedLatexToPages(pastedLatex, 'auto', figureAssets))
+        : extractedPages.length > 0
+        ? extractedPages
+        : []);
+    if (activePages.length > 0 && !isConverting && !isExportingPaste) {
+      try {
+        setStatusMessage(
+          nextEnabled
+            ? 'Đang cập nhật file Word có gạch chân đáp án đúng...'
+            : 'Đang bỏ gạch chân đáp án đúng trong file Word...'
+        );
+        await rebuildDocxExport(
+          activePages,
+          sourceFilename || 'tai_lieu_latex',
+          addPageBreaks,
+          choiceLayout,
+          mathFormat,
+          isExTestLatexInput && nextEnabled
+        );
+        setStatusMessage(
+          nextEnabled
+            ? 'Đã bật gạch chân đáp án đúng (chỉ gạch chân chữ cái phương án).'
+            : 'Đã tắt gạch chân đáp án đúng trong file Word.'
+        );
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Không thể cập nhật tệp Word.';
         setErrorMessage(msg);
@@ -876,7 +940,8 @@ export default function App() {
               : 'tai_lieu_toan'),
           addPageBreaks,
           choiceLayout,
-          nextFormat
+          nextFormat,
+          isExTestLatexInput && underlineCorrectChoice
         );
         setStatusMessage(
           nextFormat === 'latex'
@@ -973,7 +1038,8 @@ export default function App() {
           sourceFilename || filenameFallback,
           addPageBreaks,
           choiceLayout,
-          targetFormat
+          targetFormat,
+          isExTestLatexInput && underlineCorrectChoice
         ),
       ]);
 
@@ -1146,8 +1212,11 @@ export default function App() {
         setStatusMessage(`Đã nhận dạng xong ${completedCount}/${total} trang...`);
       };
 
-      const concurrency = Math.min(2, total);
-      const workers = Array.from({ length: concurrency }, async () => {
+      const concurrency = Math.min(5, total);
+      const workers = Array.from({ length: concurrency }, async (_, workerIdx) => {
+        if (workerIdx > 0) {
+          await new Promise((r) => setTimeout(r, workerIdx * 90));
+        }
         while (!abortedError) {
           const idx = nextIndex++;
           if (idx >= total) break;
@@ -1220,39 +1289,44 @@ export default function App() {
           : 'Đang đóng gói tệp Word (.docx) với Equation OMML...'
       );
 
-      const ommlPreviewPromise =
-        eqQueries.length > 0
-          ? fetchWithRetry(
-              '/api/omml/preview',
-              {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ equations: eqQueries }),
-              },
-              1
-            )
-              .then(async (ommlRes) => {
-                if (!ommlRes.ok) return;
-                const ommlJson = (await ommlRes.json()) as {
-                  results: Array<{ latex: string; isDisplay: boolean; omml: string }>;
-                };
-                const map: Record<string, string> = {};
-                for (const item of ommlJson.results) {
-                  map[`${item.isDisplay ? 'D' : 'I'}:${item.latex}`] = item.omml;
-                }
-                setOmmlMap(map);
-              })
-              .catch(() => undefined)
-          : Promise.resolve();
+      if (eqQueries.length > 0) {
+        void fetchWithRetry(
+          '/api/omml/preview',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ equations: eqQueries }),
+          },
+          1
+        )
+          .then(async (ommlRes) => {
+            if (!ommlRes.ok) return;
+            const ommlJson = (await ommlRes.json()) as {
+              results: Array<{ latex: string; isDisplay: boolean; omml: string }>;
+            };
+            const map: Record<string, string> = {};
+            for (const item of ommlJson.results) {
+              map[`${item.isDisplay ? 'D' : 'I'}:${item.latex}`] = item.omml;
+            }
+            setOmmlMap(map);
+          })
+          .catch(() => undefined);
+      }
 
-      await Promise.all([
-        ommlPreviewPromise,
-        rebuildDocxExport(finalPages, sourceFilename, addPageBreaks, choiceLayout, mathFormat),
-      ]);
+      const docxPromise = rebuildDocxExport(
+        finalPages,
+        sourceFilename,
+        addPageBreaks,
+        choiceLayout,
+        mathFormat
+      );
 
+      // Overlap client-side LaTeX source generation while server builds the .docx file
       const { latex: generatedLatex, assets: generatedAssets } = pagesToLatexSource(finalPages);
       setFigureAssets(generatedAssets);
       setPastedLatex(generatedLatex);
+
+      await docxPromise;
 
       setProgressPct(100);
       setStatusMessage('Hoàn tất chuyển đổi! File Word đã sẵn sàng để tải xuống.');
@@ -1468,6 +1542,60 @@ export default function App() {
     );
   }, [displayPreviewPages, syncPagesToWordAndOmml]);
 
+  const handleDownloadLatexZip = useCallback(async () => {
+    if (displayPreviewPages.length === 0 || isExportingLatexZip) return;
+    setErrorMessage(null);
+    setIsExportingLatexZip(true);
+    try {
+      const normalized = normalizePagesInlineMath(displayPreviewPages);
+      const fallbackName =
+        inputSource === 'docx'
+          ? 'tai_lieu_word'
+          : inputSource === 'paste'
+          ? 'tai_lieu_latex'
+          : 'tai_lieu_toan';
+      const result = await buildLatexZipBlob(normalized, {
+        format: latexExportFormat,
+        filename: sourceFilename || fallbackName,
+        addPageBreaks,
+        choiceLayout,
+        convertImageToPng: svgDataUrlToPngDataUrl,
+      });
+
+      const url = URL.createObjectURL(result.blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = result.zipFileName;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+      const modeLabel = result.mode === 'ex_test' ? 'gói ex_test (đề thi)' : 'TeX cơ bản';
+      const imgLabel =
+        result.imageCount > 0
+          ? ` và ${result.imageCount} hình trong thư mục images/`
+          : ' (kèm thư mục images/)';
+      setStatusMessage(
+        `Đã tải gói nén ${result.zipFileName} (${modeLabel}, ${result.fileCount} file .tex${imgLabel}).`
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Không thể đóng gói file .tex (.zip).';
+      setErrorMessage(msg);
+    } finally {
+      setIsExportingLatexZip(false);
+    }
+  }, [
+    addPageBreaks,
+    choiceLayout,
+    displayPreviewPages,
+    inputSource,
+    isExportingLatexZip,
+    latexExportFormat,
+    sourceFilename,
+    svgDataUrlToPngDataUrl,
+  ]);
+
   const equationsList = useMemo<ExtractedEquationItem[]>(() => {
     const items: ExtractedEquationItem[] = [];
     let counter = 1;
@@ -1629,7 +1757,18 @@ export default function App() {
             </a>
           </nav>
 
-          <div className="flex items-center shrink-0">
+          <div className="flex items-center gap-2 shrink-0">
+            {displayPreviewPages.length > 0 && (
+              <button
+                type="button"
+                onClick={() => void handleDownloadLatexZip()}
+                disabled={isExportingLatexZip || isConverting}
+                className="inline-flex items-center gap-1.5 px-2.5 py-0.5 text-xs font-semibold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+              >
+                <FileArchive className="w-3.5 h-3.5" />
+                Tải .tex (.zip)
+              </button>
+            )}
             {docxDownloadUrl && (
               <a
                 href={docxDownloadUrl}
@@ -1894,6 +2033,83 @@ export default function App() {
                     </strong>
                   </span>
                 </label>
+                {isExTestLatexInput && (
+                  <label
+                    className={`flex items-start gap-2.5 p-2.5 rounded-lg border transition-colors cursor-pointer select-none ${
+                      underlineCorrectChoice
+                        ? 'border-blue-600 bg-blue-50/40'
+                        : 'border-slate-200 hover:border-blue-400'
+                    }`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={underlineCorrectChoice}
+                      onChange={(e) => void handleUnderlineCorrectChoiceChange(e.target.checked)}
+                      disabled={isConverting || isExportingPaste}
+                      className="mt-0.5 h-4 w-4 rounded border-slate-300 text-blue-700 focus:ring-blue-600"
+                    />
+                    <span className="text-xs leading-relaxed text-slate-700">
+                      <strong className="block text-slate-900 font-semibold">
+                        Gạch chân đáp án đúng
+                      </strong>
+                      <span className="text-[11px] text-slate-500">
+                        Chỉ gạch chân chữ cái A, B, C hoặc D (gói ex_test)
+                      </span>
+                    </span>
+                  </label>
+                )}
+              </div>
+            </div>
+
+            <div>
+              <span className="block text-xs font-medium text-slate-700 mb-1.5">
+                Định dạng xuất LaTeX nén (.zip)
+              </span>
+              <div className="space-y-2">
+                <label
+                  className={`flex items-center gap-2.5 p-2.5 rounded-lg border transition-colors cursor-pointer select-none ${
+                    latexExportFormat === 'auto'
+                      ? 'border-blue-600 bg-blue-50/40'
+                      : 'border-slate-200 hover:border-blue-400'
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    name="latex-export-format"
+                    value="auto"
+                    checked={latexExportFormat === 'auto'}
+                    onChange={() => setLatexExportFormat('auto')}
+                    disabled={isConverting || isExportingLatexZip}
+                    className="h-4 w-4 border-slate-300 text-blue-700 focus:ring-blue-600"
+                  />
+                  <span className="text-xs leading-relaxed text-slate-700">
+                    <strong className="block text-slate-900 font-semibold">
+                      Tự động (Đề thi → Gói ex_test)
+                    </strong>
+                  </span>
+                </label>
+                <label
+                  className={`flex items-center gap-2.5 p-2.5 rounded-lg border transition-colors cursor-pointer select-none ${
+                    latexExportFormat === 'basic'
+                      ? 'border-blue-600 bg-blue-50/40'
+                      : 'border-slate-200 hover:border-blue-400'
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    name="latex-export-format"
+                    value="basic"
+                    checked={latexExportFormat === 'basic'}
+                    onChange={() => setLatexExportFormat('basic')}
+                    disabled={isConverting || isExportingLatexZip}
+                    className="h-4 w-4 border-slate-300 text-blue-700 focus:ring-blue-600"
+                  />
+                  <span className="text-xs leading-relaxed text-slate-700">
+                    <strong className="block text-slate-900 font-semibold">
+                      TeX cơ bản
+                    </strong>
+                  </span>
+                </label>
               </div>
             </div>
 
@@ -1966,6 +2182,27 @@ export default function App() {
                     Tải xuống file Word
                   </a>
                 </div>
+              )}
+
+              {displayPreviewPages.length > 0 && !isConverting && (
+                <button
+                  type="button"
+                  onClick={() => void handleDownloadLatexZip()}
+                  disabled={isExportingLatexZip}
+                  className="w-full h-11 inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-semibold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 disabled:opacity-50 rounded-lg transition-colors cursor-pointer"
+                >
+                  {isExportingLatexZip ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      Đang nén gói LaTeX...
+                    </>
+                  ) : (
+                    <>
+                      <FileArchive className="w-4 h-4" />
+                      Tải xuống file .tex (.zip)
+                    </>
+                  )}
+                </button>
               )}
             </div>
 
@@ -2281,6 +2518,7 @@ export default function App() {
                   pages={displayPreviewPages}
                   choiceLayout={choiceLayout}
                   mathFormat={mathFormat}
+                  underlineCorrectChoice={isExTestLatexInput && underlineCorrectChoice}
                   onSelectEquation={handleInspectEquation}
                   editable={false}
                   onCtrlDoubleClickBlock={handleJumpToLatexFromPreview}

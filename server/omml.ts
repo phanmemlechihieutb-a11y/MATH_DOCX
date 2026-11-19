@@ -66,31 +66,106 @@ function expandBalancedMacro(
 const CSS_COLOR_HEX_MAP: Record<string, string> = {
   black: '000000',
   white: 'FFFFFF',
-  red: 'DC2626',
+  red: 'FF0000',
   crimson: 'DC143C',
-  darkred: '991B1B',
+  darkred: '8B0000',
   maroon: '800000',
-  blue: '2563EB',
-  darkblue: '1E3A8A',
-  navy: '1E3A8A',
-  royalblue: '1D4ED8',
-  green: '16A34A',
-  darkgreen: '15803D',
-  forestgreen: '15803D',
-  teal: '0D9488',
-  cyan: '0891B2',
-  orange: 'EA580C',
-  purple: '9333EA',
-  violet: '7C3AED',
-  magenta: 'DB2777',
-  pink: 'EC4899',
-  brown: '92400E',
-  gray: '64748B',
-  grey: '64748B',
-  yellow: 'CA8A04',
-  olive: '65A30D',
-  lime: '84CC16',
+  blue: '0000FF',
+  darkblue: '00008B',
+  navy: '000080',
+  royalblue: '4169E1',
+  dodgerblue: '1E90FF',
+  green: '008000',
+  darkgreen: '006400',
+  forestgreen: '228B22',
+  teal: '008080',
+  cyan: '00FFFF',
+  orange: 'FF8000',
+  darkorange: 'FF8C00',
+  purple: '800080',
+  violet: '800080',
+  indigo: '4B0082',
+  magenta: 'FF00FF',
+  pink: 'FFC0CB',
+  brown: '804000',
+  gray: '808080',
+  grey: '808080',
+  darkgray: '404040',
+  darkgrey: '404040',
+  lightgray: 'C0C0C0',
+  lightgrey: 'C0C0C0',
+  yellow: 'FFFF00',
+  olive: '808000',
+  lime: '00FF00',
 };
+
+function hexToRgb(hex6: string): [number, number, number] | null {
+  const clean = hex6.replace(/^#/, '');
+  if (!/^[0-9a-f]{6}$/i.test(clean)) return null;
+  return [
+    parseInt(clean.slice(0, 2), 16),
+    parseInt(clean.slice(2, 4), 16),
+    parseInt(clean.slice(4, 6), 16),
+  ];
+}
+
+function rgbToHex(r: number, g: number, b: number): string {
+  return [r, g, b]
+    .map((v) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0').toUpperCase())
+    .join('');
+}
+
+function resolveSimpleCssColorHex(name: string): string | null {
+  const s = name.trim().toLowerCase();
+  if (!s) return null;
+  if (CSS_COLOR_HEX_MAP[s]) return CSS_COLOR_HEX_MAP[s];
+  const hex6 = s.match(/^#?([0-9a-f]{6})$/i);
+  if (hex6) return hex6[1].toUpperCase();
+  const hex3 = s.match(/^#?([0-9a-f]{3})$/i);
+  if (hex3) {
+    return hex3[1]
+      .split('')
+      .map((c) => c + c)
+      .join('')
+      .toUpperCase();
+  }
+  return null;
+}
+
+function resolveXcolorExprToHex(expr: string): string | null {
+  const trimmed = expr.trim();
+  if (!trimmed.includes('!')) return resolveSimpleCssColorHex(trimmed);
+  const parts = trimmed.split('!').map((p) => p.trim()).filter(Boolean);
+  if (parts.length === 0) return null;
+  const firstHex = resolveSimpleCssColorHex(parts[0]);
+  if (!firstHex) return null;
+  let acc = hexToRgb(firstHex);
+  if (!acc) return firstHex;
+  let idx = 1;
+  while (idx < parts.length) {
+    const pct = parseFloat(parts[idx]);
+    if (!Number.isFinite(pct)) break;
+    const ratio = Math.max(0, Math.min(100, pct)) / 100;
+    const nextPart = parts[idx + 1];
+    let targetHex = 'FFFFFF';
+    if (nextPart !== undefined && Number.isNaN(Number(nextPart))) {
+      const resolvedNext = resolveSimpleCssColorHex(nextPart);
+      if (resolvedNext) targetHex = resolvedNext;
+      idx += 2;
+    } else {
+      idx += 1;
+    }
+    const rgb2 = hexToRgb(targetHex);
+    if (rgb2) {
+      acc = [
+        acc[0] * ratio + rgb2[0] * (1 - ratio),
+        acc[1] * ratio + rgb2[1] * (1 - ratio),
+        acc[2] * ratio + rgb2[2] * (1 - ratio),
+      ];
+    }
+  }
+  return rgbToHex(acc[0], acc[1], acc[2]);
+}
 
 function parseCssColorToHex(raw: string): string | null | undefined {
   const s = raw.trim().toLowerCase();
@@ -138,7 +213,8 @@ function extractNodeColorHex(node: XmlElement): string | null | undefined {
 }
 
 function normalizeMathColorsForTemml(s: string): string {
-  return s.replace(
+  // 1. Model-qualified colors: \textcolor[HTML]{FF0000}{...} or \color[RGB]{...}
+  let out = s.replace(
     /\\(textcolor|color)\s*\[([^\]]+)\]\s*\{([^}]+)\}/g,
     (full, cmd: string, modelRaw: string, specRaw: string) => {
       const model = modelRaw.trim();
@@ -164,11 +240,21 @@ function normalizeMathColorsForTemml(s: string): string {
         const h = Math.round(g * 255).toString(16).padStart(2, '0').toUpperCase();
         return `\\${cmd}{#${h}${h}${h}}`;
       } else if (model.toLowerCase() === 'named') {
-        return `\\${cmd}{${spec}}`;
+        const hex = resolveXcolorExprToHex(spec);
+        return hex ? `\\${cmd}{#${hex}}` : `\\${cmd}{${spec}}`;
       }
       return full;
     }
   );
+  // 2. Named or xcolor-mixed colors: \textcolor{blue!70!black}{...}, \color{red}
+  out = out.replace(/\\(textcolor|color)\s*\{([^}]+)\}/g, (full, cmd: string, specRaw: string) => {
+    const spec = specRaw.trim();
+    if (spec.startsWith('#')) return full;
+    const hex = resolveXcolorExprToHex(spec);
+    if (hex) return `\\${cmd}{#${hex}}`;
+    return full;
+  });
+  return out;
 }
 
 function sanitizeLatexForTemml(latex: string): string {
@@ -282,21 +368,29 @@ export interface OmmlStyleOptions {
   colorHex?: string | null;
   bold?: boolean;
   italic?: boolean;
+  forcePlain?: boolean;
 }
 
 function buildWordRunPr(style?: OmmlStyleOptions): string {
+  // Strict ECMA-376 CT_RPr order: rFonts -> b -> bCs -> i -> iCs -> color -> sz -> szCs
   const parts = [
     '<w:rFonts w:ascii="Cambria Math" w:hAnsi="Cambria Math" w:cs="Cambria Math"/>',
   ];
   if (style?.bold) {
-    parts.push('<w:b/>');
+    parts.push('<w:b/>', '<w:bCs/>');
+  } else {
+    parts.push('<w:b w:val="0"/>', '<w:bCs w:val="0"/>');
   }
   if (style?.italic) {
-    parts.push('<w:i/>');
+    parts.push('<w:i/>', '<w:iCs/>');
+  } else if (style?.italic === false || style?.forcePlain) {
+    parts.push('<w:i w:val="0"/>', '<w:iCs w:val="0"/>');
   }
-  if (style?.colorHex && /^[0-9A-Fa-f]{6}$/.test(style.colorHex)) {
-    parts.push(`<w:color w:val="${style.colorHex.toUpperCase()}"/>`);
-  }
+  const colorVal =
+    style?.colorHex && /^[0-9A-Fa-f]{6}$/.test(style.colorHex)
+      ? style.colorHex.toUpperCase()
+      : '000000';
+  parts.push(`<w:color w:val="${colorVal}"/>`);
   if (typeof style?.sizeHalfPt === 'number' && Number.isFinite(style.sizeHalfPt)) {
     const sz = Math.max(14, Math.min(96, Math.round(style.sizeHalfPt)));
     parts.push(`<w:sz w:val="${sz}"/>`, `<w:szCs w:val="${sz}"/>`);
@@ -309,11 +403,59 @@ function buildCtrlPr(style?: OmmlStyleOptions): string {
   return `<m:ctrlPr>${buildWordRunPr(style)}</m:ctrlPr>`;
 }
 
-function makeMathRun(text: string, plain = false, style?: OmmlStyleOptions): string {
-  const normalized = stripInvalidXmlChars(text.replace(/\r\n?|\n/g, ' '));
-  if (!normalized) return '';
+const GREEK_UPPER_SEQ = 'ΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡϴΣΤΥΦΧΨΩ';
+const GREEK_LOWER_SEQ = 'αβγδεζηθικλμνξοπρςστυφχψω';
+const GREEK_VAR_SEQ = 'ϵϑϰϕϱϖ';
+
+function decodeMathBoldChar(cp: number): { ch: string; kind: 'bold' | 'bold-italic' } | null {
+  // Mathematical Bold (upright)
+  if (cp >= 0x1d400 && cp <= 0x1d419) {
+    return { ch: String.fromCharCode(0x41 + (cp - 0x1d400)), kind: 'bold' };
+  }
+  if (cp >= 0x1d41a && cp <= 0x1d433) {
+    return { ch: String.fromCharCode(0x61 + (cp - 0x1d41a)), kind: 'bold' };
+  }
+  if (cp >= 0x1d7ce && cp <= 0x1d7d7) {
+    return { ch: String.fromCharCode(0x30 + (cp - 0x1d7ce)), kind: 'bold' };
+  }
+  if (cp >= 0x1d6a8 && cp <= 0x1d6c0) {
+    return { ch: GREEK_UPPER_SEQ[cp - 0x1d6a8] ?? '', kind: 'bold' };
+  }
+  if (cp === 0x1d6c1) return { ch: '∇', kind: 'bold' };
+  if (cp >= 0x1d6c2 && cp <= 0x1d6da) {
+    return { ch: GREEK_LOWER_SEQ[cp - 0x1d6c2] ?? '', kind: 'bold' };
+  }
+  if (cp === 0x1d6db) return { ch: '∂', kind: 'bold' };
+  if (cp >= 0x1d6dc && cp <= 0x1d6e1) {
+    return { ch: GREEK_VAR_SEQ[cp - 0x1d6dc] ?? '', kind: 'bold' };
+  }
+
+  // Mathematical Bold Italic
+  if (cp >= 0x1d468 && cp <= 0x1d481) {
+    return { ch: String.fromCharCode(0x41 + (cp - 0x1d468)), kind: 'bold-italic' };
+  }
+  if (cp >= 0x1d482 && cp <= 0x1d49b) {
+    return { ch: String.fromCharCode(0x61 + (cp - 0x1d482)), kind: 'bold-italic' };
+  }
+  if (cp >= 0x1d71c && cp <= 0x1d734) {
+    return { ch: GREEK_UPPER_SEQ[cp - 0x1d71c] ?? '', kind: 'bold-italic' };
+  }
+  if (cp === 0x1d735) return { ch: '∇', kind: 'bold-italic' };
+  if (cp >= 0x1d736 && cp <= 0x1d74e) {
+    return { ch: GREEK_LOWER_SEQ[cp - 0x1d736] ?? '', kind: 'bold-italic' };
+  }
+  if (cp === 0x1d74f) return { ch: '∂', kind: 'bold-italic' };
+  if (cp >= 0x1d750 && cp <= 0x1d755) {
+    return { ch: GREEK_VAR_SEQ[cp - 0x1d750] ?? '', kind: 'bold-italic' };
+  }
+
+  return null;
+}
+
+function makeSingleMathRun(text: string, plain = false, style?: OmmlStyleOptions): string {
+  const effectivePlain = plain || Boolean(style?.forcePlain);
   let rPr = '';
-  if (plain) {
+  if (effectivePlain) {
     const sty =
       style?.bold && style?.italic
         ? 'bi'
@@ -327,8 +469,49 @@ function makeMathRun(text: string, plain = false, style?: OmmlStyleOptions): str
     rPr = '<m:rPr><m:sty m:val="bi"/></m:rPr>';
   }
   const wRPr = buildWordRunPr(style);
-  const preserve = /^\s|\s$|\s{2,}/.test(normalized) ? ' xml:space="preserve"' : '';
-  return `<m:r>${rPr}${wRPr}<m:t${preserve}>${escapeXml(normalized)}</m:t></m:r>`;
+  const preserve = /^\s|\s$|\s{2,}/.test(text) ? ' xml:space="preserve"' : '';
+  return `<m:r>${rPr}${wRPr}<m:t${preserve}>${escapeXml(text)}</m:t></m:r>`;
+}
+
+function makeMathRun(text: string, plain = false, style?: OmmlStyleOptions): string {
+  const normalized = stripInvalidXmlChars(text.replace(/\r\n?|\n/g, ' '));
+  if (!normalized) return '';
+
+  const chunks: Array<{ text: string; kind: 'normal' | 'bold' | 'bold-italic' }> = [];
+  for (const ch of Array.from(normalized)) {
+    const cp = ch.codePointAt(0) ?? 0;
+    const decoded = decodeMathBoldChar(cp);
+    const kind: 'normal' | 'bold' | 'bold-italic' = decoded ? decoded.kind : 'normal';
+    const outChar = decoded && decoded.ch ? decoded.ch : ch;
+    const last = chunks[chunks.length - 1];
+    if (last && last.kind === kind) {
+      last.text += outChar;
+    } else {
+      chunks.push({ text: outChar, kind });
+    }
+  }
+
+  return chunks
+    .map((chunk) => {
+      if (chunk.kind === 'bold') {
+        return makeSingleMathRun(chunk.text, true, {
+          ...style,
+          bold: true,
+          italic: false,
+          forcePlain: true,
+        });
+      }
+      if (chunk.kind === 'bold-italic') {
+        return makeSingleMathRun(chunk.text, false, {
+          ...style,
+          bold: true,
+          italic: true,
+          forcePlain: false,
+        });
+      }
+      return makeSingleMathRun(chunk.text, plain, style);
+    })
+    .join('');
 }
 
 function getElementChildren(node: XmlNode): XmlElement[] {
@@ -357,8 +540,64 @@ function resolveStyleWithNode(
   activeStyle?: OmmlStyleOptions
 ): OmmlStyleOptions | undefined {
   const ownColor = extractNodeColorHex(node);
-  if (ownColor === undefined) return activeStyle;
-  return { ...(activeStyle ?? {}), colorHex: ownColor };
+  const mv = (node.getAttribute('mathvariant') ?? '').trim().toLowerCase();
+  const styleAttr = node.getAttribute('style') ?? '';
+  const fwM = styleAttr.match(/(?:^|;)\s*font-weight\s*:\s*([^;]+)/i);
+  const fsM = styleAttr.match(/(?:^|;)\s*font-style\s*:\s*([^;]+)/i);
+
+  let nextBold: boolean | undefined;
+  let nextItalic: boolean | undefined;
+  let nextForcePlain: boolean | undefined;
+
+  if (mv) {
+    if (mv === 'bold' || mv === 'bold-sans-serif' || mv === 'bold-fraktur' || mv === 'bold-script') {
+      nextBold = true;
+      nextItalic = false;
+      nextForcePlain = true;
+    } else if (mv === 'bold-italic' || mv === 'sans-serif-bold-italic') {
+      nextBold = true;
+      nextItalic = true;
+      nextForcePlain = false;
+    } else if (mv === 'italic' || mv === 'sans-serif-italic') {
+      nextItalic = true;
+      nextForcePlain = false;
+    } else if (mv === 'normal' || mv === 'sans-serif' || mv === 'monospace') {
+      nextBold = false;
+      nextItalic = false;
+      nextForcePlain = true;
+    }
+  }
+
+  if (fwM) {
+    const fw = fwM[1].trim().toLowerCase();
+    if (fw === 'bold' || fw === 'bolder' || Number(fw) >= 600) {
+      nextBold = true;
+    } else if (fw === 'normal' || (Number(fw) > 0 && Number(fw) < 600)) {
+      nextBold = false;
+    }
+  }
+  if (fsM) {
+    const fs = fsM[1].trim().toLowerCase();
+    if (fs === 'italic' || fs === 'oblique') nextItalic = true;
+    else if (fs === 'normal') nextItalic = false;
+  }
+
+  if (
+    ownColor === undefined &&
+    nextBold === undefined &&
+    nextItalic === undefined &&
+    nextForcePlain === undefined
+  ) {
+    return activeStyle;
+  }
+
+  return {
+    ...(activeStyle ?? {}),
+    ...(ownColor !== undefined ? { colorHex: ownColor } : {}),
+    ...(nextBold !== undefined ? { bold: nextBold } : {}),
+    ...(nextItalic !== undefined ? { italic: nextItalic } : {}),
+    ...(nextForcePlain !== undefined ? { forcePlain: nextForcePlain } : {}),
+  };
 }
 
 function convertMrowList(children: XmlElement[], activeStyle?: OmmlStyleOptions): string {
@@ -540,7 +779,11 @@ function convertNode(node: XmlElement, activeStyle?: OmmlStyleOptions): string {
     const txt = getNodeText(node).replace(INVISIBLE_MATH_CHARS_RE, '');
     if (!txt) return '';
     const isPlain =
-      tag === 'mn' || tag === 'mtext' || tag === 'ms' || (tag === 'mi' && txt.length > 1);
+      tag === 'mn' ||
+      tag === 'mo' ||
+      tag === 'mtext' ||
+      tag === 'ms' ||
+      (tag === 'mi' && txt.length > 1);
     return makeMathRun(txt, isPlain, nextStyle);
   }
 
@@ -642,21 +885,27 @@ function convertNode(node: XmlElement, activeStyle?: OmmlStyleOptions): string {
   if (tag === 'msup') {
     const children = getElementChildren(node);
     if (children.length >= 2) {
-      return `<m:sSup><m:e>${convertNode(children[0], nextStyle)}</m:e><m:sup>${convertNode(children[1], nextStyle)}</m:sup></m:sSup>`;
+      const ctrlPr = buildCtrlPr(nextStyle);
+      const pr = ctrlPr ? `<m:sSupPr>${ctrlPr}</m:sSupPr>` : '';
+      return `<m:sSup>${pr}<m:e>${convertNode(children[0], nextStyle)}</m:e><m:sup>${convertNode(children[1], nextStyle)}</m:sup></m:sSup>`;
     }
   }
 
   if (tag === 'msub') {
     const children = getElementChildren(node);
     if (children.length >= 2) {
-      return `<m:sSub><m:e>${convertNode(children[0], nextStyle)}</m:e><m:sub>${convertNode(children[1], nextStyle)}</m:sub></m:sSub>`;
+      const ctrlPr = buildCtrlPr(nextStyle);
+      const pr = ctrlPr ? `<m:sSubPr>${ctrlPr}</m:sSubPr>` : '';
+      return `<m:sSub>${pr}<m:e>${convertNode(children[0], nextStyle)}</m:e><m:sub>${convertNode(children[1], nextStyle)}</m:sub></m:sSub>`;
     }
   }
 
   if (tag === 'msubsup') {
     const children = getElementChildren(node);
     if (children.length >= 3) {
-      return `<m:sSubSup><m:e>${convertNode(children[0], nextStyle)}</m:e><m:sub>${convertNode(children[1], nextStyle)}</m:sub><m:sup>${convertNode(children[2], nextStyle)}</m:sup></m:sSubSup>`;
+      const ctrlPr = buildCtrlPr(nextStyle);
+      const pr = ctrlPr ? `<m:sSubSupPr>${ctrlPr}</m:sSubSupPr>` : '';
+      return `<m:sSubSup>${pr}<m:e>${convertNode(children[0], nextStyle)}</m:e><m:sub>${convertNode(children[1], nextStyle)}</m:sub><m:sup>${convertNode(children[2], nextStyle)}</m:sup></m:sSubSup>`;
     }
   }
 

@@ -11,10 +11,12 @@ import type {
 import { normalizeSegmentListInlineMath } from '../src/utils/latexParser.ts';
 import {
   computePageGeometry,
+  computeSafeTableColPcts,
   groupBlocksIntoVisualBands,
   isValidBox,
   normalizeBoxHexColor,
   normalizeHexColor,
+  normalizeTableBlockGrid,
   transformBlocksForChoiceLayout,
   type PageGeometry,
   type VisualBand,
@@ -76,14 +78,22 @@ function renderRunXml(
     colorHex = null,
   } = options;
   const sz = finiteInt(sizeHalfPt, 24, 14, 96);
-  const safeColor = colorHex && /^[0-9A-Fa-f]{6}$/.test(colorHex) ? colorHex.toUpperCase() : null;
-  // Strict ECMA-376 CT_RPr order: rFonts -> b -> i -> color -> sz -> szCs -> u
+  const safeColor = colorHex && /^[0-9A-Fa-f]{6}$/.test(colorHex) ? colorHex.toUpperCase() : '000000';
+  // Strict ECMA-376 CT_RPr order: rFonts -> b -> bCs -> i -> iCs -> color -> sz -> szCs -> u
   const rPrParts = [
     '<w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman" w:cs="Times New Roman" w:eastAsia="Times New Roman"/>',
   ];
-  if (bold) rPrParts.push('<w:b/>');
-  if (italic) rPrParts.push('<w:i/>');
-  if (safeColor) rPrParts.push(`<w:color w:val="${safeColor}"/>`);
+  if (bold) {
+    rPrParts.push('<w:b/>', '<w:bCs/>');
+  } else {
+    rPrParts.push('<w:b w:val="0"/>', '<w:bCs w:val="0"/>');
+  }
+  if (italic) {
+    rPrParts.push('<w:i/>', '<w:iCs/>');
+  } else {
+    rPrParts.push('<w:i w:val="0"/>', '<w:iCs w:val="0"/>');
+  }
+  rPrParts.push(`<w:color w:val="${safeColor}"/>`);
   rPrParts.push(`<w:sz w:val="${sz}"/>`, `<w:szCs w:val="${sz}"/>`);
   if (underline) rPrParts.push('<w:u w:val="single"/>');
 
@@ -421,7 +431,8 @@ function renderTableXml(
     mathFormat?: MathOutputFormat;
   }
 ): string {
-  const rows = block.table_rows ?? [];
+  const normalizedBlock = normalizeTableBlockGrid(block);
+  const rows = normalizedBlock.table_rows ?? [];
   if (rows.length === 0) return '';
 
   const safeSpan = (rawSpan: unknown): number => finiteInt(rawSpan, 1, 1, 63);
@@ -443,12 +454,14 @@ function renderTableXml(
   const safeIndentLeft = finiteInt(indentLeftTwip, 0, 0, 20_000);
   const safeSpaceBefore = finiteInt(spaceBeforeTwip, 0, 0, 20_000);
 
-  const tableStyle = block.table_style ?? (block.table_borderless ? 'borderless' : 'grid');
+  const tableStyle = normalizedBlock.table_style ?? (normalizedBlock.table_borderless ? 'borderless' : 'grid');
   const isBorderless = tableStyle === 'borderless';
   const isBooktabs = tableStyle === 'booktabs';
   const isBox = tableStyle === 'box';
   const isGrid = tableStyle === 'grid';
-  const colBorders = Array.isArray(block.table_col_borders) ? block.table_col_borders : null;
+  const colBorders = Array.isArray(normalizedBlock.table_col_borders)
+    ? normalizedBlock.table_col_borders
+    : null;
 
   const baseColW = Math.max(120, Math.floor(totalWidthDxa / maxCols));
   const colWidthsDxa: number[] = new Array(maxCols).fill(baseColW);
@@ -459,41 +472,28 @@ function renderTableXml(
     }
   }
 
-  const rowWithWidths = rows.find(
-    (r) =>
-      r.length === maxCols &&
-      r.every(
-        (c) =>
-          typeof c.width_pct === 'number' &&
-          Number.isFinite(c.width_pct) &&
-          (c.width_pct ?? 0) > 0 &&
-          !(c.col_span && c.col_span > 1)
-      )
-  );
-  if (rowWithWidths) {
-    const pctSum = rowWithWidths.reduce((s, c) => s + (c.width_pct ?? 0), 0);
-    if (Number.isFinite(pctSum) && pctSum > 0) {
-      let assigned = 0;
-      const minColW = Math.min(360, Math.max(120, Math.floor(totalWidthDxa / maxCols)));
-      rowWithWidths.forEach((c, idx) => {
-        if (idx === maxCols - 1) {
-          colWidthsDxa[idx] = Math.max(minColW, totalWidthDxa - assigned);
-        } else {
-          const maxAllow = Math.max(
-            minColW,
-            totalWidthDxa - assigned - minColW * (maxCols - 1 - idx)
-          );
-          const w = finiteInt(
-            ((c.width_pct ?? 0) / pctSum) * totalWidthDxa,
-            minColW,
-            minColW,
-            maxAllow
-          );
-          colWidthsDxa[idx] = w;
-          assigned += w;
-        }
-      });
-    }
+  const safeColPcts = computeSafeTableColPcts(rows, maxCols, totalWidthDxa / 20, isBorderless);
+  if (safeColPcts) {
+    let assigned = 0;
+    const minColW = Math.min(360, Math.max(120, Math.floor(totalWidthDxa / maxCols)));
+    safeColPcts.forEach((pct, idx) => {
+      if (idx === maxCols - 1) {
+        colWidthsDxa[idx] = Math.max(minColW, totalWidthDxa - assigned);
+      } else {
+        const maxAllow = Math.max(
+          minColW,
+          totalWidthDxa - assigned - minColW * (maxCols - 1 - idx)
+        );
+        const w = finiteInt(
+          (pct / 100) * totalWidthDxa,
+          minColW,
+          minColW,
+          maxAllow
+        );
+        colWidthsDxa[idx] = w;
+        assigned += w;
+      }
+    });
   }
 
   const resolvedTableWidthDxa = colWidthsDxa.reduce((a, b) => a + b, 0);
@@ -513,7 +513,11 @@ function renderTableXml(
     ? '<w:tblCellMar><w:top w:w="20" w:type="dxa"/><w:left w:w="40" w:type="dxa"/><w:bottom w:w="20" w:type="dxa"/><w:right w:w="40" w:type="dxa"/></w:tblCellMar>'
     : '<w:tblCellMar><w:top w:w="70" w:type="dxa"/><w:left w:w="100" w:type="dxa"/><w:bottom w:w="70" w:type="dxa"/><w:right w:w="100" w:type="dxa"/></w:tblCellMar>';
 
-  const tblPr = `<w:tblPr><w:tblW w:w="${resolvedTableWidthDxa}" w:type="dxa"/>${tblIndXml}${bordersXml}<w:tblLayout w:type="fixed"/>${cellMarXml}</w:tblPr>`;
+  const tblJcXml =
+    safeIndentLeft <= 20 && (normalizedBlock.alignment === 'center' || normalizedBlock.alignment === 'right')
+      ? `<w:jc w:val="${normalizedBlock.alignment}"/>`
+      : '';
+  const tblPr = `<w:tblPr><w:tblW w:w="${resolvedTableWidthDxa}" w:type="dxa"/>${tblJcXml}${tblIndXml}${bordersXml}<w:tblLayout w:type="fixed"/>${cellMarXml}</w:tblPr>`;
 
   const defaultSizeHalfPt =
     typeof block.font_size_pt === 'number' && Number.isFinite(block.font_size_pt)
@@ -553,6 +557,12 @@ function renderTableXml(
           ? '<w:shd w:val="clear" w:color="auto" w:fill="F1F5F9"/>'
           : '';
         const gridSpanXml = span > 1 ? `<w:gridSpan w:val="${span}"/>` : '';
+        const vMergeXml =
+          cell.v_merge === 'restart'
+            ? '<w:vMerge w:val="restart"/>'
+            : cell.v_merge === 'continue'
+            ? '<w:vMerge/>'
+            : '';
 
         const borderHex =
           normalizeBoxHexColor(cell.border_color) ??
@@ -703,9 +713,9 @@ function renderTableXml(
           });
         }
 
-        // Strict ECMA-376 CT_TcPrInner child order: tcW -> gridSpan -> tcBorders -> shd -> vAlign
+        // Strict ECMA-376 CT_TcPrInner child order: tcW -> gridSpan -> vMerge -> tcBorders -> shd -> vAlign
         cellsXml.push(
-          `<w:tc><w:tcPr><w:tcW w:w="${cellWidthDxa}" w:type="dxa"/>${gridSpanXml}${tcBordersXml}${shading}${vAlignXml}</w:tcPr>${cellContentXml}</w:tc>`
+          `<w:tc><w:tcPr><w:tcW w:w="${cellWidthDxa}" w:type="dxa"/>${gridSpanXml}${vMergeXml}${tcBordersXml}${shading}${vAlignXml}</w:tcPr>${cellContentXml}</w:tc>`
         );
       }
 
@@ -863,21 +873,37 @@ function renderSingleBlockXml(
   if (blk.block_type === 'equation' && blk.latex) {
     const sizeHalfPt = getBlockSizeHalfPt(blk, pageBaseFontPt);
     const eqAlign = blk.alignment ?? 'center';
+    const eqColorHex = normalizeHexColor(blk.color);
+    const eqBold = Boolean(blk.bold);
+    const eqItalic = Boolean(blk.italic);
     if (mathFormat === 'latex') {
       let cleaned = cleanLatex(blk.latex);
       const eqEnvM = cleaned.match(/^\\begin\{(equation\*?|displaymath)\}([\s\S]*)\\end\{\1\}$/);
       if (eqEnvM) cleaned = eqEnvM[2].trim();
-      return renderParagraphXml(cleaned ? renderRunXml('${' + cleaned + '}$', { sizeHalfPt }) : '', {
-        align: eqAlign,
-        spaceBeforeTwip,
-        spaceAfterTwip: 0,
-        indentLeftTwip: eqAlign === 'center' ? 0 : indentLeftTwip,
-        indentRightTwip: eqAlign === 'center' ? 0 : indentRightTwip,
-      });
+      return renderParagraphXml(
+        cleaned
+          ? renderRunXml('${' + cleaned + '}$', {
+              sizeHalfPt,
+              colorHex: eqColorHex,
+              bold: eqBold,
+              italic: eqItalic,
+            })
+          : '',
+        {
+          align: eqAlign,
+          spaceBeforeTwip,
+          spaceAfterTwip: 0,
+          indentLeftTwip: eqAlign === 'center' ? 0 : indentLeftTwip,
+          indentRightTwip: eqAlign === 'center' ? 0 : indentRightTwip,
+        }
+      );
     }
     const omml = latexToOmmlXml(blk.latex, true, {
       sizeHalfPt,
       align: eqAlign,
+      colorHex: eqColorHex,
+      bold: eqBold,
+      italic: eqItalic,
     });
     if (omml) {
       return renderParagraphXml(omml, {
@@ -888,12 +914,21 @@ function renderSingleBlockXml(
         indentRightTwip: eqAlign === 'center' ? 0 : indentRightTwip,
       });
     }
-    return renderParagraphXml(renderRunXml(cleanLatex(blk.latex), { sizeHalfPt }), {
-      align: eqAlign,
-      spaceBeforeTwip,
-      spaceAfterTwip: 0,
-      indentLeftTwip: eqAlign === 'center' ? 0 : indentLeftTwip,
-    });
+    return renderParagraphXml(
+      renderRunXml(cleanLatex(blk.latex), {
+        sizeHalfPt,
+        colorHex: eqColorHex,
+        bold: eqBold,
+        italic: eqItalic,
+      }),
+      {
+        align: eqAlign,
+        spaceBeforeTwip,
+        spaceAfterTwip: 0,
+        indentLeftTwip: eqAlign === 'center' ? 0 : indentLeftTwip,
+        indentRightTwip: eqAlign === 'center' ? 0 : indentRightTwip,
+      }
+    );
   }
 
   if (blk.block_type === 'table') {
@@ -1002,9 +1037,15 @@ export async function buildDocxBuffer(
     addPageBreaks?: boolean;
     choiceLayout?: ChoiceLayoutMode;
     mathFormat?: MathOutputFormat;
+    underlineCorrectChoice?: boolean;
   } = {}
 ): Promise<Buffer> {
-  const { addPageBreaks = true, choiceLayout = 'tabs', mathFormat = 'omml' } = options;
+  const {
+    addPageBreaks = true,
+    choiceLayout = 'tabs',
+    mathFormat = 'omml',
+    underlineCorrectChoice = false,
+  } = options;
   const mediaItems: MediaItem[] = [];
   const bodyChunks: string[] = [];
 
@@ -1049,7 +1090,12 @@ export async function buildDocxBuffer(
         ? Math.max(8, Math.min(20, page.base_font_size_pt))
         : defaultPageBaseFontPt;
 
-    const transformedBlocks = transformBlocksForChoiceLayout(page.blocks, choiceLayout, geom);
+    const transformedBlocks = transformBlocksForChoiceLayout(
+      page.blocks,
+      choiceLayout,
+      geom,
+      underlineCorrectChoice
+    );
     const bands = groupBlocksIntoVisualBands(transformedBlocks, geom);
 
     if (pageIdx > 0 && addPageBreaks) {
@@ -1153,6 +1199,11 @@ export async function buildDocxBuffer(
     <w:rPrDefault>
       <w:rPr>
         <w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman" w:cs="Times New Roman" w:eastAsia="Times New Roman"/>
+        <w:b w:val="0"/>
+        <w:bCs w:val="0"/>
+        <w:i w:val="0"/>
+        <w:iCs w:val="0"/>
+        <w:color w:val="000000"/>
         <w:sz w:val="${defaultStyleHalfPt}"/>
         <w:szCs w:val="${defaultStyleHalfPt}"/>
       </w:rPr>

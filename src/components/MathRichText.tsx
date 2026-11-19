@@ -11,7 +11,9 @@ function renderKatexHtml(latex: string, displayMode: boolean): string {
   const cleaned = latex
     .trim()
     .replace(/^\$\$|\$\$$/g, '')
-    .replace(/^\$|\$$/g, '');
+    .replace(/^\$|\$$/g, '')
+    .replace(/[\uEF00\u200B-\u200F\u2060-\u2064\uFEFF]/g, '')
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\uE000-\uF8FF\uFFFD]/g, '');
   try {
     return katex.renderToString(cleaned, {
       displayMode,

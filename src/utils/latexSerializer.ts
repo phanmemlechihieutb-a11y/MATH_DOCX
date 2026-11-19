@@ -4,7 +4,11 @@ import type {
   PageExtraction,
 } from '../types/document.ts';
 import type { EmbeddedFigureAsset } from './latexParser.ts';
-import { cleanLatexDelimiters, normalizeHexColor } from './layoutMetrics.ts';
+import {
+  cleanLatexDelimiters,
+  normalizeHexColor,
+  normalizeTableBlockGrid,
+} from './layoutMetrics.ts';
 
 function escapeLatexPlainText(text: string): string {
   return text
@@ -32,7 +36,7 @@ function formatTextSegment(seg: InlineSegment): string {
   if (seg.bold) out = `\\textbf{${out}}`;
 
   const hex = normalizeHexColor(seg.color);
-  if (hex && hex !== '000000' && hex !== '0F172A' && hex !== '111827') {
+  if (hex) {
     out = `\\textcolor{#${hex}}{${out}}`;
   }
 
@@ -45,14 +49,22 @@ function segmentsToLatex(segments?: InlineSegment[] | null, inTableCell = false)
   const parts: string[] = [];
   for (let i = 0; i < segments.length; i++) {
     const seg = segments[i];
-    const tabPrefix = seg.tab_before && i > 0 ? ' \\qquad ' : '';
+    const tabPrefix =
+      seg.tab_before && i > 0
+        ? typeof seg.tab_width_pt === 'number' && Number.isFinite(seg.tab_width_pt) && seg.tab_width_pt > 0
+          ? `\\hspace*{${Math.round(seg.tab_width_pt * 10) / 10}pt}`
+          : ' \\qquad '
+        : '';
 
     if (seg.type === 'math') {
       const inner = cleanLatexDelimiters(seg.content ?? '');
       if (!inner) continue;
       let mathOut = `$${inner}$`;
+      if (seg.underline) mathOut = `\\underline{${mathOut}}`;
+      if (seg.italic) mathOut = `\\textit{${mathOut}}`;
+      if (seg.bold) mathOut = `{\\boldmath ${mathOut}}`;
       const hex = normalizeHexColor(seg.color);
-      if (hex && hex !== '000000' && hex !== '0F172A' && hex !== '111827') {
+      if (hex) {
         mathOut = `\\textcolor{#${hex}}{${mathOut}}`;
       }
       parts.push(`${tabPrefix}${mathOut}`);
@@ -91,15 +103,28 @@ export function pagesToLatexSource(pages: PageExtraction[]): {
     const blockStrings: string[] = [];
 
     for (const blk of page.blocks) {
+      const vspacePrefix =
+        typeof blk.space_before_pt === 'number' && Number.isFinite(blk.space_before_pt) && blk.space_before_pt > 6
+          ? `\\vspace{${Math.round(blk.space_before_pt * 10) / 10}pt}\n`
+          : '';
+
       if (blk.block_type === 'horizontal_rule') {
-        blockStrings.push('\\hrule');
+        blockStrings.push(`${vspacePrefix}\\hrule`);
         continue;
       }
 
       if (blk.block_type === 'equation') {
         const inner = cleanLatexDelimiters(blk.latex ?? '');
         if (inner) {
-          blockStrings.push(`\\[\n${inner}\n\\]`);
+          const eqHex = normalizeHexColor(blk.color);
+          const prefixes: string[] = [];
+          if (blk.bold) prefixes.push('\\boldmath\\bfseries');
+          if (blk.italic) prefixes.push('\\itshape');
+          if (eqHex) prefixes.push(`\\color{#${eqHex}}`);
+          const eqStr = `\\[\n${inner}\n\\]`;
+          blockStrings.push(
+            vspacePrefix + (prefixes.length > 0 ? `{${prefixes.join(' ')}\n${eqStr}\n}` : eqStr)
+          );
         }
         continue;
       }
@@ -118,31 +143,50 @@ export function pagesToLatexSource(pages: PageExtraction[]): {
           const body = blk.caption
             ? `\\includegraphics{${key}}\n\\\\\n\\textit{${escapeLatexPlainText(blk.caption)}}`
             : `\\includegraphics{${key}}`;
-          blockStrings.push(wrapAlignment(body, blk.alignment === 'left' || blk.alignment === 'right' ? blk.alignment : 'center'));
+          blockStrings.push(
+            vspacePrefix +
+              wrapAlignment(
+                body,
+                blk.alignment === 'left' || blk.alignment === 'right' ? blk.alignment : 'center'
+              )
+          );
         } else if (blk.caption) {
-          blockStrings.push(wrapAlignment(`\\textit{${escapeLatexPlainText(blk.caption)}}`, 'center'));
+          blockStrings.push(
+            vspacePrefix + wrapAlignment(`\\textit{${escapeLatexPlainText(blk.caption)}}`, 'center')
+          );
         }
         continue;
       }
 
       if (blk.block_type === 'table' && blk.table_rows && blk.table_rows.length > 0) {
+        const normBlk = normalizeTableBlockGrid(blk);
+        const normRows = normBlk.table_rows ?? blk.table_rows;
         const colCount = Math.max(
           1,
-          ...blk.table_rows.map((row) =>
+          ...normRows.map((row) =>
             row.reduce((acc, cell) => acc + Math.max(1, cell.col_span ?? 1), 0)
           )
         );
         const firstRowAligns = Array.from({ length: colCount }, (_, cIdx) => {
-          const align = blk.table_rows?.[0]?.[cIdx]?.alignment;
+          const align = normRows?.[0]?.[cIdx]?.alignment;
           return align === 'center' ? 'c' : align === 'right' ? 'r' : 'l';
         });
-        const isBorderless = Boolean(blk.table_borderless);
+        const isBorderless = Boolean(normBlk.table_borderless);
         const colSpec = isBorderless
           ? firstRowAligns.join('')
           : `|${firstRowAligns.join('|')}|`;
 
-        const rowLines = blk.table_rows.map((row) => {
-          const cells = row.map((cell) => segmentsToLatex(cell.segments, true) || ' ');
+        const rowLines = normRows.map((row) => {
+          const cells = row.map((cell) => {
+            const inner = segmentsToLatex(cell.segments, true) || ' ';
+            const span = Math.max(1, cell.col_span ?? 1);
+            if (span > 1) {
+              const a = cell.alignment === 'center' ? 'c' : cell.alignment === 'right' ? 'r' : 'l';
+              const spec = isBorderless ? a : `|${a}|`;
+              return `\\multicolumn{${span}}{${spec}}{${inner}}`;
+            }
+            return inner;
+          });
           return `  ${cells.join(' & ')} \\\\`;
         });
 
@@ -152,7 +196,12 @@ export function pagesToLatexSource(pages: PageExtraction[]): {
 
         const tblLatex = `\\begin{tabular}{${colSpec}}\n${tableBody}\n\\end{tabular}`;
         blockStrings.push(
-          blk.alignment === 'center' ? `\\begin{center}\n${tblLatex}\n\\end{center}` : tblLatex
+          vspacePrefix +
+            (normBlk.alignment === 'center'
+              ? `\\begin{center}\n${tblLatex}\n\\end{center}`
+              : normBlk.alignment === 'right'
+              ? `\\begin{flushright}\n${tblLatex}\n\\end{flushright}`
+              : tblLatex)
         );
         continue;
       }
@@ -160,19 +209,37 @@ export function pagesToLatexSource(pages: PageExtraction[]): {
       if (blk.block_type === 'heading') {
         const inner = segmentsToLatex(blk.segments);
         if (!inner) continue;
+        const nonEmptySegs = (blk.segments ?? []).filter((s) => (s.content ?? '').trim().length > 0);
+        const allBold = nonEmptySegs.length > 0 && nonEmptySegs.every((s) => Boolean(s.bold));
+        if (!allBold) {
+          const sizeCmd =
+            blk.heading_level === 1 ? '\\Large' : blk.heading_level === 3 ? '\\normalsize' : '\\large';
+          blockStrings.push(vspacePrefix + wrapAlignment(`{${sizeCmd} ${inner}}`, blk.alignment));
+          continue;
+        }
         const cmd =
           blk.heading_level === 1
             ? `\\section*{${inner}}`
             : blk.heading_level === 3
             ? `\\subsubsection*{${inner}}`
             : `\\subsection*{${inner}}`;
-        blockStrings.push(blk.alignment === 'center' ? wrapAlignment(cmd, 'center') : cmd);
+        blockStrings.push(
+          vspacePrefix + (blk.alignment === 'center' ? wrapAlignment(cmd, 'center') : cmd)
+        );
         continue;
       }
 
       const paraText = segmentsToLatex(blk.segments);
       if (paraText) {
-        blockStrings.push(wrapAlignment(paraText, blk.alignment));
+        const leadIndent =
+          typeof blk.first_line_indent_pt === 'number' &&
+          Number.isFinite(blk.first_line_indent_pt) &&
+          blk.first_line_indent_pt > 3 &&
+          blk.alignment !== 'center' &&
+          blk.alignment !== 'right'
+            ? `\\hspace*{${Math.round(blk.first_line_indent_pt * 10) / 10}pt}`
+            : '';
+        blockStrings.push(vspacePrefix + wrapAlignment(`${leadIndent}${paraText}`, blk.alignment));
       }
     }
 

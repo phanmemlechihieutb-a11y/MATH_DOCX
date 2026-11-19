@@ -47,15 +47,15 @@ const BARE_LATEX_CMD_RE =
   /\\(?:(?:frac|dfrac|tfrac|cfrac|binom|dbinom|sqrt|int|iint|iiint|oint|sum|prod|lim|limsup|liminf|limits|nolimits|displaystyle|textstyle|scriptstyle|scriptscriptstyle|underset|overset|mathop|operatorname|left|right|vec|overrightarrow|overleftarrow|widehat|widetilde|overline|bar|tilde|hat|heva|hoac|mathbb|mathcal|mathfrak|mathrm|sin|cos|tan|cot|sec|csc|arcsin|arccos|arctan|log|ln|lg|exp|max|min|sup|inf|alpha|beta|gamma|delta|Delta|epsilon|varepsilon|zeta|eta|theta|vartheta|lambda|mu|nu|xi|pi|rho|sigma|tau|phi|varphi|chi|psi|omega|Omega|Gamma|Theta|Lambda|Sigma|Phi|Psi|infty|partial|nabla|leq|geq|neq|approx|equiv|sim|simeq|cong|propto|pm|mp|times|cdot|div|ast|star|circ|bullet|in|notin|ni|subset|subseteq|supset|supseteq|cup|cap|setminus|emptyset|varnothing|forall|exists|nexists|neg|land|lor|Rightarrow|Leftrightarrow|Leftarrow|rightarrow|leftarrow|leftrightarrow|to|mapsto|implies|iff|dots|cdots|ldots|vdots|ddots)(?![a-zA-Z])|begin\{)/;
 
 const LATEX_COLOR_MAP: Record<string, string> = {
-  red: '#DC2626',
+  red: '#FF0000',
   crimson: '#DC143C',
-  darkred: '#991B1B',
+  darkred: '#8B0000',
   maroon: '#800000',
-  blue: '#2563EB',
-  darkblue: '#1E3A8A',
-  navy: '#1E3A8A',
-  navyblue: '#1E3A8A',
-  royalblue: '#1D4ED8',
+  blue: '#0000FF',
+  darkblue: '#00008B',
+  navy: '#000080',
+  navyblue: '#000080',
+  royalblue: '#4169E1',
   dodgerblue: '#1E90FF',
   midnightblue: '#191970',
   cornflowerblue: '#6495ED',
@@ -66,9 +66,9 @@ const LATEX_COLOR_MAP: Record<string, string> = {
   cadetblue: '#5F9EA0',
   aquamarine: '#00B5BE',
   turquoise: '#00B4CC',
-  green: '#16A34A',
-  darkgreen: '#15803D',
-  forestgreen: '#15803D',
+  green: '#008000',
+  darkgreen: '#006400',
+  forestgreen: '#228B22',
   pinegreen: '#008B72',
   junglegreen: '#00A99D',
   seagreen: '#3FBC9D',
@@ -78,10 +78,10 @@ const LATEX_COLOR_MAP: Record<string, string> = {
   greenyellow: '#AFE138',
   yellowgreen: '#98CC70',
   olivegreen: '#3C8031',
-  teal: '#0D9488',
-  cyan: '#0891B2',
-  orange: '#EA580C',
-  darkorange: '#C2410C',
+  teal: '#008080',
+  cyan: '#00FFFF',
+  orange: '#FF8000',
+  darkorange: '#FF8C00',
   burntorange: '#F7921D',
   redorange: '#F26035',
   orangered: '#FF4500',
@@ -90,15 +90,15 @@ const LATEX_COLOR_MAP: Record<string, string> = {
   apricot: '#FBB982',
   melon: '#F89E7B',
   salmon: '#F69289',
-  yellow: '#CA8A04',
+  yellow: '#FFFF00',
   goldenrod: '#DAA520',
-  gold: '#CA8A04',
+  gold: '#FFD700',
   amber: '#D97706',
   dandelion: '#FDBC42',
-  olive: '#65A30D',
-  lime: '#84CC16',
-  purple: '#9333EA',
-  violet: '#7C3AED',
+  olive: '#808000',
+  lime: '#00FF00',
+  purple: '#800080',
+  violet: '#800080',
   blueviolet: '#473992',
   darkorchid: '#A4538A',
   orchid: '#AF72B0',
@@ -106,30 +106,31 @@ const LATEX_COLOR_MAP: Record<string, string> = {
   mulberry: '#A93C93',
   lavender: '#F49EC4',
   thistle: '#D883B7',
-  indigo: '#4338CA',
+  indigo: '#4B0082',
   periwinkle: '#7977B8',
-  magenta: '#DB2777',
-  fuchsia: '#8C368C',
+  magenta: '#FF00FF',
+  fuchsia: '#FF00FF',
   rhodamine: '#EF559F',
   rubinered: '#ED017D',
   wildstrawberry: '#EE2967',
   carnationpink: '#F282B4',
-  pink: '#EC4899',
+  pink: '#FFC0CB',
   redviolet: '#A1246B',
   violetred: '#EF58A0',
   brickred: '#B6321C',
   mahogany: '#A9341F',
-  brown: '#92400E',
+  brown: '#804000',
   rawsienna: '#974006',
   sepia: '#671800',
   tan: '#DA9D76',
-  gray: '#64748B',
-  grey: '#64748B',
-  lightgray: '#E2E8F0',
-  silver: '#CBD5E1',
-  darkgray: '#334155',
-  darkgrey: '#334155',
-  black: '#0F172A',
+  gray: '#808080',
+  grey: '#808080',
+  lightgray: '#C0C0C0',
+  lightgrey: '#C0C0C0',
+  silver: '#C0C0C0',
+  darkgray: '#404040',
+  darkgrey: '#404040',
+  black: '#000000',
   white: '#FFFFFF',
 };
 
@@ -451,7 +452,7 @@ function resolveLatexModelAndSpec(
 function isBlackLatexColor(specRaw: string, resolvedHex?: string): boolean {
   const s = specRaw.trim().toLowerCase();
   if (s === 'black') return true;
-  return resolvedHex === '#000000' || resolvedHex === '#0F172A';
+  return resolvedHex === '#000000';
 }
 
 function readBalancedBraces(
@@ -3023,16 +3024,18 @@ function parseInlineSegmentText(
         let matchedSwitch = false;
         while (bodyStr.length > 0) {
           const swM = bodyStr.match(
-            /^\\(bfseries|bf|itshape|it|em|slshape|sl|ttfamily|tt|scshape|sc|sffamily|rmfamily|mdseries|upshape|normalfont|selectfont|normalcolor|tiny|scriptsize|footnotesize|small|normalsize|large|Large|LARGE|huge|Huge)(?![a-zA-Z])\s*/
+            /^\\(bfseries|bf|boldmath|unboldmath|itshape|it|em|slshape|sl|ttfamily|tt|scshape|sc|sffamily|rmfamily|mdseries|upshape|normalfont|selectfont|normalcolor|tiny|scriptsize|footnotesize|small|normalsize|large|Large|LARGE|huge|Huge)(?![a-zA-Z])\s*/
           );
           if (swM) {
             matchedSwitch = true;
             const sw = swM[1];
             bodyStr = bodyStr.slice(swM[0].length);
-            if (sw === 'bf' || sw === 'bfseries') groupStyle.bold = true;
-            else if (sw === 'mdseries') groupStyle.bold = false;
-            else if (sw === 'it' || sw === 'itshape' || sw === 'em' || sw === 'sl' || sw === 'slshape') {
+            if (sw === 'bf' || sw === 'bfseries' || sw === 'boldmath') groupStyle.bold = true;
+            else if (sw === 'mdseries' || sw === 'unboldmath') groupStyle.bold = false;
+            else if (sw === 'it' || sw === 'itshape' || sw === 'sl' || sw === 'slshape') {
               groupStyle.italic = true;
+            } else if (sw === 'em') {
+              groupStyle.italic = !groupStyle.italic;
             } else if (sw === 'upshape') groupStyle.italic = false;
             else if (sw === 'normalfont') {
               groupStyle.bold = baseStyle.bold;
@@ -3341,9 +3344,9 @@ function parseInlineSegmentText(
         }
       }
 
-      // \textbf{}, \textit{}, \emph{}, \underline{}, \fbox{}, \boxed{}, \textrm{}, \textsf{}, \texttt{}, \textsc{}, \textsl{}, \textnormal{}, \textup{}, \sout{}, \text{}, \mbox{}, \thead{}, \makecell{}, \textsuperscript{}, \textsubscript{}, \centerline{}, \leftline{}, \rightline{}, \uline{}, \cancel{}
+      // \textbf{}, \textmd{}, \textit{}, \emph{}, \underline{}, \fbox{}, \boxed{}, \textrm{}, \textsf{}, \texttt{}, \textsc{}, \textsl{}, \textnormal{}, \textup{}, \sout{}, \text{}, \mbox{}, \thead{}, \makecell{}, \textsuperscript{}, \textsubscript{}, \centerline{}, \leftline{}, \rightline{}, \uline{}, \cancel{}
       const styleMatch = rest.match(
-        /^\\(textbf|textit|emph|underline|fbox|boxed|textrm|textsf|texttt|textsc|textsl|textnormal|textup|sout|uline|uwave|st|cancel|bcancel|xcancel|ul|text|mbox|hbox|thead|makecell|textsuperscript|textsubscript|centerline|leftline|rightline)(?:\[[^\]]*\])?\s*\{/
+        /^\\(textbf|textmd|textit|emph|underline|fbox|boxed|textrm|textsf|texttt|textsc|textsl|textnormal|textup|sout|uline|uwave|st|cancel|bcancel|xcancel|ul|text|mbox|hbox|thead|makecell|textsuperscript|textsubscript|centerline|leftline|rightline)(?:\[[^\]]*\])?\s*\{/
       );
       if (styleMatch) {
         const braceStart = i + styleMatch[0].length - 1;
@@ -3356,14 +3359,20 @@ function parseInlineSegmentText(
             i = br.endIdx + 1;
             continue;
           }
+          const nextBold =
+            cmd === 'textmd' || cmd === 'textnormal'
+              ? false
+              : currentStyle.bold || cmd === 'textbf' || cmd === 'thead';
+          const nextItalic =
+            cmd === 'textup' || cmd === 'textnormal'
+              ? false
+              : cmd === 'emph'
+              ? !currentStyle.italic
+              : currentStyle.italic || cmd === 'textit' || cmd === 'textsl';
           const nextStyle: InlineStyle = {
             ...currentStyle,
-            bold: currentStyle.bold || cmd === 'textbf' || cmd === 'thead',
-            italic:
-              currentStyle.italic ||
-              cmd === 'textit' ||
-              cmd === 'emph' ||
-              cmd === 'textsl',
+            bold: nextBold,
+            italic: nextItalic,
             underline: currentStyle.underline || cmd === 'underline' || cmd === 'ul' || cmd === 'uline',
             ...(cmd === 'textsuperscript' || cmd === 'textsubscript'
               ? { font_size_pt: Math.max(8, (currentStyle.font_size_pt ?? 12) - 3) }
@@ -3379,17 +3388,19 @@ function parseInlineSegmentText(
         }
       }
 
-      // Inline switch without braces: \bfseries, \itshape, \Large, \normalcolor, \color[model]{spec}
+      // Inline switch without braces: \bfseries, \boldmath, \itshape, \Large, \normalcolor, \color[model]{spec}
       const inlineSwMatch = rest.match(
-        /^\\(bfseries|bf|itshape|it|em|slshape|sl|ttfamily|tt|scshape|sc|sffamily|rmfamily|mdseries|upshape|normalfont|selectfont|normalcolor|tiny|scriptsize|footnotesize|small|normalsize|large|Large|LARGE|huge|Huge)(?![a-zA-Z])\s*/
+        /^\\(bfseries|bf|boldmath|unboldmath|itshape|it|em|slshape|sl|ttfamily|tt|scshape|sc|sffamily|rmfamily|mdseries|upshape|normalfont|selectfont|normalcolor|tiny|scriptsize|footnotesize|small|normalsize|large|Large|LARGE|huge|Huge)(?![a-zA-Z])\s*/
       );
       if (inlineSwMatch) {
         flushText();
         const sw = inlineSwMatch[1];
-        if (sw === 'bf' || sw === 'bfseries') currentStyle = { ...currentStyle, bold: true };
-        else if (sw === 'mdseries') currentStyle = { ...currentStyle, bold: false };
-        else if (sw === 'it' || sw === 'itshape' || sw === 'em' || sw === 'sl' || sw === 'slshape') {
+        if (sw === 'bf' || sw === 'bfseries' || sw === 'boldmath') currentStyle = { ...currentStyle, bold: true };
+        else if (sw === 'mdseries' || sw === 'unboldmath') currentStyle = { ...currentStyle, bold: false };
+        else if (sw === 'it' || sw === 'itshape' || sw === 'sl' || sw === 'slshape') {
           currentStyle = { ...currentStyle, italic: true };
+        } else if (sw === 'em') {
+          currentStyle = { ...currentStyle, italic: !currentStyle.italic };
         } else if (sw === 'upshape') currentStyle = { ...currentStyle, italic: false };
         else if (sw === 'normalfont') {
           currentStyle = {
@@ -3486,9 +3497,33 @@ function parseInlineSegmentText(
         continue;
       }
 
+      // Preserve explicit horizontal spacing \hspace*{len} / \hspace{len} instead of dropping it
+      const hspaceMatch = rest.match(/^\\hspace\*?\s*\{([^}]+)\}[ \t]*/);
+      if (hspaceMatch) {
+        const pt = parseLatexLengthToPt(
+          hspaceMatch[1],
+          ctx?.pageConfig.contentWidthPt ?? 487.3,
+          currentStyle.font_size_pt ?? 12
+        );
+        if (pt !== null && pt >= 6) {
+          flushText();
+          out.push({
+            type: 'text',
+            content: '',
+            tab_before: true,
+            tab_leader: 'none',
+            tab_width_pt: Math.round(pt * 10) / 10,
+          });
+        } else if (pt !== null && pt >= 2) {
+          textBuffer += ' ';
+        }
+        i += hspaceMatch[0].length;
+        continue;
+      }
+
       // Ignore benign layout/spacing macros in inline text
       const noopMatch = rest.match(
-        /^\\(?:noindent|indent|centering|raggedright|raggedleft|hspace\*?\{[^}]*\}|vspace\*?\{[^}]*\}|addvspace\{[^}]*\}|phantom\*?\{[^}]*\}|hphantom\{[^}]*\}|vphantom\{[^}]*\}|fontsize\{[^}]*\}\{[^}]*\}|vfill|smallskip|medskip|bigskip|par(?![a-zA-Z])|index\{[^}]*\}|phantomsection|protect|relax|ignorespaces|strut|leavevmode|null)\s*/
+        /^\\(?:noindent|indent|centering|raggedright|raggedleft|vspace\*?\{[^}]*\}|addvspace\{[^}]*\}|phantom\*?\{[^}]*\}|hphantom\{[^}]*\}|vphantom\{[^}]*\}|fontsize\{[^}]*\}\{[^}]*\}|vfill|smallskip|medskip|bigskip|par(?![a-zA-Z])|index\{[^}]*\}|phantomsection|protect|relax|ignorespaces|strut|leavevmode|null)\s*/
       );
       if (noopMatch) {
         i += noopMatch[0].length;
@@ -3802,11 +3837,18 @@ function parseTabularEnvironment(
   bodyRaw: string,
   mode: LatexPasteMode,
   ctx?: ParserContext,
-  containerWidthPt?: number
+  containerWidthPt?: number,
+  tableScope?: {
+    alignment?: BlockAlignment;
+    fontSizePt?: number;
+    bold?: boolean;
+    italic?: boolean;
+    color?: string;
+  }
 ): DocumentBlock | null {
   const expandedSpec = expandColumnSpec(colSpecRaw);
   const availWidthPt = containerWidthPt ?? ctx?.pageConfig.contentWidthPt ?? 487.3;
-  const baseFontPt = ctx?.pageConfig.baseFontSizePt ?? 12;
+  const baseFontPt = tableScope?.fontSizePt ?? ctx?.pageConfig.baseFontSizePt ?? 12;
 
   interface ColSpecInfo {
     align: BlockAlignment;
@@ -3957,7 +3999,11 @@ function parseTabularEnvironment(
         rowCells.push({
           segments: parseInlineSegmentText(
             content,
-            { bold: cInfo?.bold, italic: cInfo?.italic },
+            {
+              ...(cInfo?.bold || tableScope?.bold ? { bold: true } : {}),
+              ...(cInfo?.italic || tableScope?.italic ? { italic: true } : {}),
+              ...(tableScope?.color ? { color: tableScope.color } : {}),
+            },
             mode,
             ctx
           ),
@@ -3973,7 +4019,11 @@ function parseTabularEnvironment(
         rowCells.push({
           segments: parseInlineSegmentText(
             cellTrimmed,
-            { bold: cInfo?.bold, italic: cInfo?.italic },
+            {
+              ...(cInfo?.bold || tableScope?.bold ? { bold: true } : {}),
+              ...(cInfo?.italic || tableScope?.italic ? { italic: true } : {}),
+              ...(tableScope?.color ? { color: tableScope.color } : {}),
+            },
             mode,
             ctx
           ),
@@ -4059,11 +4109,11 @@ function parseTabularEnvironment(
 
   return {
     block_type: 'table',
-    alignment: 'center',
+    alignment: tableScope?.alignment ?? 'left',
     table_borderless: tableStyle === 'borderless',
     table_style: tableStyle,
     ...(colBorders.length === maxCols + 1 ? { table_col_borders: colBorders } : {}),
-    font_size_pt: Math.min(baseFontPt, 11),
+    font_size_pt: baseFontPt,
     line_spacing: 1.15,
     table_rows: tableRows,
   };
@@ -4461,10 +4511,11 @@ function parseExEnvironment(
   }
 
   // Extract \choice[cols]{A}{B}{C}{D}, \choiceTF[cols]{A}{B}{C}{D}, \motcot{...}, \haicot{...}, \boncot{...}
-  const chMatch = /\\(choice(?:TF)?|motcot|haicot|boncot)\s*(?:\[\s*(\d+)\s*\])?\s*\{/.exec(remaining);
+  const chMatch = /\\(choice(?:TF)?|motcot|haicot|boncot)\s*(?:\[\s*([^\]]*)\s*\])?\s*\{/.exec(remaining);
   if (chMatch) {
     const cmdName = chMatch[1];
     const isTF = cmdName === 'choiceTF';
+    const numericColOpt = chMatch[2] && /^\d+$/.test(chMatch[2].trim()) ? parseInt(chMatch[2].trim(), 10) : null;
     const extracted = extractBalancedMacroArgs(
       remaining,
       chMatch.index + chMatch[0].length - 1,
@@ -4475,24 +4526,29 @@ function parseExEnvironment(
         remaining.slice(0, chMatch.index) + remaining.slice(extracted.endIdx)
       ).trim();
       const labels = isTF ? ['a)', 'b)', 'c)', 'd)'] : ['A.', 'B.', 'C.', 'D.'];
-      const colHint = chMatch[2]
-        ? parseInt(chMatch[2], 10)
+      const colHint = numericColOpt
+        ? numericColOpt
         : isTF || cmdName === 'motcot'
         ? 1
         : cmdName === 'haicot'
         ? 2
         : 4;
       const explicitColOverride = Boolean(
-        chMatch[2] || cmdName === 'motcot' || cmdName === 'haicot' || cmdName === 'boncot' || isTF
+        numericColOpt || cmdName === 'motcot' || cmdName === 'haicot' || cmdName === 'boncot' || isTF
       );
-      const cells: TableCellData[] = extracted.args.map((arg, idx) => ({
-        segments: [
-          { type: 'text', content: `${labels[idx]} `, bold: true },
-          ...parseInlineSegmentText(arg.replace(/\\True\b/g, '').trim(), {}, mode, ctx),
-        ],
-        alignment: 'left',
-        width_pct: colHint === 1 ? 100 : colHint === 2 ? 50 : 25,
-      }));
+      const cells: TableCellData[] = extracted.args.map((arg, idx) => {
+        const isCorrect = /\\True(?![a-zA-Z])/.test(arg);
+        const cleanedArg = arg.replace(/\\True(?![a-zA-Z])\s*/g, '').trim();
+        return {
+          segments: [
+            { type: 'text', content: `${labels[idx]} `, bold: true },
+            ...parseInlineSegmentText(cleanedArg, {}, mode, ctx),
+          ],
+          alignment: 'left',
+          width_pct: colHint === 1 ? 100 : colHint === 2 ? 50 : 25,
+          ...(isCorrect ? { is_correct: true } : {}),
+        };
+      });
       const rows: TableCellData[][] =
         colHint === 1
           ? cells.map((c) => [c])
@@ -5011,7 +5067,8 @@ function parseBodyBlocks(
             pushBlock(subChoice);
             continue;
           }
-          const segs = applyQuestionLabelBold(parseInlineSegmentText(st, inlineBaseStyle, mode, ctx));
+          const parsedSubSegs = parseInlineSegmentText(st, inlineBaseStyle, mode, ctx);
+          const segs = opts.isFullLatexDoc ? parsedSubSegs : applyQuestionLabelBold(parsedSubSegs);
           if (segs.length > 0) {
             const align: BlockAlignment =
               scopeAlign === 'left' && st.length > 55 ? 'justify' : scopeAlign;
@@ -5051,6 +5108,9 @@ function parseBodyBlocks(
           alignment: 'center',
           latex: normalizeMathContent(pLine, ctx),
           font_size_pt: scopeFontSizePt,
+          ...(scopeBold ? { bold: true } : {}),
+          ...(scopeItalic ? { italic: true } : {}),
+          ...(scopeColor ? { color: scopeColor } : {}),
         });
         prevEndedWithDoubleBackslash = Boolean(trailingBreakM);
         pIdx++;
@@ -5136,7 +5196,19 @@ function parseBodyBlocks(
         continue;
       }
 
-      const segs = applyQuestionLabelBold(parseInlineSegmentText(pLine, inlineBaseStyle, mode, ctx));
+      // Detect explicit leading \hspace*{len} / \hspace{len} at paragraph start -> first_line_indent_pt
+      let explicitLeadingIndentPt: number | undefined;
+      const leadHsM = pLine.match(/^\\hspace\*?\s*\{([^}]+)\}\s*/);
+      if (leadHsM) {
+        const hsPt = parseLatexLengthToPt(leadHsM[1], containerW, scopeFontSizePt);
+        if (hsPt !== null && hsPt > 0) {
+          explicitLeadingIndentPt = Math.round(hsPt * 10) / 10;
+          pLine = pLine.slice(leadHsM[0].length);
+        }
+      }
+
+      const parsedLineSegs = parseInlineSegmentText(pLine, inlineBaseStyle, mode, ctx);
+      const segs = opts.isFullLatexDoc ? parsedLineSegs : applyQuestionLabelBold(parsedLineSegs);
       if (segs.length > 0) {
         const plainLen = segs.reduce((s, item) => s + item.content.length, 0);
         const hasTabs = segs.some((s) => s.tab_before);
@@ -5151,13 +5223,15 @@ function parseBodyBlocks(
           pendingSpaceBeforePt = 1.5;
         }
         const parInd =
-          !hasExplicitNoindent &&
-          !prevEndedWithDoubleBackslash &&
-          !hasTabs &&
-          ctx.pageConfig.defaultParIndentPt > 0 &&
-          opts.indentLeftPt === 0 &&
-          (align === 'left' || align === 'justify') &&
-          !/^(?:Câu|Bài|Ví dụ|Phần|Mục|Lời giải)\b/i.test(segs[0]?.content ?? '')
+          explicitLeadingIndentPt !== undefined
+            ? explicitLeadingIndentPt
+            : !hasExplicitNoindent &&
+              !prevEndedWithDoubleBackslash &&
+              !hasTabs &&
+              ctx.pageConfig.defaultParIndentPt > 0 &&
+              opts.indentLeftPt === 0 &&
+              (align === 'left' || align === 'justify') &&
+              !/^(?:Câu|Bài|Ví dụ|Phần|Mục|Lời giải)\b/i.test(segs[0]?.content ?? '')
             ? ctx.pageConfig.defaultParIndentPt
             : undefined;
         splitTabLinesAndPushParagraph(segs, align, scopeFontSizePt, defaultLineSp, parInd);
@@ -5171,7 +5245,7 @@ function parseBodyBlocks(
   };
 
   const hasBlockContainerInside = (snippet: string): boolean =>
-    /\\begin\{(?:tikzpicture|pgfpicture|picture|tabular|tabular\*|tabularx|longtable|enumerate\*?|itemize|itemchoice|description|inparaenum|tasks|tabbing|figure|table|verbatim|lstlisting|minted|axis|ex|bt|vd|center|flushleft|flushright|minipage|tcolorbox|framed|mdframed|shaded|multicols)\}|\\(?:section|subsection|subsubsection|chapter|part|par(?![a-zA-Z])|centering|raggedright|raggedleft)|\n\s*\n/.test(
+    /\\begin\{(?:tikzpicture|pgfpicture|picture|tabular|tabular\*|tabularx|longtable|enumerate\*?|itemize|itemchoice|description|inparaenum|tasks|tabbing|figure|table|verbatim|lstlisting|minted|axis|ex|bt|vd|center|flushleft|flushright|minipage|tcolorbox|framed|mdframed|shaded|multicols|equation\*?|align\*?|gather\*?|multline\*?|displaymath)\}|\\\[|\\(?:section|subsection|subsubsection|chapter|part|par(?![a-zA-Z])|centering|raggedright|raggedleft)|\n\s*\n/.test(
       snippet
     );
 
@@ -5351,6 +5425,9 @@ function parseBodyBlocks(
               alignment: 'center',
               latex: normalizeMathContent(inner, ctx),
               font_size_pt: scopeFontSizePt,
+              ...(scopeBold ? { bold: true } : {}),
+              ...(scopeItalic ? { italic: true } : {}),
+              ...(scopeColor ? { color: scopeColor } : {}),
             });
           }
           i = closeIdx + 2;
@@ -5423,6 +5500,9 @@ function parseBodyBlocks(
             alignment: 'center',
             latex: normalizeMathContent(inner, ctx),
             font_size_pt: scopeFontSizePt,
+            ...(scopeBold ? { bold: true } : {}),
+            ...(scopeItalic ? { italic: true } : {}),
+            ...(scopeColor ? { color: scopeColor } : {}),
           });
         }
         i = closeIdx + 2;
@@ -5551,14 +5631,14 @@ function parseBodyBlocks(
 
       // Block-level font/size/color scope switches (chaining cleanly when consecutive)
       const scopeStyleM = rest.match(
-        /^\\(Large|LARGE|large|huge|Huge|small|footnotesize|scriptsize|tiny|normalsize|bfseries|bf|itshape|it|normalfont|mdseries|upshape|normalcolor)(?![a-zA-Z])\s*/
+        /^\\(Large|LARGE|large|huge|Huge|small|footnotesize|scriptsize|tiny|normalsize|bfseries|bf|boldmath|unboldmath|itshape|it|slshape|sl|normalfont|mdseries|upshape|normalcolor)(?![a-zA-Z])\s*/
       );
       if (scopeStyleM && atFreshSwitchStart) {
         flushTextSlice(i);
         const sw = scopeStyleM[1];
-        if (sw === 'bf' || sw === 'bfseries') scopeBold = true;
-        else if (sw === 'mdseries') scopeBold = false;
-        else if (sw === 'it' || sw === 'itshape') scopeItalic = true;
+        if (sw === 'bf' || sw === 'bfseries' || sw === 'boldmath') scopeBold = true;
+        else if (sw === 'mdseries' || sw === 'unboldmath') scopeBold = false;
+        else if (sw === 'it' || sw === 'itshape' || sw === 'sl' || sw === 'slshape') scopeItalic = true;
         else if (sw === 'upshape') scopeItalic = false;
         else if (sw === 'normalfont') {
           scopeBold = opts.defaultBold ?? false;
@@ -5678,7 +5758,7 @@ function parseBodyBlocks(
 
       // Keep inline boxes/styling commands (\makebox, \framebox, \textbf, etc.) intact when they contain no block containers
       const inlineBoxCmdM = rest.match(
-        /^\\(?:makebox|framebox)\*?(?:\s*\[[^\]]*\])*\s*\{|^\\(?:textbf|textit|emph|underline|fbox|boxed|textrm|textsf|texttt|textsc|textsl|textnormal|textup|sout|uline|text|mbox|hbox|centerline|leftline|rightline)(?:\s*\[[^\]]*\])?\s*\{|^\\(?:parbox|raisebox|scalebox|textcolor|colorbox)(?:\s*\[[^\]]*\])*(?:\s*\{[^}]*\})+(?:\s*\[[^\]]*\])*\s*\{|^\\(?:fcolorbox)(?:\s*\[[^\]]*\])?\s*\{[^}]*\}(?:\s*\[[^\]]*\])?\s*\{[^}]*\}\s*\{|^\\resizebox\*?\s*\{[^}]*\}\s*\{[^}]*\}\s*\{/
+        /^\\(?:makebox|framebox)\*?(?:\s*\[[^\]]*\])*\s*\{|^\\(?:textbf|textmd|textit|emph|underline|fbox|boxed|textrm|textsf|texttt|textsc|textsl|textnormal|textup|sout|uline|text|mbox|hbox|centerline|leftline|rightline)(?:\s*\[[^\]]*\])?\s*\{|^\\(?:parbox|raisebox|scalebox|textcolor|colorbox)(?:\s*\[[^\]]*\])*\s*\{[^}]*\}(?:\s*\[[^\]]*\])*\s*\{|^\\(?:fcolorbox)(?:\s*\[[^\]]*\])?\s*\{[^}]*\}(?:\s*\[[^\]]*\])?\s*\{[^}]*\}\s*\{|^\\resizebox\*?\s*\{[^}]*\}\s*\{[^}]*\}\s*\{/
       );
       if (inlineBoxCmdM) {
         const br = readBalancedBraces(src, i + inlineBoxCmdM[0].length - 1);
@@ -6103,6 +6183,9 @@ function parseBodyBlocks(
               alignment: 'center',
               latex: normalizeMathContent(fullMath, ctx),
               font_size_pt: scopeFontSizePt,
+              ...(scopeBold ? { bold: true } : {}),
+              ...(scopeItalic ? { italic: true } : {}),
+              ...(scopeColor ? { color: scopeColor } : {}),
             });
             i = endIdx + closeToken.length;
             textStart = i;
@@ -6311,7 +6394,14 @@ function parseBodyBlocks(
               envRawBody.slice(pos),
               mode,
               ctx,
-              containerW
+              containerW,
+              {
+                alignment: scopeAlign,
+                fontSizePt: scopeFontSizePt,
+                bold: scopeBold,
+                italic: scopeItalic,
+                color: scopeColor,
+              }
             );
             if (tblBlock) {
               if (opts.indentLeftPt > 0) tblBlock.indent_left_pt = opts.indentLeftPt;
@@ -7842,6 +7932,57 @@ export function promoteNumbersAndSignsToMathSegments(
   return out;
 }
 
+export function fixBareSetBracesInMath(latex: string): string {
+  if (!latex || !latex.includes('{')) return latex;
+  let out = '';
+  let i = 0;
+  while (i < latex.length) {
+    if (latex[i] === '\\') {
+      out += latex.slice(i, i + 2);
+      i += 2;
+      continue;
+    }
+    if (latex[i] === '{') {
+      const beforeTrim = out.trimEnd();
+      const precededBySetOp =
+        /(?:=|\\in|\\notin|\\subset|\\subseteq|\\supset|\\supseteq|\\cup|\\cap|\\setminus|\\neq)$/.test(
+          beforeTrim
+        );
+      if (precededBySetOp) {
+        // Find matching unescaped closing '}'
+        let depth = 1;
+        let j = i + 1;
+        while (j < latex.length && depth > 0) {
+          if (latex[j] === '\\') {
+            j += 2;
+            continue;
+          }
+          if (latex[j] === '{') depth++;
+          else if (latex[j] === '}') depth--;
+          j++;
+        }
+        if (depth === 0) {
+          const closeIdx = j - 1;
+          const inner = latex.slice(i + 1, closeIdx);
+          const after = latex.slice(closeIdx + 1).trimStart();
+          const hasScriptAfter = after.startsWith('^') || after.startsWith('_');
+          const looksLikeSet =
+            /(?:\\in(?![a-zA-Z])|\\mid(?![a-zA-Z])|\||;|,)/.test(inner) ||
+            (/\\setminus$/.test(beforeTrim) && inner.trim().length > 0);
+          if (!hasScriptAfter && looksLikeSet) {
+            out += '\\{' + fixBareSetBracesInMath(inner) + '\\}';
+            i = closeIdx + 1;
+            continue;
+          }
+        }
+      }
+    }
+    out += latex[i];
+    i += 1;
+  }
+  return out;
+}
+
 export function normalizeSegmentListInlineMath(
   segments?: InlineSegment[] | null,
   options: { isTableCell?: boolean } = {}
@@ -7849,6 +7990,11 @@ export function normalizeSegmentListInlineMath(
   if (!segments || segments.length === 0) return segments ?? undefined;
   const splitResult: InlineSegment[] = [];
   for (const seg of segments) {
+    if (seg.type === 'math') {
+      const fixed = fixBareSetBracesInMath(seg.content ?? '');
+      splitResult.push(fixed !== seg.content ? { ...seg, content: fixed } : seg);
+      continue;
+    }
     if (
       seg.type !== 'text' ||
       (!seg.content.includes('$') &&
@@ -7860,7 +8006,9 @@ export function normalizeSegmentListInlineMath(
       continue;
     }
     const { type: _t, content, tab_before, ...style } = seg;
-    const split = splitTextPreservingInlineMath(content, style);
+    const split = splitTextPreservingInlineMath(content, style).map((s) =>
+      s.type === 'math' ? { ...s, content: fixBareSetBracesInMath(s.content) } : s
+    );
     if (tab_before && split.length > 0) {
       split[0] = { ...split[0], tab_before: true };
     }
@@ -7872,6 +8020,9 @@ export function normalizeSegmentListInlineMath(
 function normalizeBlockListInlineMath(blocks: DocumentBlock[]): DocumentBlock[] {
   return blocks.map((blk) => ({
     ...blk,
+    ...(blk.block_type === 'equation' && blk.latex
+      ? { latex: fixBareSetBracesInMath(blk.latex) }
+      : {}),
     ...(blk.segments ? { segments: normalizeSegmentListInlineMath(blk.segments) } : {}),
     ...(blk.table_rows
       ? {

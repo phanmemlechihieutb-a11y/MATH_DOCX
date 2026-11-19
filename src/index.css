@@ -17,6 +17,7 @@
 
 .doc-serif {
   font-family: "Times New Roman", "Liberation Serif", "Nimbus Roman", "Noto Serif", Georgia, serif;
+  color: #000000;
 }
 
 .doc-serif .katex {
@@ -29,4 +30,18 @@
 
 .doc-serif .katex-display > .katex {
   font-size: 1.08em;
+}
+
+.katex-bold-override .katex,
+.katex-bold-override .katex .mord,
+.katex-bold-override .katex .mop,
+.katex-bold-override .katex .mbin,
+.katex-bold-override .katex .mrel,
+.katex-bold-override .katex .mopen,
+.katex-bold-override .katex .mclose,
+.katex-bold-override .katex .mpunct,
+.katex-bold-override .katex .mathnormal,
+.katex-bold-override .katex .mathrm,
+.katex-bold-override .katex .text {
+  font-weight: 700 !important;
 }

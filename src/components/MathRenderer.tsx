@@ -59,6 +59,13 @@ function stripDelimiters(raw: string): string {
     s = eqMatch[2].trim();
   }
   s = s
+    .replace(/\uEF02/g, '\\,')
+    .replace(/\uEF03/g, '\\;')
+    .replace(/\uEF04/g, '\\quad ')
+    .replace(/\uEF05/g, '\\qquad ')
+    .replace(/[\uEF00\u200B-\u200F\u2060-\u2064\uFEFF]/g, '')
+    .replace(/[\uEF01\uEF06-\uEF0F\uF020]/g, ' ')
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\uE000-\uF8FF\uFFFD]/g, '')
     .replace(/\\label\{[^}]*\}/g, '')
     .replace(/\\tag\*?\{[^}]*\}/g, '')
     .replace(/\\(?:nonumber|notag|noindent)(?![a-zA-Z])\s*/g, '')
