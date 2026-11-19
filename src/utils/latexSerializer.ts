@@ -31,6 +31,8 @@ function formatTextSegment(seg: InlineSegment): string {
   if (!core) return raw;
 
   let out = escapeLatexPlainText(core).replace(/\n/g, ' \\\\\n');
+  if (seg.vert_align === 'subscript') out = `\\textsubscript{${out}}`;
+  else if (seg.vert_align === 'superscript') out = `\\textsuperscript{${out}}`;
   if (seg.underline) out = `\\underline{${out}}`;
   if (seg.italic) out = `\\textit{${out}}`;
   if (seg.bold) out = `\\textbf{${out}}`;

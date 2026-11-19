@@ -310,7 +310,142 @@ function sanitizeLatexForTemml(latex: string): string {
     .replace(/\\begin\{(gather\*?|multline\*?)\}/g, '\\begin{gathered}')
     .replace(/\\end\{(gather\*?|multline\*?)\}/g, '\\end{gathered}');
 
-  return s.trim();
+  return fixDoubleScriptsOmml(s.trim());
+}
+
+function readOmmlScriptArg(s: string, startIdx: number): { endIdx: number; text: string } {
+  let i = startIdx;
+  while (i < s.length && s[i] === ' ') i++;
+  if (i >= s.length) return { endIdx: i, text: '' };
+  if (s[i] === '{') {
+    let depth = 0;
+    for (let j = i; j < s.length; j++) {
+      if (s[j] === '\\' && j + 1 < s.length) {
+        j++;
+        continue;
+      }
+      if (s[j] === '{') depth++;
+      else if (s[j] === '}') {
+        depth--;
+        if (depth === 0) return { endIdx: j + 1, text: s.slice(i, j + 1) };
+      }
+    }
+    return { endIdx: s.length, text: s.slice(i) };
+  }
+  if (s[i] === '\\') {
+    const m = s.slice(i).match(/^\\[a-zA-Z]+|^\\./);
+    if (m) return { endIdx: i + m[0].length, text: m[0] };
+  }
+  return { endIdx: i + 1, text: s[i] };
+}
+
+function fixDoubleScriptsOmml(src: string): string {
+  if (!src || (!src.includes('_') && !src.includes('^'))) return src;
+  const rewrite = (str: string): string => {
+    let out = '';
+    let i = 0;
+    let atomStartInOut = -1;
+    let seenSub = false;
+    let seenSup = false;
+
+    const resetAtom = () => {
+      atomStartInOut = -1;
+      seenSub = false;
+      seenSup = false;
+    };
+
+    while (i < str.length) {
+      const ch = str[i];
+      if (ch === '\\') {
+        const m = str.slice(i).match(/^\\(?:begin|end)\{[^}]*\}|^\\[a-zA-Z]+|^\\./);
+        const tok = m ? m[0] : ch;
+        const isSpacing = /^\\(?:,|;|:|!|quad|qquad|\s)$/.test(tok);
+        const isOp = /^\\(?:to|leftarrow|rightarrow|leftrightarrow|rightleftharpoons|leftrightharpoons|rightleftarrows|leftrightarrows|xrightarrow|xleftarrow|xleftrightarrow|xrightleftharpoons|Rightarrow|Leftarrow|Leftrightarrow|leq|geq|neq|approx|equiv|sim|pm|mp|times|cdot|div)$/.test(
+          tok
+        );
+        if (isSpacing || isOp) {
+          out += tok;
+          resetAtom();
+        } else {
+          atomStartInOut = out.length;
+          seenSub = false;
+          seenSup = false;
+          out += tok;
+        }
+        i += tok.length;
+        continue;
+      }
+
+      if (ch === '{') {
+        let depth = 0;
+        let closeIdx = -1;
+        for (let j = i; j < str.length; j++) {
+          if (str[j] === '\\' && j + 1 < str.length) {
+            j++;
+            continue;
+          }
+          if (str[j] === '{') depth++;
+          else if (str[j] === '}') {
+            depth--;
+            if (depth === 0) {
+              closeIdx = j;
+              break;
+            }
+          }
+        }
+        if (closeIdx !== -1) {
+          const inner = rewrite(str.slice(i + 1, closeIdx));
+          atomStartInOut = out.length;
+          seenSub = false;
+          seenSup = false;
+          out += `{${inner}}`;
+          i = closeIdx + 1;
+          continue;
+        }
+      }
+
+      if (ch === '_' || ch === '^') {
+        const arg = readOmmlScriptArg(str, i + 1);
+        const fixedInner =
+          arg.text.startsWith('{') && arg.text.endsWith('}')
+            ? `{${rewrite(arg.text.slice(1, -1))}}`
+            : arg.text;
+        const alreadyHas = ch === '_' ? seenSub : seenSup;
+        if (alreadyHas) {
+          if (atomStartInOut >= 0 && atomStartInOut < out.length) {
+            out = `${out.slice(0, atomStartInOut)}{${out.slice(atomStartInOut)}}`;
+          } else {
+            out += '{}';
+          }
+          seenSub = ch === '_';
+          seenSup = ch === '^';
+        } else {
+          if (atomStartInOut < 0) atomStartInOut = out.length;
+          if (ch === '_') seenSub = true;
+          else seenSup = true;
+        }
+        out += `${ch}${fixedInner}`;
+        i = arg.endIdx;
+        continue;
+      }
+
+      if (/\s|[=+\-<>(),;:\[\]|&/]/.test(ch)) {
+        out += ch;
+        if (!/\s/.test(ch)) resetAtom();
+        i++;
+        continue;
+      }
+
+      atomStartInOut = out.length;
+      seenSub = false;
+      seenSup = false;
+      out += ch;
+      i++;
+    }
+
+    return out;
+  };
+  return rewrite(src);
 }
 
 function stripInvalidXmlChars(text: string): string {

@@ -55,6 +55,22 @@ const UNICODE_MATH_TO_LATEX: Record<string, string> = {
   '←': '\\leftarrow ',
   '↔': '\\leftrightarrow ',
   '↦': '\\mapsto ',
+  '⇌': '\\rightleftharpoons ',
+  '⇋': '\\leftrightharpoons ',
+  '⇄': '\\rightleftarrows ',
+  '⇆': '\\leftrightarrows ',
+  '⇀': '\\rightharpoonup ',
+  '⇁': '\\rightharpoondown ',
+  '↼': '\\leftharpoonup ',
+  '↽': '\\leftharpoondown ',
+  '⟶': '\\longrightarrow ',
+  '⟵': '\\longleftarrow ',
+  '⟷': '\\longleftrightarrow ',
+  '⟹': '\\Longrightarrow ',
+  '⟸': '\\Longleftarrow ',
+  '⟺': '\\Longleftrightarrow ',
+  '⟨': '\\langle ',
+  '⟩': '\\rangle ',
   '∂': '\\partial ',
   '∇': '\\nabla ',
   '°': '^\\circ ',
@@ -186,6 +202,36 @@ function wrapBracesIfNeeded(s: string): string {
   return `{${t}}`;
 }
 
+function hasTopLevelScript(latex: string): boolean {
+  let depth = 0;
+  for (let i = 0; i < latex.length; i++) {
+    const ch = latex[i];
+    if (ch === '\\') {
+      i++;
+      continue;
+    }
+    if (ch === '{') depth++;
+    else if (ch === '}') depth = Math.max(0, depth - 1);
+    else if (depth === 0 && (ch === '_' || ch === '^')) return true;
+  }
+  return false;
+}
+
+function wrapOmmlBaseForScript(base: string, eEl: Element | null): string {
+  if (!base) return '{}';
+  const children = eEl ? getChildElements(eEl) : [];
+  const singleTag = children.length === 1 ? getLocalName(children[0]) : '';
+  if (
+    singleTag === 'sSub' ||
+    singleTag === 'sSup' ||
+    singleTag === 'sSubSup' ||
+    hasTopLevelScript(base)
+  ) {
+    return `{${base}}`;
+  }
+  return base;
+}
+
 function ommlElementToLatex(el: Element): string {
   const tag = getLocalName(el);
 
@@ -289,7 +335,7 @@ function ommlElementToLatex(el: Element): string {
     case 'sSup': {
       const eEl = getFirstChild(el, 'e');
       const supEl = getFirstChild(el, 'sup');
-      const base = eEl ? ommlElementToLatex(eEl).trim() : '';
+      const base = wrapOmmlBaseForScript(eEl ? ommlElementToLatex(eEl).trim() : '', eEl);
       const sup = supEl ? ommlElementToLatex(supEl).trim() : '';
       return `${base}^${wrapBracesIfNeeded(sup) || '{}'}`;
     }
@@ -297,7 +343,7 @@ function ommlElementToLatex(el: Element): string {
     case 'sSub': {
       const eEl = getFirstChild(el, 'e');
       const subEl = getFirstChild(el, 'sub');
-      const base = eEl ? ommlElementToLatex(eEl).trim() : '';
+      const base = wrapOmmlBaseForScript(eEl ? ommlElementToLatex(eEl).trim() : '', eEl);
       const sub = subEl ? ommlElementToLatex(subEl).trim() : '';
       return `${base}_${wrapBracesIfNeeded(sub) || '{}'}`;
     }
@@ -306,7 +352,7 @@ function ommlElementToLatex(el: Element): string {
       const eEl = getFirstChild(el, 'e');
       const subEl = getFirstChild(el, 'sub');
       const supEl = getFirstChild(el, 'sup');
-      const base = eEl ? ommlElementToLatex(eEl).trim() : '';
+      const base = wrapOmmlBaseForScript(eEl ? ommlElementToLatex(eEl).trim() : '', eEl);
       const sub = subEl ? ommlElementToLatex(subEl).trim() : '';
       const sup = supEl ? ommlElementToLatex(supEl).trim() : '';
       return `${base}_${wrapBracesIfNeeded(sub) || '{}'}^${wrapBracesIfNeeded(sup) || '{}'}`;
@@ -571,18 +617,36 @@ function splitInlineLatexFromRun(
 
 interface ResolvedRunProps {
   bold?: boolean;
+  boldCs?: boolean;
   italic?: boolean;
+  italicCs?: boolean;
   underline?: boolean;
+  vert_align?: 'subscript' | 'superscript' | null;
   font_size_pt?: number;
   color?: string | null;
+}
+
+interface ParagraphStyleEntry {
+  basedOn?: string;
+  rPr: ResolvedRunProps;
+  alignment?: BlockAlignment;
+  indentLeftPt?: number;
+  firstLineIndentPt?: number;
+}
+
+interface TableStyleEntry {
+  basedOn?: string;
+  rPr: ResolvedRunProps;
+  firstRowRPr: ResolvedRunProps;
 }
 
 interface DocxStyleContext {
   themeColors: Map<string, string>;
   docDefaultRun: ResolvedRunProps;
-  paragraphStyles: Map<string, { basedOn?: string; rPr: ResolvedRunProps; alignment?: BlockAlignment }>;
+  defaultParagraphStyleId?: string;
+  paragraphStyles: Map<string, ParagraphStyleEntry>;
   characterStyles: Map<string, { basedOn?: string; rPr: ResolvedRunProps }>;
-  tableStyles: Map<string, { rPr: ResolvedRunProps; firstRowRPr: ResolvedRunProps }>;
+  tableStyles: Map<string, TableStyleEntry>;
 }
 
 const DEFAULT_OFFICE_THEME_COLORS: Record<string, string> = {
@@ -698,8 +762,9 @@ function parseRPrElement(rPr: Element | null, themeColors?: Map<string, string>)
   const bCsVal = parseWordToggle(bCsEl);
   if (bVal !== undefined) {
     style.bold = bVal;
-  } else if (bCsVal !== undefined) {
-    style.bold = bCsVal;
+  }
+  if (bCsVal !== undefined) {
+    style.boldCs = bCsVal;
   }
 
   const iEl = getFirstChild(rPr, 'i');
@@ -708,14 +773,25 @@ function parseRPrElement(rPr: Element | null, themeColors?: Map<string, string>)
   const iCsVal = parseWordToggle(iCsEl);
   if (iVal !== undefined) {
     style.italic = iVal;
-  } else if (iCsVal !== undefined) {
-    style.italic = iCsVal;
+  }
+  if (iCsVal !== undefined) {
+    style.italicCs = iCsVal;
   }
 
   const uEl = getFirstChild(rPr, 'u');
   if (uEl) {
     const uVal = getAttr(uEl, 'val');
     style.underline = uVal !== 'none' && uVal !== 'false' && uVal !== '0';
+  }
+
+  const vertAlignEl = getFirstChild(rPr, 'vertAlign');
+  if (vertAlignEl) {
+    const vVal = getAttr(vertAlignEl, 'val');
+    if (vVal === 'subscript' || vVal === 'superscript') {
+      style.vert_align = vVal;
+    } else if (vVal === 'baseline') {
+      style.vert_align = null;
+    }
   }
 
   const szEl = getFirstChild(rPr, 'sz');
@@ -753,22 +829,82 @@ function mergeRunProps(...layers: Array<ResolvedRunProps | undefined>): Resolved
   for (const layer of layers) {
     if (!layer) continue;
     if (layer.bold !== undefined) out.bold = layer.bold;
+    if (layer.boldCs !== undefined) out.boldCs = layer.boldCs;
     if (layer.italic !== undefined) out.italic = layer.italic;
+    if (layer.italicCs !== undefined) out.italicCs = layer.italicCs;
     if (layer.underline !== undefined) out.underline = layer.underline;
+    if (layer.vert_align !== undefined) out.vert_align = layer.vert_align;
     if (layer.font_size_pt !== undefined) out.font_size_pt = layer.font_size_pt;
     if (layer.color !== undefined) out.color = layer.color;
   }
   return out;
 }
 
-function resolvedPropsToSegmentStyle(props: ResolvedRunProps): Omit<InlineSegment, 'type' | 'content'> {
+function resolvedPropsToSegmentStyle(
+  props: ResolvedRunProps,
+  textSample?: string
+): Omit<InlineSegment, 'type' | 'content'> {
   const out: Omit<InlineSegment, 'type' | 'content'> = {};
-  if (props.bold) out.bold = true;
-  if (props.italic) out.italic = true;
+  const isComplexScriptOnly =
+    Boolean(textSample) &&
+    /[\u0590-\u077F\u0900-\u0DFF\u0E00-\u0EFF]/.test(textSample!) &&
+    !/[A-Za-z0-9\u00C0-\u024F\u1E00-\u1EFF]/.test(textSample!);
+  const isBold = isComplexScriptOnly ? Boolean(props.boldCs ?? props.bold) : Boolean(props.bold);
+  const isItalic = isComplexScriptOnly ? Boolean(props.italicCs ?? props.italic) : Boolean(props.italic);
+  if (isBold) out.bold = true;
+  if (isItalic) out.italic = true;
   if (props.underline) out.underline = true;
+  if (props.vert_align) out.vert_align = props.vert_align;
   if (props.font_size_pt !== undefined) out.font_size_pt = props.font_size_pt;
   if (props.color) out.color = props.color;
   return out;
+}
+
+function parseIndTwipsOrChars(
+  indEl: Element,
+  twAttr: string,
+  charsAttr: string,
+  altTwAttr?: string
+): number | undefined {
+  const twRaw = getAttr(indEl, twAttr) ?? (altTwAttr ? getAttr(indEl, altTwAttr) : null);
+  if (twRaw !== null && !Number.isNaN(Number(twRaw))) {
+    return Number(twRaw);
+  }
+  const chRaw = getAttr(indEl, charsAttr);
+  if (chRaw !== null && !Number.isNaN(Number(chRaw))) {
+    return (Number(chRaw) / 100) * 120;
+  }
+  return undefined;
+}
+
+function parseParagraphIndentFromPPr(pPr: Element | null): {
+  indentLeftPt?: number;
+  firstLineIndentPt?: number;
+} {
+  if (!pPr) return {};
+  const indEl = getFirstChild(pPr, 'ind');
+  if (!indEl) return {};
+  const leftTw = parseIndTwipsOrChars(indEl, 'left', 'leftChars', 'start');
+  const firstTw = parseIndTwipsOrChars(indEl, 'firstLine', 'firstLineChars');
+  const hangingTw = parseIndTwipsOrChars(indEl, 'hanging', 'hangingChars');
+
+  let indentLeftPt: number | undefined;
+  let firstLineIndentPt: number | undefined;
+
+  if (hangingTw !== undefined && hangingTw > 0) {
+    firstLineIndentPt = -Math.round((hangingTw / 20) * 10) / 10;
+    const baseLeft = Math.max(0, (leftTw ?? 0) - hangingTw);
+    if (baseLeft > 0) indentLeftPt = Math.round((baseLeft / 20) * 10) / 10;
+    else if (leftTw !== undefined) indentLeftPt = 0;
+  } else {
+    if (leftTw !== undefined && leftTw >= 0) {
+      indentLeftPt = Math.round((leftTw / 20) * 10) / 10;
+    }
+    if (firstTw !== undefined && firstTw >= 0) {
+      firstLineIndentPt = Math.round((firstTw / 20) * 10) / 10;
+    }
+  }
+  return { indentLeftPt, firstLineIndentPt };
 }
 
 function parseStylesDocument(
@@ -801,9 +937,13 @@ function parseStylesDocument(
     const sId = getAttr(sEl, 'styleId');
     if (!sId) continue;
     const basedOn = getAttr(getFirstChild(sEl, 'basedOn'), 'val') ?? undefined;
+    const isDefault = getAttr(sEl, 'default') === '1' || getAttr(sEl, 'default') === 'true';
     const rPr = parseRPrElement(getFirstChild(sEl, 'rPr'), themeColors);
 
     if (sType === 'paragraph') {
+      if (isDefault && !styleCtx.defaultParagraphStyleId) {
+        styleCtx.defaultParagraphStyleId = sId;
+      }
       const pPr = getFirstChild(sEl, 'pPr');
       const jcVal = pPr ? getAttr(getFirstChild(pPr, 'jc'), 'val') : null;
       let alignment: BlockAlignment | undefined;
@@ -811,7 +951,14 @@ function parseStylesDocument(
       else if (jcVal === 'right' || jcVal === 'end') alignment = 'right';
       else if (jcVal === 'both' || jcVal === 'distribute') alignment = 'justify';
       else if (jcVal === 'left' || jcVal === 'start') alignment = 'left';
-      styleCtx.paragraphStyles.set(sId, { basedOn, rPr, alignment });
+      const { indentLeftPt, firstLineIndentPt } = parseParagraphIndentFromPPr(pPr);
+      styleCtx.paragraphStyles.set(sId, {
+        basedOn,
+        rPr,
+        alignment,
+        indentLeftPt,
+        firstLineIndentPt,
+      });
     } else if (sType === 'character') {
       styleCtx.characterStyles.set(sId, { basedOn, rPr });
     } else if (sType === 'table') {
@@ -821,7 +968,7 @@ function parseStylesDocument(
           firstRowRPr = parseRPrElement(getFirstChild(tblStylePr, 'rPr'), themeColors);
         }
       }
-      styleCtx.tableStyles.set(sId, { rPr, firstRowRPr });
+      styleCtx.tableStyles.set(sId, { basedOn, rPr, firstRowRPr });
     }
   }
 
@@ -831,25 +978,58 @@ function parseStylesDocument(
 function resolveParagraphStyleChain(
   styleCtx: DocxStyleContext | undefined,
   styleId: string | undefined
-): { rPr: ResolvedRunProps; alignment?: BlockAlignment } {
+): {
+  rPr: ResolvedRunProps;
+  alignment?: BlockAlignment;
+  indentLeftPt?: number;
+  firstLineIndentPt?: number;
+} {
   if (!styleCtx || !styleId) return { rPr: {} };
-  const chain: Array<{ rPr: ResolvedRunProps; alignment?: BlockAlignment }> = [];
+  const chain: ParagraphStyleEntry[] = [];
   const visited = new Set<string>();
   let cur: string | undefined = styleId;
   while (cur && !visited.has(cur)) {
     visited.add(cur);
     const entry = styleCtx.paragraphStyles.get(cur);
     if (!entry) break;
-    chain.unshift({ rPr: entry.rPr, alignment: entry.alignment });
+    chain.unshift(entry);
     cur = entry.basedOn;
   }
   let alignment: BlockAlignment | undefined;
+  let indentLeftPt: number | undefined;
+  let firstLineIndentPt: number | undefined;
   for (const item of chain) {
     if (item.alignment) alignment = item.alignment;
+    if (item.indentLeftPt !== undefined) indentLeftPt = item.indentLeftPt;
+    if (item.firstLineIndentPt !== undefined) firstLineIndentPt = item.firstLineIndentPt;
   }
   return {
     rPr: mergeRunProps(...chain.map((c) => c.rPr)),
     alignment,
+    indentLeftPt,
+    firstLineIndentPt,
+  };
+}
+
+function resolveTableStyleChain(
+  styleCtx: DocxStyleContext | undefined,
+  styleId: string | undefined | null
+): { rPr: ResolvedRunProps; firstRowRPr: ResolvedRunProps } | undefined {
+  if (!styleCtx || !styleId) return undefined;
+  const chain: TableStyleEntry[] = [];
+  const visited = new Set<string>();
+  let cur: string | undefined = styleId;
+  while (cur && !visited.has(cur)) {
+    visited.add(cur);
+    const entry = styleCtx.tableStyles.get(cur);
+    if (!entry) break;
+    chain.unshift(entry);
+    cur = entry.basedOn;
+  }
+  if (chain.length === 0) return undefined;
+  return {
+    rPr: mergeRunProps(...chain.map((c) => c.rPr)),
+    firstRowRPr: mergeRunProps(...chain.map((c) => c.firstRowRPr)),
   };
 }
 
@@ -874,14 +1054,15 @@ function resolveCharacterStyleChain(
 function parseRunFormatting(
   rEl: Element,
   baseRunProps?: ResolvedRunProps,
-  styleCtx?: DocxStyleContext
+  styleCtx?: DocxStyleContext,
+  textSample?: string
 ): Omit<InlineSegment, 'type' | 'content'> {
   const rPr = getFirstChild(rEl, 'rPr');
   const rStyleId = rPr ? getAttr(getFirstChild(rPr, 'rStyle'), 'val') ?? undefined : undefined;
   const charStyleProps = resolveCharacterStyleChain(styleCtx, rStyleId);
   const directProps = parseRPrElement(rPr, styleCtx?.themeColors);
   const merged = mergeRunProps(baseRunProps, charStyleProps, directProps);
-  return resolvedPropsToSegmentStyle(merged);
+  return resolvedPropsToSegmentStyle(merged, textSample);
 }
 
 function extractOmmlRunStyle(
@@ -913,7 +1094,14 @@ function extractOmmlRunStyle(
         ((n as Element).prefix === 'm' || (n as Element).namespaceURI?.includes('/math'))
     ) as Element | undefined;
     const styVal = mRPr ? getAttr(getFirstChild(mRPr, 'sty'), 'val') : null;
-    const isBold = direct.bold !== undefined ? direct.bold : styVal === 'b' || styVal === 'bi' ? true : Boolean(baseRunProps?.bold);
+    const isBold =
+      direct.bold !== undefined
+        ? direct.bold
+        : styVal === 'b' || styVal === 'bi'
+        ? true
+        : styVal
+        ? false
+        : Boolean(baseRunProps?.bold);
     if (isBold) boldCount++;
 
     const effectiveColor = direct.color !== undefined ? direct.color : baseRunProps?.color ?? null;
@@ -944,6 +1132,7 @@ function sameTextStyle(
     Boolean(a.bold) === Boolean(b.bold) &&
     Boolean(a.italic) === Boolean(b.italic) &&
     Boolean(a.underline) === Boolean(b.underline) &&
+    (a.vert_align ?? undefined) === (b.vert_align ?? undefined) &&
     a.font_size_pt === b.font_size_pt &&
     a.color === b.color
   );
@@ -1136,19 +1325,26 @@ function parseParagraphElement(
   let listPrefix: { text: string; rPr?: ResolvedRunProps } | null = null;
   let pStyleId: string | undefined;
 
-  if (pPr) {
-    const styleVal = getAttr(getFirstChild(pPr, 'pStyle'), 'val') ?? '';
-    if (styleVal) pStyleId = styleVal;
-    const resolvedPStyle = resolveParagraphStyleChain(ctx.styleCtx, pStyleId);
-    if (resolvedPStyle.alignment) alignment = resolvedPStyle.alignment;
+  const pStyleAttr = pPr ? getAttr(getFirstChild(pPr, 'pStyle'), 'val') ?? '' : '';
+  if (pStyleAttr) pStyleId = pStyleAttr;
+  const effectivePStyleId = pStyleId ?? ctx.styleCtx?.defaultParagraphStyleId;
+  const resolvedPStyle = resolveParagraphStyleChain(ctx.styleCtx, effectivePStyleId);
+  if (resolvedPStyle.alignment) alignment = resolvedPStyle.alignment;
+  if (resolvedPStyle.indentLeftPt !== undefined && resolvedPStyle.indentLeftPt > 0) {
+    indentLeftPt = resolvedPStyle.indentLeftPt;
+  }
+  if (resolvedPStyle.firstLineIndentPt !== undefined && resolvedPStyle.firstLineIndentPt !== 0) {
+    firstLineIndentPt = resolvedPStyle.firstLineIndentPt;
+  }
 
+  if (pPr) {
     const jcVal = getAttr(getFirstChild(pPr, 'jc'), 'val');
     if (jcVal === 'center') alignment = 'center';
     else if (jcVal === 'right' || jcVal === 'end') alignment = 'right';
     else if (jcVal === 'both' || jcVal === 'distribute') alignment = 'justify';
     else if (jcVal === 'left' || jcVal === 'start') alignment = 'left';
 
-    const hMatch = styleVal.match(/^(?:Heading|Titre|Title)(\d?)$/i);
+    const hMatch = pStyleAttr.match(/^(?:Heading|Titre|Title)(\d?)$/i);
     if (hMatch) {
       isHeading = true;
       headingLevel = hMatch[1] ? Math.max(1, Math.min(4, Number(hMatch[1]))) : 1;
@@ -1167,19 +1363,13 @@ function parseParagraphElement(
       }
     }
 
-    const indEl = getFirstChild(pPr, 'ind');
-    if (indEl) {
-      const leftTw = Number(getAttr(indEl, 'left') ?? getAttr(indEl, 'start') ?? 0);
-      const firstTw = Number(getAttr(indEl, 'firstLine') ?? 0);
-      const hangingTw = Number(getAttr(indEl, 'hanging') ?? 0);
-      if (hangingTw > 0) {
-        firstLineIndentPt = -Math.round((hangingTw / 20) * 10) / 10;
-        const baseLeft = Math.max(0, leftTw - hangingTw);
-        if (baseLeft > 0) indentLeftPt = Math.round((baseLeft / 20) * 10) / 10;
-      } else {
-        if (leftTw > 0) indentLeftPt = Math.round((leftTw / 20) * 10) / 10;
-        if (firstTw > 0) firstLineIndentPt = Math.round((firstTw / 20) * 10) / 10;
-      }
+    const directIndent = parseParagraphIndentFromPPr(pPr);
+    if (directIndent.indentLeftPt !== undefined) {
+      indentLeftPt = directIndent.indentLeftPt > 0 ? directIndent.indentLeftPt : undefined;
+    }
+    if (directIndent.firstLineIndentPt !== undefined) {
+      firstLineIndentPt =
+        directIndent.firstLineIndentPt !== 0 ? directIndent.firstLineIndentPt : undefined;
     }
 
     const spEl = getFirstChild(pPr, 'spacing');
@@ -1201,13 +1391,11 @@ function parseParagraphElement(
     }
   }
 
-  const pStyleProps = resolveParagraphStyleChain(ctx.styleCtx, pStyleId).rPr;
   const pPrRunProps = pPr ? parseRPrElement(getFirstChild(pPr, 'rPr'), ctx.styleCtx?.themeColors) : undefined;
   const baseRunProps = mergeRunProps(
     ctx.styleCtx?.docDefaultRun,
     inheritedTableRunProps,
-    pStyleProps,
-    pPrRunProps
+    resolvedPStyle.rPr
   );
 
   const rawSegments: InlineSegment[] = [];
@@ -1219,15 +1407,9 @@ function parseParagraphElement(
   let hasNonEmptyTextRuns = false;
 
   const handleEmbeddedObjectOrImage = (
-    el: Element,
-    runStyle?: Omit<InlineSegment, 'type' | 'content'>
+    el: Element
   ) => {
     const tagName = getLocalName(el);
-    const extraStyle: Partial<InlineSegment> = {};
-    if (runStyle?.bold) extraStyle.bold = true;
-    if (runStyle?.italic) extraStyle.italic = true;
-    if (runStyle?.underline) extraStyle.underline = true;
-    if (runStyle?.color) extraStyle.color = runStyle.color;
 
     if (tagName === 'object') {
       const oleId = findOleObjectRelId(el);
@@ -1236,7 +1418,6 @@ function parseParagraphElement(
         rawSegments.push({
           type: 'math',
           content: latex,
-          ...extraStyle,
           ...(pendingTab ? { tab_before: true } : {}),
         });
         pendingTab = false;
@@ -1252,7 +1433,6 @@ function parseParagraphElement(
       rawSegments.push({
         type: 'math',
         content: latex,
-        ...extraStyle,
         ...(pendingTab ? { tab_before: true } : {}),
       });
       pendingTab = false;
@@ -1315,7 +1495,7 @@ function parseParagraphElement(
     }
 
     if (tag === 'object' || tag === 'drawing' || tag === 'pict') {
-      handleEmbeddedObjectOrImage(el, resolvedPropsToSegmentStyle(baseRunProps));
+      handleEmbeddedObjectOrImage(el);
       return;
     }
 
@@ -1333,7 +1513,11 @@ function parseParagraphElement(
     }
 
     if (tag === 'r') {
-      const rStyle = parseRunFormatting(el, baseRunProps, ctx.styleCtx);
+      const rTextSample = getChildElements(el, 't')
+        .concat(getChildElements(el, 'delText'))
+        .map((n) => n.textContent ?? '')
+        .join('');
+      const rStyle = parseRunFormatting(el, baseRunProps, ctx.styleCtx, rTextSample);
       for (let i = 0; i < el.childNodes.length; i++) {
         const ch = el.childNodes[i];
         if (ch.nodeType !== 1) continue;
@@ -1362,7 +1546,7 @@ function parseParagraphElement(
             rawSegments.push({ type: 'text', content: '\n', ...rStyle });
           }
         } else if (cTag === 'drawing' || cTag === 'pict' || cTag === 'object') {
-          handleEmbeddedObjectOrImage(cEl, rStyle);
+          handleEmbeddedObjectOrImage(cEl);
         } else if (cTag === 'AlternateContent') {
           const choice = getFirstChild(cEl, 'Choice');
           const fallback = getFirstChild(cEl, 'Fallback');
@@ -1371,7 +1555,7 @@ function parseParagraphElement(
             for (const inner of getChildElements(target)) {
               const iTag = getLocalName(inner);
               if (iTag === 'drawing' || iTag === 'pict' || iTag === 'object') {
-                handleEmbeddedObjectOrImage(inner, rStyle);
+                handleEmbeddedObjectOrImage(inner);
               }
             }
           }
@@ -1383,7 +1567,10 @@ function parseParagraphElement(
   getChildElements(pEl).forEach(processNode);
   const segments = splitParagraphTextSegmentsForLatex(rawSegments);
   if (listPrefix && segments.length > 0) {
-    const labelStyle = resolvedPropsToSegmentStyle(mergeRunProps(baseRunProps, listPrefix.rPr));
+    const labelStyle = resolvedPropsToSegmentStyle(
+      mergeRunProps(baseRunProps, pPrRunProps, listPrefix.rPr),
+      listPrefix.text
+    );
     segments.unshift({ type: 'text', content: listPrefix.text, ...labelStyle });
   }
 
@@ -1480,9 +1667,17 @@ function parseTableElement(
   }
 
   const tblStyleId = tblPr ? getAttr(getFirstChild(tblPr, 'tblStyle'), 'val') : null;
-  const tblStyleEntry = tblStyleId ? ctx.styleCtx?.tableStyles.get(tblStyleId) : undefined;
+  const tblStyleEntry = resolveTableStyleChain(ctx.styleCtx, tblStyleId);
   const tblLook = tblPr ? getFirstChild(tblPr, 'tblLook') : null;
-  const firstRowEnabled = !tblLook || getAttr(tblLook, 'firstRow') !== '0';
+  const tblLookVal = tblLook ? getAttr(tblLook, 'val') : null;
+  const tblLookMask = tblLookVal && /^[0-9A-Fa-f]+$/.test(tblLookVal) ? parseInt(tblLookVal, 16) : null;
+  const firstRowAttr = tblLook ? getAttr(tblLook, 'firstRow') : null;
+  const firstRowEnabled =
+    firstRowAttr !== null
+      ? firstRowAttr !== '0' && firstRowAttr !== 'false'
+      : tblLookMask !== null
+      ? Boolean(tblLookMask & 0x0020)
+      : false;
 
   const tblGrid = getFirstChild(tblEl, 'tblGrid');
   const gridCols = tblGrid
@@ -1495,12 +1690,14 @@ function parseTableElement(
 
   for (let rIdx = 0; rIdx < trEls.length; rIdx++) {
     const tr = trEls[rIdx];
+    const trPr = getFirstChild(tr, 'trPr');
+    const hasTblHeader = Boolean(trPr && getFirstChild(trPr, 'tblHeader'));
     const tcEls = getChildElements(tr, 'tc');
     const rowCells: TableCellData[] = [];
     let colCursor = 0;
     const rowInheritedProps =
       tblStyleEntry
-        ? rIdx === 0 && firstRowEnabled
+        ? rIdx === 0 && (firstRowEnabled || hasTblHeader)
           ? mergeRunProps(tblStyleEntry.rPr, tblStyleEntry.firstRowRPr)
           : tblStyleEntry.rPr
         : undefined;

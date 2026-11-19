@@ -66,6 +66,7 @@ function renderRunXml(
     bold?: boolean;
     italic?: boolean;
     underline?: boolean;
+    vertAlign?: 'subscript' | 'superscript';
     sizeHalfPt?: number;
     colorHex?: string | null;
   } = {}
@@ -74,12 +75,13 @@ function renderRunXml(
     bold = false,
     italic = false,
     underline = false,
+    vertAlign,
     sizeHalfPt = 24,
     colorHex = null,
   } = options;
   const sz = finiteInt(sizeHalfPt, 24, 14, 96);
   const safeColor = colorHex && /^[0-9A-Fa-f]{6}$/.test(colorHex) ? colorHex.toUpperCase() : '000000';
-  // Strict ECMA-376 CT_RPr order: rFonts -> b -> bCs -> i -> iCs -> color -> sz -> szCs -> u
+  // Strict ECMA-376 CT_RPr order: rFonts -> b -> bCs -> i -> iCs -> color -> sz -> szCs -> u -> vertAlign
   const rPrParts = [
     '<w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman" w:cs="Times New Roman" w:eastAsia="Times New Roman"/>',
   ];
@@ -96,6 +98,9 @@ function renderRunXml(
   rPrParts.push(`<w:color w:val="${safeColor}"/>`);
   rPrParts.push(`<w:sz w:val="${sz}"/>`, `<w:szCs w:val="${sz}"/>`);
   if (underline) rPrParts.push('<w:u w:val="single"/>');
+  if (vertAlign === 'subscript' || vertAlign === 'superscript') {
+    rPrParts.push(`<w:vertAlign w:val="${vertAlign}"/>`);
+  }
 
   const cleanText = text.replace(/\r\n?|\n/g, ' ');
   const safeText = escapeXml(cleanText);
@@ -176,6 +181,7 @@ function renderSegmentsXml(
               bold: isBold,
               italic: Boolean(seg.italic),
               underline: Boolean(seg.underline),
+              vertAlign: seg.vert_align,
               sizeHalfPt: segSizeHalfPt,
               colorHex,
             })

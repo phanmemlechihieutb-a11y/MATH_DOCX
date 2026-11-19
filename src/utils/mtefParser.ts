@@ -1370,11 +1370,22 @@ const UNICODE_MTCODE_TO_LATEX: Record<number, string> = {
   0x2193: '\\downarrow ',
   0x2194: '\\leftrightarrow ',
   0x21a6: '\\mapsto ',
+  0x21bc: '\\leftharpoonup ',
+  0x21bd: '\\leftharpoondown ',
+  0x21c0: '\\rightharpoonup ',
+  0x21c1: '\\rightharpoondown ',
+  0x21c4: '\\rightleftarrows ',
+  0x21c6: '\\leftrightarrows ',
+  0x21cb: '\\leftrightharpoons ',
+  0x21cc: '\\rightleftharpoons ',
   0x21d0: '\\Leftarrow ',
   0x21d1: '\\Uparrow ',
   0x21d2: '\\Rightarrow ',
   0x21d3: '\\Downarrow ',
   0x21d4: '\\Leftrightarrow ',
+  0x27f5: '\\longleftarrow ',
+  0x27f6: '\\longrightarrow ',
+  0x27f7: '\\longleftrightarrow ',
   0x2200: '\\forall ',
   0x2202: '\\partial ',
   0x2203: '\\exists ',
@@ -1882,18 +1893,55 @@ function tmplNodeToLatex(node: Extract<MtefNode, { kind: 'tmpl' }>): string {
     return `\\overline{${lineNodeToLatex(lineItems[0])}}`;
   }
 
-  // 5. Arrow template (14): over/under arrow with top/bottom labels
+  // 5. Arrow template (14): MTEF v5 tvAR_SINGLE(0), tvAR_DOUBLE(1), tvAR_HARPOON(2),
+  //    tvAR_TOP(4), tvAR_BOTTOM(8), tvAR_LEFT(0x10), tvAR_RIGHT(0x20)
   if (selector === TM_ARROW) {
-    const topSlot = lineItems[0] ? lineNodeToLatex(lineItems[0]) : '';
-    const botSlot = lineItems[1] ? lineNodeToLatex(lineItems[1]) : '';
-    if (variation & 0x01) {
-      // left arrow
+    const hasTopFlag = (variation & 0x04) !== 0;
+    const hasBotFlag = (variation & 0x08) !== 0;
+    let topSlot = '';
+    let botSlot = '';
+    if (!hasTopFlag && hasBotFlag && lineItems.length === 1) {
+      botSlot = lineNodeToLatex(lineItems[0]);
+    } else {
+      topSlot = lineItems[0] ? lineNodeToLatex(lineItems[0]) : '';
+      botSlot = lineItems[1] ? lineNodeToLatex(lineItems[1]) : '';
+    }
+
+    const arrowStyle = variation & 0x03;
+    const hasLeft = (variation & 0x10) !== 0;
+    const hasRight = (variation & 0x20) !== 0;
+
+    if (arrowStyle === 2) {
+      // Harpoons (chemical equilibrium)
+      if (!topSlot && !botSlot) return '\\rightleftharpoons ';
+      return botSlot
+        ? `\\xrightleftharpoons[${botSlot}]{${topSlot}}`
+        : `\\xrightleftharpoons{${topSlot}}`;
+    }
+
+    if (arrowStyle === 1) {
+      // Double opposing arrows
+      if (!topSlot && !botSlot) return '\\rightleftarrows ';
+      if (topSlot && botSlot) {
+        return `\\overset{${topSlot}}{\\underset{${botSlot}}{\\rightleftarrows}}`;
+      }
+      return topSlot
+        ? `\\overset{${topSlot}}{\\rightleftarrows}`
+        : `\\underset{${botSlot}}{\\rightleftarrows}`;
+    }
+
+    // Single arrow (arrowStyle === 0)
+    if (hasLeft && hasRight) {
+      if (!topSlot && !botSlot) return '\\leftrightarrow ';
+      return botSlot
+        ? `\\xleftrightarrow[${botSlot}]{${topSlot}}`
+        : `\\xleftrightarrow{${topSlot}}`;
+    }
+    if (hasLeft) {
+      if (!topSlot && !botSlot) return '\\leftarrow ';
       return botSlot ? `\\xleftarrow[${botSlot}]{${topSlot}}` : `\\xleftarrow{${topSlot}}`;
     }
-    if (variation & 0x02) {
-      // right arrow
-      return botSlot ? `\\xrightarrow[${botSlot}]{${topSlot}}` : `\\xrightarrow{${topSlot}}`;
-    }
+    if (!topSlot && !botSlot) return '\\to ';
     return botSlot ? `\\xrightarrow[${botSlot}]{${topSlot}}` : `\\xrightarrow{${topSlot}}`;
   }
 
@@ -2061,9 +2109,87 @@ function appendMathToken(out: string, token: string): string {
   return `${out}${token}`;
 }
 
+function extractTrailingSubscript(out: string): { prefix: string; inner: string } | null {
+  if (!out || out.length < 2) return null;
+  if (out.endsWith('}')) {
+    let depth = 0;
+    for (let j = out.length - 1; j >= 0; j--) {
+      if (out[j] === '}') depth++;
+      else if (out[j] === '{') {
+        depth--;
+        if (depth === 0) {
+          if (j >= 1 && out[j - 1] === '_' && (j < 2 || out[j - 2] !== '\\')) {
+            return {
+              prefix: out.slice(0, j - 1),
+              inner: out.slice(j + 1, out.length - 1),
+            };
+          }
+          return null;
+        }
+      }
+    }
+    return null;
+  }
+  const prev = out[out.length - 2];
+  if (prev === '_' && (out.length < 3 || out[out.length - 3] !== '\\')) {
+    return {
+      prefix: out.slice(0, out.length - 2),
+      inner: out[out.length - 1],
+    };
+  }
+  return null;
+}
+
+function getScriptSlotParts(node: Extract<MtefNode, { kind: 'tmpl' }>): { sub: string; sup: string } {
+  const lineItems = node.items.filter((n) => n.kind === 'line' || n.kind === 'pile' || n.kind === 'matrix');
+  if (node.selector === TM_SUB) {
+    const sub = lineNodeToLatex(lineItems.find((n) => n.kind !== 'line' || !n.isNull) ?? lineItems[0]);
+    return { sub, sup: '' };
+  }
+  if (node.selector === TM_SUP) {
+    const sup = lineNodeToLatex(
+      lineItems.length >= 2 && lineItems[0].kind === 'line' && lineItems[0].isNull
+        ? lineItems[1]
+        : lineItems.find((n) => n.kind !== 'line' || !n.isNull) ?? lineItems[0]
+    );
+    return { sub: '', sup };
+  }
+  const sub = lineNodeToLatex(lineItems[0]);
+  const sup = lineNodeToLatex(lineItems[1]);
+  return { sub, sup };
+}
+
+function isSeparatorOrSpaceLatex(tok: string): boolean {
+  const t = tok.trim();
+  if (!t) return true;
+  if (/^[=+\-<>(),;:\[\]|&/]$/.test(t)) return true;
+  return /^\\(?:,|;|:|!|quad|qquad|to|leftarrow|rightarrow|leftrightarrow|rightleftharpoons|leftrightharpoons|rightleftarrows|leftrightarrows|xrightarrow|xleftarrow|xleftrightarrow|xrightleftharpoons|Rightarrow|Leftarrow|Leftrightarrow|leq|geq|neq|approx|equiv|sim|pm|mp|times|cdot|div)$/.test(
+    t
+  );
+}
+
 function sequenceToLatex(items: MtefNode[]): string {
   let out = '';
   let i = 0;
+  let atomStart = 0;
+  let atomHasSub = false;
+  let atomHasSup = false;
+
+  const appendAtomToken = (tok: string) => {
+    if (!tok) return;
+    const before = out.length;
+    out = appendMathToken(out, tok);
+    if (isSeparatorOrSpaceLatex(tok)) {
+      atomStart = out.length;
+      atomHasSub = false;
+      atomHasSup = false;
+    } else {
+      const insertedSpace = out.length > before + tok.length ? 1 : 0;
+      atomStart = before + insertedSpace;
+      atomHasSub = false;
+      atomHasSup = false;
+    }
+  };
 
   while (i < items.length) {
     const cur = items[i];
@@ -2084,9 +2210,9 @@ function sequenceToLatex(items: MtefNode[]): string {
           j++;
         }
         if (LATEX_FUNCS.has(fnWord)) {
-          out = appendMathToken(out, `\\${fnWord} `);
+          appendAtomToken(`\\${fnWord} `);
         } else {
-          out = appendMathToken(out, `\\operatorname{${fnWord}}`);
+          appendAtomToken(`\\operatorname{${fnWord}}`);
         }
         i = j;
         continue;
@@ -2113,9 +2239,12 @@ function sequenceToLatex(items: MtefNode[]): string {
           }
         }
         if (textRun.trim().length > 0) {
-          out = appendMathToken(out, `\\text{${textRun}}`);
+          appendAtomToken(`\\text{${textRun}}`);
         } else {
           out += textRun;
+          atomStart = out.length;
+          atomHasSub = false;
+          atomHasSup = false;
         }
         i = j;
         continue;
@@ -2123,9 +2252,9 @@ function sequenceToLatex(items: MtefNode[]): string {
 
       const decorated = info.latex;
       if (cur.colorHex && cur.colorHex !== '#000000' && decorated.trim()) {
-        out = appendMathToken(out, `\\textcolor{${cur.colorHex}}{${decorated.trim()}}`);
+        appendAtomToken(`\\textcolor{${cur.colorHex}}{${decorated.trim()}}`);
       } else {
-        out = appendMathToken(out, decorated);
+        appendAtomToken(decorated);
       }
       i++;
       continue;
@@ -2135,9 +2264,9 @@ function sequenceToLatex(items: MtefNode[]): string {
       const info = charNodeToBaseLatex(cur);
       const decorated = applyEmbellishments(info.latex, cur.embells);
       if (cur.colorHex && cur.colorHex !== '#000000' && decorated.trim()) {
-        out = appendMathToken(out, `\\textcolor{${cur.colorHex}}{${decorated.trim()}}`);
+        appendAtomToken(`\\textcolor{${cur.colorHex}}{${decorated.trim()}}`);
       } else {
-        out = appendMathToken(out, decorated);
+        appendAtomToken(decorated);
       }
       i++;
       continue;
@@ -2148,17 +2277,70 @@ function sequenceToLatex(items: MtefNode[]): string {
         cur.selector === TM_SUB ||
         cur.selector === TM_SUP ||
         cur.selector === TM_SUBSUP;
-      // Handle prescripts (tvSU_PRECEDES = 0x01 on TM_SUB/TM_SUP/TM_SUBSUP) or orphan scripts
-      if (isScript && ((cur.variation & 0x01) !== 0 || out.trim() === '' || /[=+\-(,\[{]$/.test(out.trim()))) {
-        out = appendMathToken(out, `{}${tmplNodeToLatex(cur)}`);
+      const needsDummyBase =
+        (cur.variation & 0x01) !== 0 ||
+        out.trim() === '' ||
+        /(?:[=+\-(<\[]|\\[,;:!]|\\(?:quad|qquad|\s)|(?<!\\)\{)$/.test(out.trim());
+
+      if (isScript && needsDummyBase) {
+        const scriptStr = tmplNodeToLatex(cur);
+        const before = out.length;
+        out = appendMathToken(out, `{}${scriptStr}`);
+        atomStart = before;
+        atomHasSub = cur.selector === TM_SUB || cur.selector === TM_SUBSUP;
+        atomHasSup = cur.selector === TM_SUP || cur.selector === TM_SUBSUP;
+      } else if (isScript) {
+        const { sub, sup } = getScriptSlotParts(cur);
+        if (cur.selector === TM_SUB && sub) {
+          const trailingSub = atomHasSub && !atomHasSup ? extractTrailingSubscript(out) : null;
+          if (trailingSub) {
+            // Merge adjacent subscripts on the same baseline (e.g. H_2 + _{(g)} -> H_{2(g)})
+            const mergedInner = `${trailingSub.inner}${sub}`;
+            out = `${trailingSub.prefix}_${wrapBraces(mergedInner)}`;
+            atomHasSub = true;
+          } else if (atomHasSub) {
+            const baseAtom = out.slice(atomStart);
+            out = `${out.slice(0, atomStart)}{${baseAtom}}_${wrapBraces(sub)}`;
+            atomHasSub = true;
+            atomHasSup = false;
+          } else {
+            out = `${out}_${wrapBraces(sub)}`;
+            atomHasSub = true;
+          }
+        } else if (cur.selector === TM_SUP && sup) {
+          if (atomHasSup) {
+            const baseAtom = out.slice(atomStart);
+            out = `${out.slice(0, atomStart)}{${baseAtom}}^${wrapBraces(sup)}`;
+            atomHasSub = false;
+            atomHasSup = true;
+          } else {
+            out = `${out}^${wrapBraces(sup)}`;
+            atomHasSup = true;
+          }
+        } else if (cur.selector === TM_SUBSUP && (sub || sup)) {
+          if (atomHasSub || atomHasSup) {
+            const baseAtom = out.slice(atomStart);
+            out = `${out.slice(0, atomStart)}{${baseAtom}}`;
+            atomHasSub = false;
+            atomHasSup = false;
+          }
+          if (sub) {
+            out = `${out}_${wrapBraces(sub)}`;
+            atomHasSub = true;
+          }
+          if (sup) {
+            out = `${out}^${wrapBraces(sup)}`;
+            atomHasSup = true;
+          }
+        }
       } else {
-        out = appendMathToken(out, nodeToLatex(cur));
+        appendAtomToken(nodeToLatex(cur));
       }
       i++;
       continue;
     }
 
-    out = appendMathToken(out, nodeToLatex(cur));
+    appendAtomToken(nodeToLatex(cur));
     i++;
   }
 
