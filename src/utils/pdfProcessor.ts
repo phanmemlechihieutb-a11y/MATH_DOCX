@@ -2,9 +2,7 @@ import * as pdfjsLib from 'pdfjs-dist';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import type { RenderedPage } from '../types/document';
 
-if (typeof pdfWorkerUrl === 'string' && pdfWorkerUrl) {
-  pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
-}
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 function encodeJpegWithCap(
   canvas: HTMLCanvasElement,
@@ -171,7 +169,7 @@ function loadImageElement(src: string): Promise<HTMLImageElement | null> {
 function isInkPixel(
   data: Uint8ClampedArray,
   idx: number,
-  threshold = 238
+  threshold = 235
 ): boolean {
   const r = data[idx];
   const g = data[idx + 1];
@@ -194,10 +192,11 @@ function isContainedInBox(
   const nArea = Math.max(1, (nBottom - nTop) * (nRight - nLeft));
   const ix = Math.max(0, Math.min(nRight, figRight) - Math.max(nLeft, figLeft));
   const iy = Math.max(0, Math.min(nBottom, figBottom) - Math.max(nTop, figTop));
-  return (ix * iy) / nArea >= 0.65;
+  return (ix * iy) / nArea >= 0.7;
 }
 
-export function computeCropSearchBounds(
+function expandCropToInkBounds(
+  ctx: CanvasRenderingContext2D,
   pageW: number,
   pageH: number,
   rawLeft: number,
@@ -205,11 +204,14 @@ export function computeCropSearchBounds(
   rawRight: number,
   rawBottom: number,
   neighborBoxes: number[][] = []
-): { maxLeft: number; maxTop: number; maxRight: number; maxBottom: number } {
+): { left: number; top: number; right: number; bottom: number } {
   let maxLeft = Math.max(0, rawLeft - Math.round(pageW * 0.16));
   let maxRight = Math.min(pageW, rawRight + Math.round(pageW * 0.16));
   let maxTop = Math.max(0, rawTop - Math.round(pageH * 0.14));
   let maxBottom = Math.min(pageH, rawBottom + Math.round(pageH * 0.18));
+
+  let overlappingTopMaxY = -1;
+  let overlappingBottomMinY = pageH + 1;
 
   for (const nb of neighborBoxes) {
     if (!Array.isArray(nb) || nb.length !== 4) continue;
@@ -219,7 +221,7 @@ export function computeCropSearchBounds(
     const nBottom = Math.ceil((Math.max(ny1, ny2) * pageH) / 1000);
     const nRight = Math.ceil((Math.max(nx1, nx2) * pageW) / 1000);
 
-    // Ignore labels or tokens that lie inside the figure box itself
+    // Ignore stray labels that lie inside the figure box itself
     if (isContainedInBox(nTop, nLeft, nBottom, nRight, rawTop, rawLeft, rawBottom, rawRight)) {
       continue;
     }
@@ -232,23 +234,21 @@ export function computeCropSearchBounds(
       if (nBottom <= rawTop + 4) {
         maxTop = Math.max(maxTop, Math.min(rawTop, nBottom + 2));
       } else if (
-        nTop < rawTop &&
-        nBottom > rawTop + 4 &&
-        nBottom < rawTop + Math.min(Math.round(pageH * 0.045), (rawBottom - rawTop) * 0.25)
+        nTop < rawTop - 4 &&
+        nBottom > rawTop &&
+        nBottom < rawTop + Math.min(Math.round(pageH * 0.05), (rawBottom - rawTop) * 0.28)
       ) {
-        // Neighbor slightly overlaps top edge: stop outward expansion at rawTop, never trim inside rawBox
-        maxTop = Math.max(maxTop, rawTop);
+        overlappingTopMaxY = Math.max(overlappingTopMaxY, nBottom);
       }
 
       if (nTop >= rawBottom - 4) {
         maxBottom = Math.min(maxBottom, Math.max(rawBottom, nTop - 2));
       } else if (
-        nBottom > rawBottom &&
-        nTop < rawBottom - 4 &&
-        nTop > rawBottom - Math.min(Math.round(pageH * 0.045), (rawBottom - rawTop) * 0.25)
+        nBottom > rawBottom + 4 &&
+        nTop < rawBottom &&
+        nTop > rawBottom - Math.min(Math.round(pageH * 0.05), (rawBottom - rawTop) * 0.28)
       ) {
-        // Neighbor slightly overlaps bottom edge: stop outward expansion at rawBottom, never trim inside rawBox
-        maxBottom = Math.min(maxBottom, rawBottom);
+        overlappingBottomMinY = Math.min(overlappingBottomMinY, nTop);
       }
     }
 
@@ -259,79 +259,44 @@ export function computeCropSearchBounds(
     if (hasVertOverlapWithFig) {
       if (nRight <= rawLeft + 4) {
         maxLeft = Math.max(maxLeft, Math.min(rawLeft, nRight + 2));
-      } else if (
-        nLeft < rawLeft &&
-        nRight > rawLeft + 4 &&
-        nRight < rawLeft + Math.min(Math.round(pageW * 0.045), (rawRight - rawLeft) * 0.25)
-      ) {
-        maxLeft = Math.max(maxLeft, rawLeft);
       }
-
       if (nLeft >= rawRight - 4) {
         maxRight = Math.min(maxRight, Math.max(rawRight, nLeft - 2));
-      } else if (
-        nRight > rawRight &&
-        nLeft < rawRight - 4 &&
-        nLeft > rawRight - Math.min(Math.round(pageW * 0.045), (rawRight - rawLeft) * 0.25)
-      ) {
-        maxRight = Math.min(maxRight, rawRight);
       }
     }
   }
 
-  return { maxLeft, maxTop, maxRight, maxBottom };
-}
+  const roiW = maxRight - maxLeft;
+  const roiH = maxBottom - maxTop;
+  if (roiW < 20 || roiH < 20) {
+    return { left: rawLeft, top: rawTop, right: rawRight, bottom: rawBottom };
+  }
 
-export function computeExpandedCropBoxFromRgba(
-  data: Uint8ClampedArray,
-  roiLeft: number,
-  roiTop: number,
-  roiW: number,
-  roiH: number,
-  pageW: number,
-  pageH: number,
-  rawLeft: number,
-  rawTop: number,
-  rawRight: number,
-  rawBottom: number
-): { left: number; top: number; right: number; bottom: number } {
-  const maxLeft = roiLeft;
-  const maxTop = roiTop;
-  const maxRight = roiLeft + roiW;
-  const maxBottom = roiTop + roiH;
+  let imgData: ImageData;
+  try {
+    imgData = ctx.getImageData(maxLeft, maxTop, roiW, roiH);
+  } catch {
+    return { left: rawLeft, top: rawTop, right: rawRight, bottom: rawBottom };
+  }
 
-  const inkAt = (rx: number, ry: number, thresh = 238): boolean => {
+  const data = imgData.data;
+  const inkAt = (rx: number, ry: number, thresh = 235): boolean => {
     if (rx < 0 || rx >= roiW || ry < 0 || ry >= roiH) return false;
     return isInkPixel(data, (ry * roiW + rx) * 4, thresh);
   };
 
-  const has8ConnectedNeighbor = (rx: number, ry: number, thresh = 232): boolean => {
-    for (let dy = -1; dy <= 1; dy++) {
-      for (let dx = -1; dx <= 1; dx++) {
-        if (dx === 0 && dy === 0) continue;
-        if (inkAt(rx + dx, ry + dy, thresh)) return true;
-      }
-    }
-    return false;
-  };
-
-  // Detect any dark 1px stroke/apex (<205), connected 1px anti-aliased tip (<224), >=2 stroke (<238), or pastel fill (>=5 px <247)
+  // Detect >=2 ink pixels OR any 1px thin/gray vertical or horizontal stroke connected along the axis
   const colHasInk = (absX: number, absY1: number, absY2: number): boolean => {
     const rx = absX - maxLeft;
     if (rx < 0 || rx >= roiW) return false;
     const ry1 = Math.max(0, absY1 - maxTop);
     const ry2 = Math.min(roiH - 1, absY2 - maxTop - 1);
-    let hits238 = 0;
-    let hits247 = 0;
+    let hits = 0;
     for (let ry = ry1; ry <= ry2; ry++) {
-      if (!inkAt(rx, ry, 247)) continue;
-      hits247++;
-      if (hits247 >= 5) return true;
-      if (inkAt(rx, ry, 238)) {
-        hits238++;
-        if (hits238 >= 2) return true;
-        if (inkAt(rx, ry, 205)) return true;
-        if (inkAt(rx, ry, 224) && has8ConnectedNeighbor(rx, ry, 232)) {
+      if (inkAt(rx, ry, 235)) {
+        hits++;
+        if (hits >= 2) return true;
+        if (inkAt(rx, ry, 218) && (inkAt(rx - 1, ry, 232) || inkAt(rx + 1, ry, 232))) {
           return true;
         }
       }
@@ -339,37 +304,91 @@ export function computeExpandedCropBoxFromRgba(
     return false;
   };
 
-  const rowHasInk = (absY: number, absX1: number, absX2: number): boolean => {
+  const countRowInk = (absY: number, absX1: number, absX2: number): number => {
     const ry = absY - maxTop;
-    if (ry < 0 || ry >= roiH) return false;
+    if (ry < 0 || ry >= roiH) return 0;
     const rx1 = Math.max(0, absX1 - maxLeft);
     const rx2 = Math.min(roiW - 1, absX2 - maxLeft - 1);
-    let hits238 = 0;
-    let hits247 = 0;
+    let hits = 0;
+    let hasConnected1px = false;
     for (let rx = rx1; rx <= rx2; rx++) {
-      if (!inkAt(rx, ry, 247)) continue;
-      hits247++;
-      if (hits247 >= 5) return true;
-      if (inkAt(rx, ry, 238)) {
-        hits238++;
-        if (hits238 >= 2) return true;
-        if (inkAt(rx, ry, 205)) return true;
-        if (inkAt(rx, ry, 224) && has8ConnectedNeighbor(rx, ry, 232)) {
-          return true;
+      if (inkAt(rx, ry, 235)) {
+        hits++;
+        if (
+          !hasConnected1px &&
+          inkAt(rx, ry, 218) &&
+          (inkAt(rx, ry - 1, 232) || inkAt(rx, ry + 1, 232))
+        ) {
+          hasConnected1px = true;
         }
       }
     }
-    return false;
+    if (hits >= 2) return hits;
+    return hasConnected1px ? 1 : 0;
   };
+
+  const rowHasInk = (absY: number, absX1: number, absX2: number): boolean =>
+    countRowInk(absY, absX1, absX2) > 0;
 
   let curLeft = rawLeft;
   let curTop = rawTop;
   let curRight = rawRight;
   let curBottom = rawBottom;
 
-  const hGap = Math.max(20, Math.round(pageW * 0.018));
-  const vGapTop = Math.max(15, Math.round(pageH * 0.01));
-  const vGapBottom = Math.max(20, Math.round(pageH * 0.013));
+  // Trim an overlapping top strip if a clean horizontal white gap separates it from the figure
+  if (overlappingTopMaxY > curTop) {
+    const trimLimit = Math.min(
+      curBottom - 20,
+      overlappingTopMaxY + Math.round(pageH * 0.02)
+    );
+    const minTrimGap = Math.max(5, Math.round(pageH * 0.0025));
+    let seenTopInk = false;
+    let gapRun = 0;
+    for (let y = curTop; y < trimLimit; y++) {
+      const cnt = countRowInk(y, curLeft, curRight);
+      if (cnt > 0) {
+        if (seenTopInk && gapRun >= minTrimGap) {
+          curTop = y;
+          maxTop = Math.max(maxTop, y);
+          break;
+        }
+        seenTopInk = true;
+        gapRun = 0;
+      } else if (seenTopInk) {
+        gapRun++;
+      }
+    }
+  }
+
+  // Trim an overlapping bottom strip if a clean horizontal white gap separates it from the figure
+  if (overlappingBottomMinY < curBottom) {
+    const trimFloor = Math.max(
+      curTop + 20,
+      overlappingBottomMinY - Math.round(pageH * 0.02)
+    );
+    const minTrimGap = Math.max(5, Math.round(pageH * 0.0025));
+    let seenBottomInk = false;
+    let gapRun = 0;
+    for (let y = curBottom - 1; y >= trimFloor; y--) {
+      const cnt = countRowInk(y, curLeft, curRight);
+      if (cnt > 0) {
+        if (seenBottomInk && gapRun >= minTrimGap) {
+          curBottom = y + 1;
+          maxBottom = Math.min(maxBottom, y + 1);
+          break;
+        }
+        seenBottomInk = true;
+        gapRun = 0;
+      } else if (seenBottomInk) {
+        gapRun++;
+      }
+    }
+  }
+
+  const hGap = Math.max(16, Math.round(pageW * 0.016));
+  const vGapTop = Math.max(12, Math.round(pageH * 0.008));
+  const vGapBottom = Math.max(14, Math.round(pageH * 0.009));
+  const vGapAfterBorder = Math.max(7, Math.round(pageH * 0.0035));
 
   const expandHorizontal = () => {
     let leftWhite = 0;
@@ -429,42 +448,42 @@ export function computeExpandedCropBoxFromRgba(
     }
 
     let bottomWhite = 0;
+    let sawBottomBorder = false;
+    const spanW = Math.max(1, curRight - curLeft);
     for (let y = curBottom - 1; y >= Math.max(curTop, curBottom - vGapBottom); y--) {
-      if (rowHasInk(y, curLeft, curRight)) break;
+      const cnt = countRowInk(y, curLeft, curRight);
+      if (cnt > 0) {
+        if (cnt >= spanW * 0.45 && bottomWhite <= 3) {
+          sawBottomBorder = true;
+        }
+        break;
+      }
       bottomWhite++;
     }
-    if (bottomWhite < vGapBottom) {
+    const effectiveBottomGap = sawBottomBorder ? vGapAfterBorder : vGapBottom;
+    if (bottomWhite < effectiveBottomGap) {
       let whiteRun = bottomWhite;
+      let localBorderSeen = sawBottomBorder;
       for (let y = curBottom; y < maxBottom; y++) {
-        if (rowHasInk(y, curLeft, curRight)) {
+        const cnt = countRowInk(y, curLeft, curRight);
+        if (cnt > 0) {
           curBottom = y + 1;
           whiteRun = 0;
+          localBorderSeen = cnt >= spanW * 0.45;
         } else {
           whiteRun++;
-          if (whiteRun >= vGapBottom) break;
+          const limit = localBorderSeen ? vGapAfterBorder : vGapBottom;
+          if (whiteRun >= limit) break;
         }
       }
     }
   };
 
-  // Multi-pass H <-> V expansion until corner labels/borders converge
-  for (let pass = 0; pass < 3; pass++) {
-    const prevL = curLeft;
-    const prevT = curTop;
-    const prevR = curRight;
-    const prevB = curBottom;
-    expandHorizontal();
-    expandVertical();
-    expandHorizontal();
-    if (
-      curLeft === prevL &&
-      curTop === prevT &&
-      curRight === prevR &&
-      curBottom === prevB
-    ) {
-      break;
-    }
-  }
+  // Pass 1 & 2: Horizontal first to grab full table width/horizontal rules, then Vertical for all rows/borders
+  expandHorizontal();
+  expandVertical();
+  expandHorizontal();
+  expandVertical();
 
   // Locate tight ink bounds inside [curLeft..curRight, curTop..curBottom]
   let inkLeft = curRight;
@@ -515,8 +534,8 @@ export function computeExpandedCropBoxFromRgba(
   }
 
   // Add breathing-room padding from the true ink edges, stopping safely clear of external ink
-  const padX = Math.max(12, Math.round(pageW * 0.008));
-  const padY = Math.max(10, Math.round(pageH * 0.006));
+  const padX = Math.max(8, Math.round(pageW * 0.005));
+  const padY = Math.max(7, Math.round(pageH * 0.004));
 
   let safePadLeft = 0;
   for (let d = 1; d <= padX && inkLeft - d >= maxLeft; d++) {
@@ -561,54 +580,6 @@ export function computeExpandedCropBoxFromRgba(
     right: paddedRight,
     bottom: inkBottom + safePadBottom,
   };
-}
-
-function expandCropToInkBounds(
-  ctx: CanvasRenderingContext2D,
-  pageW: number,
-  pageH: number,
-  rawLeft: number,
-  rawTop: number,
-  rawRight: number,
-  rawBottom: number,
-  neighborBoxes: number[][] = []
-): { left: number; top: number; right: number; bottom: number } {
-  const { maxLeft, maxTop, maxRight, maxBottom } = computeCropSearchBounds(
-    pageW,
-    pageH,
-    rawLeft,
-    rawTop,
-    rawRight,
-    rawBottom,
-    neighborBoxes
-  );
-
-  const roiW = maxRight - maxLeft;
-  const roiH = maxBottom - maxTop;
-  if (roiW < 20 || roiH < 20) {
-    return { left: rawLeft, top: rawTop, right: rawRight, bottom: rawBottom };
-  }
-
-  let imgData: ImageData;
-  try {
-    imgData = ctx.getImageData(maxLeft, maxTop, roiW, roiH);
-  } catch {
-    return { left: rawLeft, top: rawTop, right: rawRight, bottom: rawBottom };
-  }
-
-  return computeExpandedCropBoxFromRgba(
-    imgData.data,
-    maxLeft,
-    maxTop,
-    roiW,
-    roiH,
-    pageW,
-    pageH,
-    rawLeft,
-    rawTop,
-    rawRight,
-    rawBottom
-  );
 }
 
 export async function cropFiguresFromPage(

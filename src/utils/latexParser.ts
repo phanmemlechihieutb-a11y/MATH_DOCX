@@ -151,7 +151,6 @@ interface InlineStyle {
   bold?: boolean;
   italic?: boolean;
   underline?: boolean;
-  vert_align?: 'subscript' | 'superscript';
   font_size_pt?: number;
   color?: string;
 }
@@ -2869,7 +2868,6 @@ function makeTextSegment(content: string, style: InlineStyle): InlineSegment {
     ...(style.bold ? { bold: true } : {}),
     ...(style.italic ? { italic: true } : {}),
     ...(style.underline ? { underline: true } : {}),
-    ...(style.vert_align ? { vert_align: style.vert_align } : {}),
     ...(style.font_size_pt ? { font_size_pt: style.font_size_pt } : {}),
     ...(style.color ? { color: style.color } : {}),
   };
@@ -3376,10 +3374,8 @@ function parseInlineSegmentText(
             bold: nextBold,
             italic: nextItalic,
             underline: currentStyle.underline || cmd === 'underline' || cmd === 'ul' || cmd === 'uline',
-            ...(cmd === 'textsuperscript'
-              ? { vert_align: 'superscript' as const }
-              : cmd === 'textsubscript'
-              ? { vert_align: 'subscript' as const }
+            ...(cmd === 'textsuperscript' || cmd === 'textsubscript'
+              ? { font_size_pt: Math.max(8, (currentStyle.font_size_pt ?? 12) - 3) }
               : {}),
           };
           const innerContent =
@@ -7915,7 +7911,7 @@ export function promoteNumbersAndSignsToMathSegments(
     const nextSegType = idx + 1 < segments.length ? segments[idx + 1]?.type : undefined;
     const isLineStartAtZero = atBlockLineStart || Boolean(seg.tab_before);
 
-    if (seg.type === 'text' && seg.content && !seg.vert_align) {
+    if (seg.type === 'text' && seg.content) {
       const promoted = promoteSegmentNumbersAndSigns(seg, {
         prevSegType,
         nextSegType,
@@ -7928,8 +7924,8 @@ export function promoteNumbersAndSignsToMathSegments(
       atBlockLineStart = seg.content.endsWith('\n');
     } else {
       out.push(seg);
-      prevTextTail = seg.type === 'text' && seg.content ? (prevTextTail + seg.content).slice(-32) : '';
-      atBlockLineStart = seg.type === 'text' && seg.content ? seg.content.endsWith('\n') : false;
+      prevTextTail = '';
+      atBlockLineStart = false;
     }
   }
 

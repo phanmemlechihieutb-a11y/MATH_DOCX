@@ -22,7 +22,6 @@ export interface InlineSegment {
   bold?: boolean;
   italic?: boolean;
   underline?: boolean;
-  vert_align?: 'subscript' | 'superscript';
   font_size_pt?: number | null;
   color?: string | null;
   tab_before?: boolean;

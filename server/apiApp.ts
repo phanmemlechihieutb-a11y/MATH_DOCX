@@ -1,6 +1,9 @@
 import 'dotenv/config';
 import express from 'express';
+import fs from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import type { PageExtraction } from '../src/types/document.ts';
 import { normalizePagesInlineMath } from '../src/utils/latexParser.ts';
@@ -554,6 +557,61 @@ export async function handleExportDocx(req: RequestWithOptionalBody, res: Server
   }
 }
 
+const STATS_FILENAME = '.mathdocx_conversion_stats.json';
+const STATS_CANDIDATE_PATHS = [
+  path.join(process.cwd(), STATS_FILENAME),
+  path.join(os.tmpdir(), 'mathdocx_conversion_stats.json'),
+];
+
+function loadConversionCount(): number {
+  for (const filePath of STATS_CANDIDATE_PATHS) {
+    try {
+      if (!fs.existsSync(filePath)) continue;
+      const raw = fs.readFileSync(filePath, 'utf8');
+      const parsed = JSON.parse(raw) as { count?: unknown };
+      if (typeof parsed.count === 'number' && Number.isFinite(parsed.count) && parsed.count >= 0) {
+        return Math.floor(parsed.count);
+      }
+    } catch {
+      // Ignore unreadable candidates
+    }
+  }
+  return 0;
+}
+
+function saveConversionCount(count: number): void {
+  const payload = JSON.stringify({ count, updatedAt: new Date().toISOString() });
+  for (const filePath of STATS_CANDIDATE_PATHS) {
+    try {
+      fs.writeFileSync(filePath, payload, 'utf8');
+      return;
+    } catch {
+      // Try fallback directory if cwd is read-only
+    }
+  }
+}
+
+let conversionSuccessCount = loadConversionCount();
+
+export async function handleConversionStats(
+  req: RequestWithOptionalBody,
+  res: ServerResponse
+): Promise<void> {
+  res.setHeader('Cache-Control', 'no-store');
+  const method = (req.method || 'GET').toUpperCase();
+  if (method === 'GET') {
+    sendJson(res, 200, { count: conversionSuccessCount });
+    return;
+  }
+  if (method === 'POST') {
+    conversionSuccessCount += 1;
+    saveConversionCount(conversionSuccessCount);
+    sendJson(res, 200, { count: conversionSuccessCount });
+    return;
+  }
+  sendJson(res, 405, { error: 'Method Not Allowed' });
+}
+
 export function createApiApp(): express.Express {
   const app = express();
   app.use(express.json({ limit: '50mb' }));
@@ -568,6 +626,14 @@ export function createApiApp(): express.Express {
 
   app.post('/api/export/docx', (req, res) => {
     void handleExportDocx(req, res);
+  });
+
+  app.get('/api/stats/conversions', (req, res) => {
+    void handleConversionStats(req, res);
+  });
+
+  app.post('/api/stats/conversions', (req, res) => {
+    void handleConversionStats(req, res);
   });
 
   return app;

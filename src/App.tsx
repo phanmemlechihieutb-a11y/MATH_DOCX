@@ -187,6 +187,76 @@ export default function App() {
     omml: string;
   } | null>(null);
 
+  const [conversionSuccessCount, setConversionSuccessCount] = useState<number>(() => {
+    try {
+      const raw = window.localStorage.getItem('mathdocx_conversion_success_count');
+      const parsed = raw ? Number(raw) : 0;
+      return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : 0;
+    } catch {
+      return 0;
+    }
+  });
+
+  const saveLocalConversionCount = useCallback((next: number) => {
+    try {
+      window.localStorage.setItem('mathdocx_conversion_success_count', String(next));
+    } catch {
+      // Ignore storage quota or private-browsing errors
+    }
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    void fetch('/api/stats/conversions', { cache: 'no-store' })
+      .then(async (res) => {
+        if (!res.ok) return;
+        const json = (await res.json()) as { count?: unknown };
+        if (
+          active &&
+          typeof json.count === 'number' &&
+          Number.isFinite(json.count) &&
+          json.count >= 0
+        ) {
+          const serverCount = Math.floor(json.count);
+          setConversionSuccessCount((prev) => {
+            const merged = Math.max(prev, serverCount);
+            saveLocalConversionCount(merged);
+            return merged;
+          });
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [saveLocalConversionCount]);
+
+  const recordConversionSuccess = useCallback(() => {
+    setConversionSuccessCount((prev) => {
+      const optimistic = prev + 1;
+      saveLocalConversionCount(optimistic);
+      return optimistic;
+    });
+    void fetch('/api/stats/conversions', { method: 'POST', cache: 'no-store' })
+      .then(async (res) => {
+        if (!res.ok) return;
+        const json = (await res.json()) as { count?: unknown };
+        if (
+          typeof json.count === 'number' &&
+          Number.isFinite(json.count) &&
+          json.count >= 0
+        ) {
+          const serverCount = Math.floor(json.count);
+          setConversionSuccessCount((prev) => {
+            const merged = Math.max(prev, serverCount);
+            saveLocalConversionCount(merged);
+            return merged;
+          });
+        }
+      })
+      .catch(() => undefined);
+  }, [saveLocalConversionCount]);
+
   const resetResults = useCallback(() => {
     syncRequestIdRef.current += 1;
     setExtractedPages([]);
@@ -454,8 +524,7 @@ export default function App() {
       pageBreaks: boolean,
       layout: ChoiceLayoutMode,
       format: MathOutputFormat,
-      underlineCorrect = false,
-      shouldCommit?: () => boolean
+      underlineCorrect = false
     ) => {
       const prepareBlockMedia = async (blk: DocumentBlock): Promise<DocumentBlock> => {
         if (
@@ -586,10 +655,6 @@ export default function App() {
 
       const blob = await exportRes.blob();
       const url = URL.createObjectURL(blob);
-      if (shouldCommit && !shouldCommit()) {
-        URL.revokeObjectURL(url);
-        return;
-      }
       const baseName = filename.replace(/\.[^.]+$/, '') || 'tai_lieu_toan';
       const suffix = format === 'latex' ? 'LaTeX' : 'OMML';
 
@@ -797,20 +862,18 @@ export default function App() {
           );
           if (figureBlocks.length === 0) return page;
 
-          const figRawBoxes = figureBlocks.map((b) => b.box_2d);
           const neighborBoxes = blocksClone
             .filter(
               (blk): blk is DocumentBlock & { box_2d: number[] } =>
                 blk.block_type !== 'figure' &&
                 Array.isArray(blk.box_2d) &&
-                blk.box_2d.length === 4 &&
-                !isBoxMostlyInsideAnyFigure(blk.box_2d, figRawBoxes)
+                blk.box_2d.length === 4
             )
             .map((b) => b.box_2d);
 
           const croppedList = await cropFiguresFromPage(
             sourcePage,
-            figRawBoxes,
+            figureBlocks.map((b) => b.box_2d),
             0.014,
             neighborBoxes
           );
@@ -837,36 +900,19 @@ export default function App() {
       setFigureAssets(regeneratedAssets);
       setPastedLatex(regeneratedLatex);
       if (docxDownloadUrl) {
-        const reqId = ++syncRequestIdRef.current;
-        setErrorMessage(null);
-        setIsSyncingEditedWord(true);
         setStatusMessage(
           nextEnabled
-            ? 'Đang cập nhật file Word có cắt chèn hình vẽ...'
-            : 'Đang cập nhật file Word bỏ cắt chèn hình vẽ...'
+            ? 'Đã tự động nhận diện & cắt chèn hình vẽ vào tài liệu.'
+            : 'Đã tắt cắt chèn hình vẽ trong bản xem trước và file Word.'
         );
-        try {
-          await rebuildDocxExport(
-            updatedPages,
-            sourceFilename || 'tai_lieu_toan',
-            addPageBreaks,
-            choiceLayout,
-            mathFormat,
-            isExTestLatexInput && underlineCorrectChoice,
-            () => reqId === syncRequestIdRef.current
-          );
-          if (reqId === syncRequestIdRef.current) {
-            setStatusMessage(
-              nextEnabled
-                ? 'Đã tự động nhận diện & cắt chèn hình vẽ vào tài liệu.'
-                : 'Đã tắt cắt chèn hình vẽ trong bản xem trước và file Word.'
-            );
-          }
-        } finally {
-          if (reqId === syncRequestIdRef.current) {
-            setIsSyncingEditedWord(false);
-          }
-        }
+        await rebuildDocxExport(
+          updatedPages,
+          sourceFilename || 'tai_lieu_toan',
+          addPageBreaks,
+          choiceLayout,
+          mathFormat,
+          isExTestLatexInput && underlineCorrectChoice
+        );
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Không thể cập nhật hình vẽ đã cắt.';
@@ -874,132 +920,109 @@ export default function App() {
     }
   };
 
-  const getActivePagesForWordRebuild = useCallback((): PageExtraction[] => {
-    if (editedPages) return editedPages;
-    if (inputSource === 'paste' && pastedLatex.trim()) {
-      return normalizePagesInlineMath(parsePastedLatexToPages(pastedLatex, 'auto', figureAssets));
-    }
-    if (extractedPages.length > 0) return extractedPages;
-    return [];
-  }, [editedPages, extractedPages, figureAssets, inputSource, pastedLatex]);
-
-  const rebuildWordAfterOptionChange = useCallback(
-    async (
-      overrides: {
-        pageBreaks?: boolean;
-        layout?: ChoiceLayoutMode;
-        format?: MathOutputFormat;
-        underlineCorrect?: boolean;
-      },
-      pendingMsg: string,
-      successMsg: string
-    ) => {
-      if ((!docxDownloadUrl && extractedPages.length === 0) || isConverting || isExportingPaste) {
-        return;
-      }
-      const activePages = getActivePagesForWordRebuild();
-      if (activePages.length === 0) return;
-
-      const reqId = ++syncRequestIdRef.current;
-      setErrorMessage(null);
-      setIsSyncingEditedWord(true);
-      setStatusMessage(pendingMsg);
-
-      const fallbackName =
-        inputSource === 'docx'
-          ? 'tai_lieu_word'
-          : inputSource === 'paste'
-          ? 'tai_lieu_latex'
-          : 'tai_lieu_toan';
-
-      try {
-        await rebuildDocxExport(
-          activePages,
-          sourceFilename || fallbackName,
-          overrides.pageBreaks ?? addPageBreaks,
-          overrides.layout ?? choiceLayout,
-          overrides.format ?? mathFormat,
-          isExTestLatexInput && (overrides.underlineCorrect ?? underlineCorrectChoice),
-          () => reqId === syncRequestIdRef.current
-        );
-        if (reqId === syncRequestIdRef.current) {
-          setProgressPct(100);
-          setStatusMessage(successMsg);
-        }
-      } catch (err) {
-        if (reqId === syncRequestIdRef.current) {
-          const msg = err instanceof Error ? err.message : 'Không thể cập nhật tệp Word.';
-          setErrorMessage(msg);
-        }
-      } finally {
-        if (reqId === syncRequestIdRef.current) {
-          setIsSyncingEditedWord(false);
-        }
-      }
-    },
-    [
-      addPageBreaks,
-      choiceLayout,
-      docxDownloadUrl,
-      extractedPages.length,
-      getActivePagesForWordRebuild,
-      inputSource,
-      isConverting,
-      isExTestLatexInput,
-      isExportingPaste,
-      mathFormat,
-      rebuildDocxExport,
-      sourceFilename,
-      underlineCorrectChoice,
-    ]
-  );
-
-  const handleAddPageBreaksChange = async (nextEnabled: boolean) => {
-    setAddPageBreaks(nextEnabled);
-    await rebuildWordAfterOptionChange(
-      { pageBreaks: nextEnabled },
-      nextEnabled
-        ? 'Đang cập nhật file Word có ngắt trang theo từng trang...'
-        : 'Đang cập nhật file Word bỏ ngắt trang tự động...',
-      nextEnabled
-        ? 'Đã bật ngắt trang tương ứng từng trang trong file Word.'
-        : 'Đã tắt ngắt trang giữa các trang trong file Word.'
-    );
-  };
-
   const handleChoiceLayoutChange = async (nextLayout: ChoiceLayoutMode) => {
     setChoiceLayout(nextLayout);
-    await rebuildWordAfterOptionChange(
-      { layout: nextLayout },
-      'Đang cập nhật bố cục phương án trả lời trong file Word...',
-      'Đã cập nhật file Word theo định dạng phương án đã chọn.'
-    );
+    const activePages =
+      editedPages ??
+      (inputSource === 'paste' && pastedLatex.trim()
+        ? normalizePagesInlineMath(parsePastedLatexToPages(pastedLatex, 'auto', figureAssets))
+        : extractedPages.length > 0
+        ? extractedPages
+        : []);
+    if (activePages.length > 0 && !isConverting && !isExportingPaste) {
+      try {
+        setStatusMessage('Đang cập nhật bố cục phương án trả lời trong file Word...');
+        await rebuildDocxExport(
+          activePages,
+          sourceFilename || 'tai_lieu_toan',
+          addPageBreaks,
+          nextLayout,
+          mathFormat,
+          isExTestLatexInput && underlineCorrectChoice
+        );
+        setStatusMessage('Đã cập nhật file Word theo định dạng phương án đã chọn.');
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Không thể cập nhật tệp Word.';
+        setErrorMessage(msg);
+      }
+    }
   };
 
   const handleUnderlineCorrectChoiceChange = async (nextEnabled: boolean) => {
     setUnderlineCorrectChoice(nextEnabled);
-    await rebuildWordAfterOptionChange(
-      { underlineCorrect: nextEnabled },
-      nextEnabled
-        ? 'Đang cập nhật file Word có gạch chân đáp án đúng...'
-        : 'Đang bỏ gạch chân đáp án đúng trong file Word...',
-      nextEnabled
-        ? 'Đã bật gạch chân đáp án đúng (chỉ gạch chân chữ cái phương án).'
-        : 'Đã tắt gạch chân đáp án đúng trong file Word.'
-    );
+    const activePages =
+      editedPages ??
+      (inputSource === 'paste' && pastedLatex.trim()
+        ? normalizePagesInlineMath(parsePastedLatexToPages(pastedLatex, 'auto', figureAssets))
+        : extractedPages.length > 0
+        ? extractedPages
+        : []);
+    if (activePages.length > 0 && !isConverting && !isExportingPaste) {
+      try {
+        setStatusMessage(
+          nextEnabled
+            ? 'Đang cập nhật file Word có gạch chân đáp án đúng...'
+            : 'Đang bỏ gạch chân đáp án đúng trong file Word...'
+        );
+        await rebuildDocxExport(
+          activePages,
+          sourceFilename || 'tai_lieu_latex',
+          addPageBreaks,
+          choiceLayout,
+          mathFormat,
+          isExTestLatexInput && nextEnabled
+        );
+        setStatusMessage(
+          nextEnabled
+            ? 'Đã bật gạch chân đáp án đúng (chỉ gạch chân chữ cái phương án).'
+            : 'Đã tắt gạch chân đáp án đúng trong file Word.'
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Không thể cập nhật tệp Word.';
+        setErrorMessage(msg);
+      }
+    }
   };
 
   const handleMathFormatChange = async (nextFormat: MathOutputFormat) => {
     setMathFormat(nextFormat);
-    await rebuildWordAfterOptionChange(
-      { format: nextFormat },
-      nextFormat === 'latex'
-        ? 'Đang cập nhật tệp Word sang dạng Toggle TeX (${...}$)...'
-        : 'Đang cập nhật tệp Word sang dạng Equation (OMML)...',
-      nextFormat === 'latex'
-        ? 'Đã cập nhật file Word sang dạng Toggle TeX (${...}$).'
-        : 'Đã cập nhật file Word sang dạng Equation (OMML).'
-    );
+    const activePages =
+      editedPages ??
+      (inputSource === 'paste' && pastedLatex.trim()
+        ? normalizePagesInlineMath(parsePastedLatexToPages(pastedLatex, 'auto', figureAssets))
+        : extractedPages.length > 0
+        ? extractedPages
+        : []);
+    if (activePages.length > 0 && !isConverting && !isExportingPaste) {
+      try {
+        setStatusMessage(
+          nextFormat === 'latex'
+            ? 'Đang cập nhật tệp Word sang dạng Toggle TeX (${...}$)...'
+            : 'Đang cập nhật tệp Word sang dạng Equation (OMML)...'
+        );
+        await rebuildDocxExport(
+          activePages,
+          sourceFilename ||
+            (inputSource === 'docx'
+              ? 'tai_lieu_word'
+              : inputSource === 'paste'
+              ? 'tai_lieu_latex'
+              : 'tai_lieu_toan'),
+          addPageBreaks,
+          choiceLayout,
+          nextFormat,
+          isExTestLatexInput && underlineCorrectChoice
+        );
+        setStatusMessage(
+          nextFormat === 'latex'
+            ? 'Đã cập nhật file Word sang dạng Toggle TeX (${...}$).'
+            : 'Đã cập nhật file Word sang dạng Equation (OMML).'
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Không thể cập nhật tệp Word.';
+        setErrorMessage(msg);
+      }
+    }
   };
 
   const handleConvertStructuredPages = async (
@@ -1092,6 +1115,7 @@ export default function App() {
 
       setProgressPct(100);
       setStatusMessage(targetFormat === 'latex' ? successMsgLatex : successMsgOmml);
+      recordConversionSuccess();
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Không thể chuyển đổi nội dung.';
       setErrorMessage(msg);
@@ -1132,22 +1156,6 @@ export default function App() {
     setSelectedPageNum(1);
     setActiveTab('original');
   };
-
-  const handleClearSelectedFile = useCallback(() => {
-    resetResults();
-    setSourceFilename('');
-    setRenderedPages([]);
-    setSelectedPageNum(1);
-    setPendingDocxPages([]);
-    setPastedLatex('');
-    setFigureAssets({});
-    setInputSource('file');
-    setDocxFileName('tai_lieu_toan.docx');
-    setActiveTab('preview');
-    if (fileInputRef.current) {
-      fileInputRef.current.value = '';
-    }
-  }, [resetResults]);
 
   const handleStartConversion = async () => {
     const hasFile = renderedPages.length > 0;
@@ -1393,6 +1401,7 @@ export default function App() {
 
       setProgressPct(100);
       setStatusMessage('Hoàn tất chuyển đổi! File Word đã sẵn sàng để tải xuống.');
+      recordConversionSuccess();
       setActiveTab('preview');
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Đã xảy ra lỗi khi chuyển đổi.';
@@ -1818,31 +1827,17 @@ export default function App() {
             >
               Cơ chế OMML
             </a>
+            <span
+              className="text-slate-600 whitespace-nowrap shrink-0 pl-4 border-l border-slate-200"
+              title="Thống kê số lượt người dùng đã chuyển đổi thành công"
+            >
+              Số Lượt:{' '}
+              <strong className="font-semibold text-emerald-700 tabular-nums">
+                {conversionSuccessCount.toLocaleString('vi-VN')}
+              </strong>{' '}
+              thành công
+            </span>
           </nav>
-
-          <div className="flex items-center gap-2 shrink-0">
-            {displayPreviewPages.length > 0 && (
-              <button
-                type="button"
-                onClick={() => void handleDownloadLatexZip()}
-                disabled={isExportingLatexZip || isConverting}
-                className="inline-flex items-center gap-1.5 px-2.5 py-0.5 text-xs font-semibold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
-              >
-                <FileArchive className="w-3.5 h-3.5" />
-                Tải .tex (.zip)
-              </button>
-            )}
-            {docxDownloadUrl && (
-              <a
-                href={docxDownloadUrl}
-                download={docxFileName}
-                className="inline-flex items-center gap-1.5 px-2.5 py-0.5 text-xs font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-md transition-colors whitespace-nowrap shrink-0"
-              >
-                <Download className="w-3.5 h-3.5" />
-                Tải xuống file Word
-              </a>
-            )}
-          </div>
         </div>
       </header>
 
@@ -1888,7 +1883,7 @@ export default function App() {
                 </div>
               ) : (
                 <>
-                  <div className="flex items-center gap-2 min-w-0 flex-1">
+                  <div className="flex items-center gap-2 min-w-0">
                     <Upload className="w-4 h-4 text-slate-500 shrink-0" />
                     <div className="min-w-0">
                       <div className="text-xs font-medium text-slate-800 truncate">
@@ -1903,21 +1898,6 @@ export default function App() {
                       </div>
                     </div>
                   </div>
-                  {(sourceFilename || renderedPages.length > 0 || pendingDocxPages.length > 0) && (
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleClearSelectedFile();
-                      }}
-                      disabled={isConverting || isLoadingFile}
-                      title="Tắt file đang chọn"
-                      aria-label="Tắt file đang chọn"
-                      className="p-1 rounded-md text-slate-400 hover:text-red-600 hover:bg-red-50 disabled:opacity-50 transition-colors shrink-0 cursor-pointer"
-                    >
-                      <X className="w-4 h-4" />
-                    </button>
-                  )}
                 </>
               )}
             </div>
@@ -1988,8 +1968,8 @@ export default function App() {
               <input
                 type="checkbox"
                 checked={addPageBreaks}
-                onChange={(e) => void handleAddPageBreaksChange(e.target.checked)}
-                disabled={isConverting || isExportingPaste}
+                onChange={(e) => setAddPageBreaks(e.target.checked)}
+                disabled={isConverting}
                 className="mt-0.5 h-4 w-4 rounded border-slate-300 text-blue-700 focus:ring-blue-600"
               />
               <span className="text-sm text-slate-700">
@@ -2247,46 +2227,17 @@ export default function App() {
 
               {docxDownloadUrl && (
                 <div className="pt-1 space-y-2">
-                  <div
-                    className={`flex items-center gap-1.5 text-xs font-medium ${
-                      isSyncingEditedWord ? 'text-blue-700' : 'text-emerald-700'
-                    }`}
-                  >
-                    {isSyncingEditedWord ? (
-                      <Loader2 className="w-4 h-4 shrink-0 animate-spin" />
-                    ) : (
-                      <CheckCircle2 className="w-4 h-4 shrink-0" />
-                    )}
-                    <span>
-                      {isSyncingEditedWord
-                        ? 'Đang cập nhật tệp Word theo tùy chọn mới...'
-                        : 'Tạo tệp Word thành công'}
-                    </span>
+                  <div className="flex items-center gap-1.5 text-xs font-medium text-emerald-700">
+                    <CheckCircle2 className="w-4 h-4 shrink-0" />
+                    <span>Tạo tệp Word thành công</span>
                   </div>
                   <a
-                    href={isSyncingEditedWord ? undefined : docxDownloadUrl}
-                    download={isSyncingEditedWord ? undefined : docxFileName}
-                    aria-disabled={isSyncingEditedWord}
-                    onClick={(e) => {
-                      if (isSyncingEditedWord) e.preventDefault();
-                    }}
-                    className={`w-full h-11 inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-semibold text-white rounded-lg transition-colors ${
-                      isSyncingEditedWord
-                        ? 'bg-emerald-700/60 cursor-wait pointer-events-none'
-                        : 'bg-emerald-700 hover:bg-emerald-800'
-                    }`}
+                    href={docxDownloadUrl}
+                    download={docxFileName}
+                    className="w-full h-11 inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg transition-colors"
                   >
-                    {isSyncingEditedWord ? (
-                      <>
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                        Đang tạo lại file Word...
-                      </>
-                    ) : (
-                      <>
-                        <Download className="w-4 h-4" />
-                        Tải xuống file Word
-                      </>
-                    )}
+                    <Download className="w-4 h-4" />
+                    Tải xuống file Word
                   </a>
                 </div>
               )}
@@ -2575,16 +2526,6 @@ export default function App() {
                         + Dán thêm trang ảnh
                       </button>
                     )}
-                    <button
-                      type="button"
-                      onClick={handleClearSelectedFile}
-                      disabled={isConverting || isLoadingFile}
-                      title="Tắt file đang chọn"
-                      className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 disabled:opacity-50 rounded-lg transition-colors cursor-pointer"
-                    >
-                      <X className="w-3.5 h-3.5" />
-                      Tắt file
-                    </button>
                   </div>
                 </section>
                 {activeTab === 'original' ? (
