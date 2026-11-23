@@ -6,7 +6,12 @@ import type {
   TableCellData,
   TabStopSpec,
 } from '../types/document.ts';
-import { evaluateTikzMathExpr, renderLatexPictureToSvgDataUrl } from './tikzRenderer.ts';
+import {
+  computeTdplotMainCoordsStyle,
+  evaluateTikzMathExpr,
+  extractTikzStylesFromSetBody,
+  renderLatexPictureToSvgDataUrl,
+} from './tikzRenderer.ts';
 
 export type LatexPasteMode = 'auto' | 'bare_latex';
 
@@ -151,6 +156,7 @@ interface InlineStyle {
   bold?: boolean;
   italic?: boolean;
   underline?: boolean;
+  vert_align?: 'subscript' | 'superscript';
   font_size_pt?: number;
   color?: string;
 }
@@ -258,6 +264,7 @@ interface ParserContext {
   lastNumberedKind: string | null;
   customTheorems: Record<string, CustomTheoremDef>;
   customColors: Record<string, string>;
+  customTikzStyles: Record<string, string>;
   defaultTasksLabel?: string;
   figureAssets?: Record<string, EmbeddedFigureAsset>;
   pageConfig: DocumentPageConfig;
@@ -267,7 +274,7 @@ function createParserContext(
   initial?: Partial<
     Pick<
       ParserContext,
-      'isVietnamese' | 'labels' | 'labelKinds' | 'cites' | 'customTheorems' | 'customColors' | 'defaultTasksLabel' | 'figureAssets' | 'pageConfig'
+      'isVietnamese' | 'labels' | 'labelKinds' | 'cites' | 'customTheorems' | 'customColors' | 'customTikzStyles' | 'defaultTasksLabel' | 'figureAssets' | 'pageConfig'
     >
   >
 ): ParserContext {
@@ -285,6 +292,7 @@ function createParserContext(
     lastNumberedKind: null,
     customTheorems: initial?.customTheorems ?? {},
     customColors: initial?.customColors ?? {},
+    customTikzStyles: initial?.customTikzStyles ?? {},
     defaultTasksLabel: initial?.defaultTasksLabel,
     figureAssets: initial?.figureAssets,
     pageConfig: initial?.pageConfig ?? createDefaultPageConfig(),
@@ -642,10 +650,62 @@ function stripLatexComments(raw: string): string {
   });
 
   let joined = cleanedLines.join('\n');
+  joined = stripCommentEnvironments(joined, new Set(['comment']));
   for (let idx = 0; idx < verbatimStore.length; idx++) {
     joined = joined.replace(`\x00VERBATIM_${idx}\x00`, () => verbatimStore[idx]);
   }
   return joined;
+}
+
+function stripCommentEnvironments(src: string, commentEnvs: Set<string>): string {
+  if (commentEnvs.size === 0 || !src.includes('\\begin{')) return src;
+  const verbatimStore: string[] = [];
+  let out = src.replace(
+    /\\begin\{(verbatim\*?|lstlisting|minted)\}([\s\S]*?)\\end\{\1\}/g,
+    (full) => {
+      const token = `\x00VERBATIM_CMT_${verbatimStore.length}\x00`;
+      verbatimStore.push(full);
+      return token;
+    }
+  );
+
+  for (const envName of commentEnvs) {
+    const escaped = envName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const openRe = new RegExp(`\\\\begin\\{${escaped}\\}`);
+    const closeToken = `\\end{${envName}}`;
+    let safety = 0;
+    let m: RegExpExecArray | null;
+    while ((m = openRe.exec(out)) !== null && safety < 200) {
+      safety++;
+      const startIdx = m.index;
+      const afterOpen = startIdx + m[0].length;
+      const endIdx = findMatchingEnvEnd(out, envName, afterOpen);
+      if (endIdx !== -1) {
+        const afterClose = endIdx + closeToken.length;
+        // Avoid synthesizing a blank line when the comment block occupied its own line(s)
+        const lineBefore = out.slice(0, startIdx);
+        const lineAfter = out.slice(afterClose);
+        const startsAtLine = /(?:^|\n)[ \t]*$/.test(lineBefore);
+        const endsAtLine = /^[ \t]*\n/.test(lineAfter);
+        if (startsAtLine && endsAtLine) {
+          out = lineBefore.replace(/[ \t]*$/, '') + lineAfter.replace(/^[ \t]*\n/, '');
+        } else {
+          out = lineBefore + lineAfter;
+        }
+      } else {
+        // Unclosed \begin{comment} comments out the remainder of the document/snippet
+        out = out.slice(0, startIdx).replace(/[ \t]*$/, '');
+        break;
+      }
+    }
+    // Strip any stray closing \end{comment}
+    out = out.replace(new RegExp(`\\\\end\\{${escaped}\\}[ \\t]*\\n?`, 'g'), '');
+  }
+
+  for (let idx = 0; idx < verbatimStore.length; idx++) {
+    out = out.replace(`\x00VERBATIM_CMT_${idx}\x00`, () => verbatimStore[idx]);
+  }
+  return out;
 }
 
 interface ExtractedMacro {
@@ -1379,6 +1439,7 @@ function preprocessDocumentAndMacros(raw: string): {
   isVietnamese: boolean;
   customTheorems: Record<string, CustomTheoremDef>;
   customColors: Record<string, string>;
+  customTikzStyles: Record<string, string>;
   defaultTasksLabel?: string;
   pageConfig: DocumentPageConfig;
 } {
@@ -1430,6 +1491,7 @@ function preprocessDocumentAndMacros(raw: string): {
   const envMacros: ExtractedEnvMacro[] = [];
   const customTheorems: Record<string, CustomTheoremDef> = {};
   const customColors: Record<string, string> = {};
+  const customTikzStyles: Record<string, string> = {};
 
   const parseMacrosIntoMap = (src: string, target: Map<string, ExtractedMacro>) => {
     // Collect preamble macros in source order (excluding \def\f(#1){...} TikZ function defs)
@@ -1651,6 +1713,27 @@ function preprocessDocumentAndMacros(raw: string): {
     }
   }
 
+  // Parse \tikzset{...}, \tikzstyle{name}=[...], and \tdplotsetmaincoords{theta}{phi}
+  const tikzSetDeclRe = /\\tikzset\s*\{/g;
+  while ((m = tikzSetDeclRe.exec(macroSrc)) !== null) {
+    const br = readBalancedBraces(macroSrc, m.index + m[0].length - 1);
+    if (br) extractTikzStylesFromSetBody(br.content, customTikzStyles);
+  }
+  const tikzStyleDeclRe = /\\tikzstyle\s*\{([^}]+)\}\s*=\s*\[/g;
+  while ((m = tikzStyleDeclRe.exec(macroSrc)) !== null) {
+    const sName = m[1].trim();
+    const brk = readBalancedBrackets(macroSrc, m.index + m[0].length - 1);
+    if (sName && brk) customTikzStyles[sName] = brk.content.trim();
+  }
+  const tdplotDeclRe = /\\tdplotsetmaincoords\s*\{([^}]+)\}\s*\{([^}]+)\}/g;
+  while ((m = tdplotDeclRe.exec(macroSrc)) !== null) {
+    const th = evaluateTikzMathExpr(m[1]);
+    const ph = evaluateTikzMathExpr(m[2]);
+    if (th !== null && ph !== null) {
+      customTikzStyles['tdplot_main_coords'] = computeTdplotMainCoordsStyle(th, ph);
+    }
+  }
+
   // Parse \settasks{label=...}
   let defaultTasksLabel: string | undefined;
   const setTasksRe = /\\settasks\s*\{/g;
@@ -1662,13 +1745,75 @@ function preprocessDocumentAndMacros(raw: string): {
     }
   }
 
+  // Collect \excludecomment{envName} declarations
+  const excludedCommentEnvs = new Set<string>(['comment']);
+  const excludeCmtRe = /\\excludecomment\s*\{([^}]+)\}/g;
+  while ((m = excludeCmtRe.exec(macroSrc)) !== null) {
+    const eName = m[1].trim();
+    if (eName) excludedCommentEnvs.add(eName);
+  }
+  if (excludedCommentEnvs.size > 1) {
+    body = stripCommentEnvironments(body, excludedCommentEnvs);
+  }
+
+  // Collect declared LaTeX counters (\newcounter{name}[parent] and preamble counter updates)
+  const trackedCounters = new Set<string>();
+  const counterValues: Record<string, number> = {};
+  const counterResetChildren: Record<string, Set<string>> = {};
+  const registerCounter = (name: string, parent?: string) => {
+    const c = name.trim();
+    if (!c) return;
+    trackedCounters.add(c);
+    if (counterValues[c] === undefined) counterValues[c] = 0;
+    if (parent && parent.trim()) {
+      const p = parent.trim();
+      if (!counterResetChildren[p]) counterResetChildren[p] = new Set();
+      counterResetChildren[p].add(c);
+    }
+  };
+  const newCtrDeclRe = /\\newcounter\s*\{([^}]+)\}(?:\s*\[([^\]]*)\])?/g;
+  while ((m = newCtrDeclRe.exec(macroSrc)) !== null) {
+    registerCounter(m[1], m[2]);
+  }
+  const refCtrDeclRe = /\\(?:refstepcounter|stepcounter|setcounter|addtocounter)\s*\{([^}]+)\}/g;
+  while ((m = refCtrDeclRe.exec(macroSrc)) !== null) {
+    const c = m[1].trim();
+    if (c && !/^(?:secnumdepth|tocdepth|page|enumi+|mpfootnote|footnote)$/.test(c)) {
+      registerCounter(c);
+    }
+  }
+  if (preamble) {
+    let preTop = stripBalancedCommand(preamble, /\\(?:re)?newenvironment\*?(?![a-zA-Z])/, 3, true);
+    preTop = stripBalancedCommand(
+      preTop,
+      /\\(?:(?:re|provide)?newcommand\*?|DeclareRobustCommand\*?)(?![a-zA-Z])/,
+      2,
+      true
+    );
+    const preCtrOpRe = /\\(setcounter|addtocounter|stepcounter|refstepcounter)\s*\{([^}]+)\}(?:\s*\{([^}]*)\})?/g;
+    while ((m = preCtrOpRe.exec(preTop)) !== null) {
+      const op = m[1];
+      const cname = m[2].trim();
+      if (!trackedCounters.has(cname)) continue;
+      if (op === 'stepcounter' || op === 'refstepcounter') {
+        counterValues[cname] = (counterValues[cname] ?? 0) + 1;
+      } else if (op === 'setcounter') {
+        const v = parseInt((m[3] ?? '').trim(), 10);
+        if (Number.isFinite(v)) counterValues[cname] = v;
+      } else if (op === 'addtocounter') {
+        const v = parseInt((m[3] ?? '').trim(), 10);
+        if (Number.isFinite(v)) counterValues[cname] = (counterValues[cname] ?? 0) + v;
+      }
+    }
+  }
+
   // Safely strip non-macro preamble commands with balanced braces
   // (macro definitions are processed sequentially in scoped order below so per-figure \def/\pgfmathsetmacro never leaks globally)
   const preambleThreeArgCmds = /\\(?:definecolor|providecolor|xdefinecolor|DeclareMathAlphabet|SetMathAlphabet)(?![a-zA-Z])/;
   const preambleTwoArgCmds =
-    /\\(?:setlength|addtolength|setcounter|addtocounter|numberwithin|colorlet|fontsize|lstdefinestyle|DeclareTColorBox|newtcbox|inputansbox|inputans)(?![a-zA-Z])/;
+    /\\(?:setlength|addtolength|numberwithin|colorlet|fontsize|lstdefinestyle|DeclareTColorBox|newtcbox|inputansbox|inputans|tdplotsetmaincoords)(?![a-zA-Z])/;
   const preambleOneArgCmds =
-    /\\(?:documentclass|usepackage|RequirePackage|geometry|hypersetup|lstset|tikzset|pgfplotsset|tcbset|tcbuselibrary|setlist|settasks|pagestyle|thispagestyle|pagenumbering|bibliographystyle|bibliography|addbibresource|linespread|theoremstyle|newtheoremstyle|graphicspath|DeclareUnicodeCharacter|sisetup|captionsetup|AtBeginDocument|fancyhf|fancyhead|fancyfoot|rhead|lhead|chead|rfoot|lfoot|cfoot|setmainfont|setsansfont|setmonofont|newfontfamily|selectlanguage|usetikzlibrary|usepgfplotslibrary|tkzSetUpPoint|tkzSetUpLine|tkzSetUpLabel|tkzSetUpStyle|tkzTabSetup|titleformat|titlespacing|newtheorem\*?|input|include|allowdisplaybreaks|qedsymbol|showansEX|showans|hideansEX|hideans|ansEX|Opensolutionfile|Closesolutionfile|writelist)(?![a-zA-Z])/;
+    /\\(?:documentclass|usepackage|RequirePackage|geometry|hypersetup|lstset|tikzset|pgfplotsset|tcbset|tcbuselibrary|setlist|settasks|pagestyle|thispagestyle|pagenumbering|bibliographystyle|bibliography|addbibresource|linespread|theoremstyle|newtheoremstyle|graphicspath|DeclareUnicodeCharacter|sisetup|captionsetup|AtBeginDocument|fancyhf|fancyhead|fancyfoot|rhead|lhead|chead|rfoot|lfoot|cfoot|setmainfont|setsansfont|setmonofont|newfontfamily|selectlanguage|usetikzlibrary|usepgfplotslibrary|tkzSetUpPoint|tkzSetUpLine|tkzSetUpLabel|tkzSetUpStyle|tkzTabSetup|titleformat|titlespacing|newtheorem\*?|input|include|allowdisplaybreaks|qedsymbol|showansEX|showans|hideansEX|hideans|ansEX|Opensolutionfile|Closesolutionfile|writelist|excludecomment|includecomment)(?![a-zA-Z])/;
   const preambleZeroArgCmds =
     /\\(?:onehalfspacing|doublespacing|singlespacing|frenchspacing|makeatletter|makeatother|tableofcontents|listoffigures|listoftables|printbibliography|phantomsection|frontmatter|mainmatter|backmatter|sloppy|fussy|raggedbottom|flushbottom|selectfont|hidesolution|showsolution)(?![a-zA-Z])\s*/g;
 
@@ -1677,6 +1822,8 @@ function preprocessDocumentAndMacros(raw: string): {
   body = stripBalancedCommand(body, preambleTwoArgCmds, 2, true);
   body = stripBalancedCommand(body, preambleOneArgCmds, 1, true);
   body = body.replace(preambleZeroArgCmds, '');
+
+  const customEnvNames = new Set(envMacros.map((em) => em.name));
 
   // Expand custom \newenvironment usages if not a built-in/theorem environment
   for (const em of envMacros) {
@@ -1707,7 +1854,22 @@ function preprocessDocumentAndMacros(raw: string): {
       });
       const inner = body.slice(innerStart, endIdx);
       const closeLen = `\\end{${em.name}}`.length;
-      body = body.slice(0, match.index) + `${beg}\n${inner}\n${end}` + body.slice(endIdx + closeLen);
+      // Preserve inline flow without synthesizing fake blank lines (\n\n) between beg, inner, and end
+      const cleanBeg = beg.replace(/\n[ \t]*$/, '');
+      const cleanInner = inner.replace(/^[ \t]*\n[ \t]*(?![ \t]*\n)/, ' ').replace(/\n[ \t]*$/, '');
+      const cleanEnd = end.replace(/^[ \t]*\n/, '');
+      const sepBeg =
+        cleanBeg && cleanInner && /\\[a-zA-Z]+$/.test(cleanBeg) && /^[a-zA-Z]/.test(cleanInner)
+          ? ' '
+          : '';
+      const sepEnd =
+        cleanInner && cleanEnd && /\\[a-zA-Z]+$/.test(cleanInner) && /^[a-zA-Z]/.test(cleanEnd)
+          ? ' '
+          : '';
+      body =
+        body.slice(0, match.index) +
+        `${cleanBeg}${sepBeg}${cleanInner}${sepEnd}${cleanEnd}` +
+        body.slice(endIdx + closeLen);
     }
   }
 
@@ -2316,6 +2478,164 @@ function preprocessDocumentAndMacros(raw: string): {
     .replace(/\\ifnum\s*\\count\d+\s*(?:<=|>=|<|>|=)\s*-?\d+\s*/g, '')
     .replace(/\\repeat(?![a-zA-Z])\s*/g, '');
 
+  // Strip any \begin{comment}...\end{comment} or excluded comment envs introduced by macro expansion
+  body = stripCommentEnvironments(body, excludedCommentEnvs);
+
+  // Sequentially evaluate LaTeX counters (\newcounter, \setcounter, \addtocounter, \stepcounter, \refstepcounter, \the<name>, \arabic/\alph/\Alph/\roman/\Roman)
+  if (
+    /\\(?:newcounter|setcounter|addtocounter|stepcounter|refstepcounter|arabic|alph|Alph|roman|Roman)(?![a-zA-Z])/.test(
+      body
+    ) ||
+    trackedCounters.size > 0
+  ) {
+    const formatCtrVal = (
+      n: number,
+      fmt: 'arabic' | 'alph' | 'Alph' | 'roman' | 'Roman'
+    ): string => {
+      if (fmt === 'arabic') return String(n);
+      if (fmt === 'alph') return n >= 1 && n <= 26 ? String.fromCharCode(96 + n) : String(n);
+      if (fmt === 'Alph') return n >= 1 && n <= 26 ? String.fromCharCode(64 + n) : String(n);
+      const toRom = (num: number): string => {
+        if (num <= 0 || num >= 4000) return String(num);
+        const tbl: Array<[number, string]> = [
+          [1000, 'M'], [900, 'CM'], [500, 'D'], [400, 'CD'],
+          [100, 'C'], [90, 'XC'], [50, 'L'], [40, 'XL'],
+          [10, 'X'], [9, 'IX'], [5, 'V'], [4, 'IV'], [1, 'I'],
+        ];
+        let r = '';
+        let v = num;
+        for (const [val, sym] of tbl) {
+          while (v >= val) {
+            r += sym;
+            v -= val;
+          }
+        }
+        return r;
+      };
+      const rom = toRom(n);
+      return fmt === 'roman' ? rom.toLowerCase() : rom;
+    };
+
+    const resetChildCounters = (parentName: string) => {
+      const children = counterResetChildren[parentName];
+      if (!children) return;
+      children.forEach((child) => {
+        counterValues[child] = 0;
+        resetChildCounters(child);
+      });
+    };
+
+    const ctrProtected: string[] = [];
+    const safeCtrSrc = body.replace(
+      /\\begin\{(verbatim\*?|lstlisting|minted|tikzpicture|pgfpicture)\}([\s\S]*?)\\end\{\1\}/g,
+      (full) => {
+        const tok = `\x00CTRPROT_${ctrProtected.length}\x00`;
+        ctrProtected.push(full);
+        return tok;
+      }
+    );
+
+    // Match counter commands, \the<tracked>, formatting commands, and section headers (for parent reset)
+    const theNames = [...trackedCounters]
+      .filter((n) => /^[a-zA-Z]+$/.test(n))
+      .sort((a, b) => b.length - a.length)
+      .map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    const theAlt = theNames.length > 0 ? `|\\\\the(?:${theNames.join('|')})(?![a-zA-Z])` : '';
+    const ctrTokenRe = new RegExp(
+      `\\\\(?:newcounter\\s*\\{([^}]+)\\}(?:\\s*\\[([^\\]]*)\\])?|(?:refstepcounter|stepcounter)\\s*\\{([^}]+)\\}|(setcounter|addtocounter)\\s*\\{([^}]+)\\}\\s*\\{([^}]*)\\}|(arabic|alph|Alph|roman|Roman)\\s*\\{([^}]+)\\}|(section|subsection|subsubsection)\\*?(?![a-zA-Z]))${theAlt}`,
+      'g'
+    );
+
+    const isBuiltinExCtr = (c: string) =>
+      (c === 'ex' || c === 'bt' || c === 'vd') && !customEnvNames.has(c);
+
+    let evalOut = '';
+    let lastPos = 0;
+    let cm: RegExpExecArray | null;
+    while ((cm = ctrTokenRe.exec(safeCtrSrc)) !== null) {
+      const fullMatch = cm[0];
+      const matchStart = cm.index;
+      const matchEnd = matchStart + fullMatch.length;
+
+      // Section/subsection reset hook (keep token intact)
+      if (cm[9]) {
+        resetChildCounters(cm[9]);
+        continue;
+      }
+
+      // Preserve \setcounter / \addtocounter for built-in ex/bt/vd environments so parseBodyBlocks updates ctx.counters
+      if (cm[4] && isBuiltinExCtr(cm[5].trim())) {
+        continue;
+      }
+
+      // Skip formatting commands (\arabic{...}, etc.) for untracked counters (e.g. \arabic* in enumitem)
+      if (cm[7] && !trackedCounters.has(cm[8].trim())) {
+        continue;
+      }
+
+      let replacement = '';
+      let isSilentCmd = false;
+
+      if (cm[1] !== undefined) {
+        // \newcounter{name}[parent]
+        registerCounter(cm[1], cm[2]);
+        isSilentCmd = true;
+      } else if (cm[3] !== undefined) {
+        // \stepcounter{name} or \refstepcounter{name}
+        const cname = cm[3].trim();
+        counterValues[cname] = (counterValues[cname] ?? 0) + 1;
+        resetChildCounters(cname);
+        isSilentCmd = true;
+      } else if (cm[4] !== undefined) {
+        // \setcounter{name}{val} or \addtocounter{name}{val}
+        const cname = cm[5].trim();
+        const v = parseInt(cm[6].trim(), 10);
+        if (Number.isFinite(v)) {
+          if (cm[4] === 'setcounter') {
+            counterValues[cname] = v;
+            resetChildCounters(cname);
+          } else {
+            counterValues[cname] = (counterValues[cname] ?? 0) + v;
+          }
+        }
+        isSilentCmd = true;
+      } else if (cm[7] !== undefined) {
+        // \arabic{name} / \alph{name} / ...
+        const cname = cm[8].trim();
+        replacement = formatCtrVal(
+          counterValues[cname] ?? 0,
+          cm[7] as 'arabic' | 'alph' | 'Alph' | 'roman' | 'Roman'
+        );
+      } else if (fullMatch.startsWith('\\the')) {
+        const cname = fullMatch.slice(4);
+        replacement = String(counterValues[cname] ?? 0);
+      }
+
+      // When removing a silent counter command that stood alone on its own line, consume trailing newline to avoid creating a fake blank line
+      let consumeEnd = matchEnd;
+      let prefixSlice = safeCtrSrc.slice(lastPos, matchStart);
+      if (isSilentCmd) {
+        const trailingRest = safeCtrSrc.slice(matchEnd);
+        const beforeHasOnlyIndent = /(?:^|\n)[ \t]*$/.test(evalOut + prefixSlice);
+        const afterIsLineEnd = /^[ \t]*\n/.exec(trailingRest);
+        if (beforeHasOnlyIndent && afterIsLineEnd) {
+          prefixSlice = prefixSlice.replace(/[ \t]*$/, '');
+          consumeEnd = matchEnd + afterIsLineEnd[0].length;
+          ctrTokenRe.lastIndex = consumeEnd;
+        }
+      }
+
+      evalOut += prefixSlice + replacement;
+      lastPos = consumeEnd;
+    }
+    evalOut += safeCtrSrc.slice(lastPos);
+
+    for (let idx = 0; idx < ctrProtected.length; idx++) {
+      evalOut = evalOut.replace(`\x00CTRPROT_${idx}\x00`, () => ctrProtected[idx]);
+    }
+    body = evalOut;
+  }
+
   // Break mid-line \noindent (e.g., "Chọn B.\noindent\textbf{Câu 5:}") onto a new line
   body = body.replace(/([^\s\n{[\\%])\s*\\noindent(?![a-zA-Z])\s*/g, '$1\n');
   if (pageConfig.defaultParIndentPt > 0) {
@@ -2343,6 +2663,7 @@ function preprocessDocumentAndMacros(raw: string): {
     isVietnamese,
     customTheorems,
     customColors,
+    customTikzStyles,
     defaultTasksLabel,
     pageConfig,
   };
@@ -2844,7 +3165,7 @@ function unescapeLatexTextProse(s: string, isVietnamese = true): string {
     .replace(/\\([%&_#${}])/g, '$1')
     .replace(/\\(?:qquad)/g, '    ')
     .replace(/\\(?:quad|enspace)/g, '  ')
-    .replace(/\\[,;:! ]/g, ' ')
+    .replace(/\\[,;:! \t\n]/g, ' ')
     .replace(/~/g, ' ')
     .replace(/---/g, '—')
     .replace(/--/g, '–')
@@ -2868,6 +3189,7 @@ function makeTextSegment(content: string, style: InlineStyle): InlineSegment {
     ...(style.bold ? { bold: true } : {}),
     ...(style.italic ? { italic: true } : {}),
     ...(style.underline ? { underline: true } : {}),
+    ...(style.vert_align ? { vert_align: style.vert_align } : {}),
     ...(style.font_size_pt ? { font_size_pt: style.font_size_pt } : {}),
     ...(style.color ? { color: style.color } : {}),
   };
@@ -3374,8 +3696,10 @@ function parseInlineSegmentText(
             bold: nextBold,
             italic: nextItalic,
             underline: currentStyle.underline || cmd === 'underline' || cmd === 'ul' || cmd === 'uline',
-            ...(cmd === 'textsuperscript' || cmd === 'textsubscript'
-              ? { font_size_pt: Math.max(8, (currentStyle.font_size_pt ?? 12) - 3) }
+            ...(cmd === 'textsuperscript'
+              ? { vert_align: 'superscript' as const }
+              : cmd === 'textsubscript'
+              ? { vert_align: 'subscript' as const }
               : {}),
           };
           const innerContent =
@@ -5714,6 +6038,21 @@ function parseBodyBlocks(
         continue;
       }
 
+      // Built-in counter resets (\setcounter{ex}{0}, \addtocounter{ex}{1})
+      const builtinCtrM = rest.match(/^\\(setcounter|addtocounter)\s*\{([^}]+)\}\s*\{([^}]*)\}[ \t]*\n?/);
+      if (builtinCtrM) {
+        flushTextSlice(i);
+        const cname = builtinCtrM[2].trim();
+        const val = parseInt(builtinCtrM[3].trim(), 10);
+        if (cname && Number.isFinite(val)) {
+          if (builtinCtrM[1] === 'setcounter') ctx.counters[cname] = val;
+          else ctx.counters[cname] = (ctx.counters[cname] ?? 0) + val;
+        }
+        i += builtinCtrM[0].length;
+        textStart = i;
+        continue;
+      }
+
       // Multi-line or single-line consecutive \makebox[w][pos]{...} / \framebox[w][pos]{...} blocks
       if (/^\\(?:makebox|framebox)\*/.test(rest) || /^\\(?:makebox|framebox)(?:\s*\[|\s*\{)/.test(rest)) {
         if (atFreshSwitchStart) {
@@ -5835,7 +6174,7 @@ function parseBodyBlocks(
           if (br) {
             flushTextSlice(i);
             const tikzBody = tikzOpts ? `[${tikzOpts}]\n${br.content}` : br.content;
-            const rendered = renderLatexPictureToSvgDataUrl('tikzpicture', tikzBody, ctx.customColors);
+            const rendered = renderLatexPictureToSvgDataUrl('tikzpicture', tikzBody, ctx.customColors, ctx.customTikzStyles);
             if (rendered) {
               pushBlock({
                 block_type: 'figure',
@@ -7151,7 +7490,8 @@ function parseBodyBlocks(
             const rendered = renderLatexPictureToSvgDataUrl(
               envName,
               envRawBody,
-              ctx.customColors
+              ctx.customColors,
+              ctx.customTikzStyles
             );
             if (rendered) {
               pushBlock({
@@ -7377,6 +7717,13 @@ function parseBodyBlocks(
               if (pIdx > 0) pushPageBreak();
               pg.forEach(pushBlock);
             });
+            i = endIdx + closeToken.length;
+            textStart = i;
+            continue;
+          }
+
+          if (envName === 'comment') {
+            flushTextSlice(i);
             i = endIdx + closeToken.length;
             textStart = i;
             continue;
@@ -7911,7 +8258,7 @@ export function promoteNumbersAndSignsToMathSegments(
     const nextSegType = idx + 1 < segments.length ? segments[idx + 1]?.type : undefined;
     const isLineStartAtZero = atBlockLineStart || Boolean(seg.tab_before);
 
-    if (seg.type === 'text' && seg.content) {
+    if (seg.type === 'text' && seg.content && !seg.vert_align) {
       const promoted = promoteSegmentNumbersAndSigns(seg, {
         prevSegType,
         nextSegType,
@@ -7924,8 +8271,8 @@ export function promoteNumbersAndSignsToMathSegments(
       atBlockLineStart = seg.content.endsWith('\n');
     } else {
       out.push(seg);
-      prevTextTail = '';
-      atBlockLineStart = false;
+      prevTextTail = seg.type === 'text' && seg.content ? (prevTextTail + seg.content).slice(-32) : '';
+      atBlockLineStart = seg.type === 'text' && seg.content ? seg.content.endsWith('\n') : false;
     }
   }
 
@@ -8064,6 +8411,7 @@ export function parsePastedLatexToPages(
     isVietnamese,
     customTheorems,
     customColors,
+    customTikzStyles,
     defaultTasksLabel,
     pageConfig,
   } = preprocessDocumentAndMacros(rawText);
@@ -8073,6 +8421,7 @@ export function parsePastedLatexToPages(
     isVietnamese,
     customTheorems,
     customColors,
+    customTikzStyles,
     defaultTasksLabel,
     figureAssets,
     pageConfig,

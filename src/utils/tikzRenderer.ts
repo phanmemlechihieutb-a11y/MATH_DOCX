@@ -9,6 +9,36 @@ interface Point2D {
   y: number;
 }
 
+interface Basis3D {
+  x: Point2D;
+  y: Point2D;
+  z: Point2D;
+}
+
+const DEFAULT_TIKZ_BASIS: Basis3D = {
+  x: { x: 1, y: 0 },
+  y: { x: 0, y: 1 },
+  z: { x: -0.385, y: -0.385 },
+};
+
+const BUILTIN_TIKZ_STYLES: Record<string, string> = {
+  '3dview': 'x={(1cm,0cm)}, y={(-0.55cm,-0.42cm)}, z={(0cm,1cm)}',
+  tdplot_main_coords: 'x={(-0.342cm,-0.321cm)}, y={(0.94cm,-0.117cm)}, z={(0cm,0.94cm)}',
+};
+
+export function computeTdplotMainCoordsStyle(thetaDeg: number, phiDeg: number): string {
+  const th = (thetaDeg * Math.PI) / 180;
+  const ph = (phiDeg * Math.PI) / 180;
+  const xx = Math.cos(ph);
+  const xy = -Math.cos(th) * Math.sin(ph);
+  const yx = Math.sin(ph);
+  const yy = Math.cos(th) * Math.cos(ph);
+  const zx = 0;
+  const zy = Math.sin(th);
+  const fmt = (v: number) => `${Math.abs(v) < 1e-6 ? 0 : Number(v.toFixed(4))}cm`;
+  return `x={(${fmt(xx)},${fmt(xy)})}, y={(${fmt(yx)},${fmt(yy)})}, z={(${fmt(zx)},${fmt(zy)})}`;
+}
+
 interface CustomMathFunc {
   params: string[];
   bodyExpr: string;
@@ -48,6 +78,8 @@ interface DrawStyle {
   roundedCorners?: number;
   customFuncs?: Record<string, CustomMathFunc>;
   trigRad?: boolean;
+  basis?: Basis3D;
+  definedStyles?: Record<string, string>;
 }
 
 interface SvgItem {
@@ -77,6 +109,8 @@ interface TikzScopeState {
   vars?: Record<string, number>;
   customFuncs?: Record<string, CustomMathFunc>;
   trigRad?: boolean;
+  basis?: Basis3D;
+  customStyles?: Record<string, string>;
 }
 
 const COLOR_MAP: Record<string, string> = {
@@ -1302,6 +1336,63 @@ function expandForeachLoops(
   return out;
 }
 
+export function extractTikzStylesFromSetBody(raw: string, target: Record<string, string>): void {
+  const parts = splitTopLevel(raw, ',').map((p) => p.trim()).filter(Boolean);
+  for (const part of parts) {
+    const eqIdx = part.indexOf('=');
+    if (eqIdx === -1) continue;
+    const key = part.slice(0, eqIdx).trim();
+    const val = part.slice(eqIdx + 1).trim();
+    const cleanVal = val.startsWith('{') && val.endsWith('}') ? val.slice(1, -1).trim() : val;
+    const styleM = key.match(/^(.+?)\/\.(style|append\s+style)$/);
+    if (styleM) {
+      const sName = styleM[1].trim();
+      if (!sName) continue;
+      if (styleM[2] === 'style') {
+        target[sName] = cleanVal;
+      } else {
+        target[sName] = target[sName] ? `${target[sName]}, ${cleanVal}` : cleanVal;
+      }
+    }
+  }
+}
+
+function parseBasisVector(
+  raw: string,
+  unitPx: number,
+  vars: Record<string, number>,
+  customFuncs: Record<string, CustomMathFunc>
+): Point2D | null {
+  let s = raw.trim();
+  if (s.startsWith('{') && s.endsWith('}')) s = s.slice(1, -1).trim();
+  if (!s.startsWith('(') || !s.endsWith(')')) return null;
+  const inner = s.slice(1, -1).trim();
+
+  // Polar basis vector: (angle:length)
+  const colonParts = splitTopLevel(inner, ':');
+  if (colonParts.length === 2) {
+    const angDeg = evalMathExpr(colonParts[0], vars, false, customFuncs);
+    const rad =
+      parseLengthToTikzUnits(colonParts[1], unitPx) ?? evalMathExpr(colonParts[1], vars, false, customFuncs);
+    if (angDeg !== null && rad !== null) {
+      const a = (angDeg * Math.PI) / 180;
+      return { x: rad * Math.cos(a), y: rad * Math.sin(a) };
+    }
+  }
+
+  // Cartesian basis vector: (vx, vy)
+  const xyParts = splitTopLevel(inner, ',');
+  if (xyParts.length === 2) {
+    const vx = parseLengthToTikzUnits(xyParts[0], unitPx) ?? evalMathExpr(xyParts[0], vars, false, customFuncs);
+    const vy = parseLengthToTikzUnits(xyParts[1], unitPx) ?? evalMathExpr(xyParts[1], vars, false, customFuncs);
+    if (vx !== null && vy !== null) {
+      return { x: vx, y: vy };
+    }
+  }
+
+  return null;
+}
+
 function parseOptionsString(
   rawOpts: string,
   base: TikzScopeState,
@@ -1318,7 +1409,6 @@ function parseOptionsString(
   step?: number;
   labelSpec?: string;
 } {
-  const parts = splitTopLevel(rawOpts, ',').map((p) => p.trim()).filter(Boolean);
   const style: DrawStyle & {
     scaleX?: number;
     scaleY?: number;
@@ -1338,227 +1428,300 @@ function parseOptionsString(
     fontWeight: base.fontWeight,
   };
 
-  for (const part of parts) {
-    // Handle TikZ quotes syntax like `"$30^\circ$"` or `"$\alpha$"' {opts}`
-    if (part.startsWith('"')) {
-      const endQ = part.indexOf('"', 1);
-      if (endQ !== -1) {
-        style.picText = part.slice(1, endQ);
-        const tail = part.slice(endQ + 1).trim();
-        const braceIdx = tail.indexOf('{');
-        if (braceIdx !== -1) {
-          const br = readBalanced(tail, braceIdx, '{', '}');
-          if (br) style.picTextOpts = br.content;
-        }
-        continue;
-      }
+  const activeStyles: Record<string, string> = {
+    ...BUILTIN_TIKZ_STYLES,
+    ...(base.customStyles || {}),
+  };
+
+  const ensureBasis = (): Basis3D => {
+    if (!style.basis) {
+      const src = base.basis ?? DEFAULT_TIKZ_BASIS;
+      style.basis = {
+        x: { ...src.x },
+        y: { ...src.y },
+        z: { ...src.z },
+      };
     }
+    return style.basis;
+  };
 
-    const eqIdx = part.indexOf('=');
-    const key = (eqIdx === -1 ? part : part.slice(0, eqIdx)).trim();
-    const val = (eqIdx === -1 ? '' : part.slice(eqIdx + 1)).trim();
-    const cleanVal = val.startsWith('{') && val.endsWith('}') ? val.slice(1, -1).trim() : val;
+  const applyOptString = (optsStr: string, depth: number) => {
+    if (depth > 4 || !optsStr.trim()) return;
+    const parts = splitTopLevel(optsStr, ',').map((p) => p.trim()).filter(Boolean);
 
-    if (key === '->' || key === '-latex' || key === '-stealth' || key === '->>') {
-      style.arrowEnd = true;
-    } else if (key === '<-' || key === 'latex-' || key === 'stealth-') {
-      style.arrowStart = true;
-    } else if (key === '<->' || key === 'latex-latex' || key === 'stealth-stealth') {
-      style.arrowStart = true;
-      style.arrowEnd = true;
-    } else if (key === 'clip') {
-      style.isClip = true;
-    } else if (key === 'ultra thin') style.strokeWidth = 0.5;
-    else if (key === 'very thin') style.strokeWidth = 0.7;
-    else if (key === 'thin') style.strokeWidth = 1.0;
-    else if (key === 'semithick') style.strokeWidth = 1.3;
-    else if (key === 'thick') style.strokeWidth = 1.8;
-    else if (key === 'very thick') style.strokeWidth = 2.4;
-    else if (key === 'ultra thick') style.strokeWidth = 3.2;
-    else if (key === 'line width' && cleanVal) {
-      const px = parseLengthToPx(cleanVal);
-      if (px !== null) style.strokeWidth = Math.max(0.4, px);
-    } else if (key === 'dashed') style.dashArray = '6,4';
-    else if (key === 'densely dashed') style.dashArray = '4,2.5';
-    else if (key === 'loosely dashed') style.dashArray = '6,6';
-    else if (key === 'dotted') style.dashArray = '1.8,3.2';
-    else if (key === 'densely dotted') style.dashArray = '1.6,2';
-    else if (key === 'loosely dotted') style.dashArray = '1.8,5.5';
-    else if (key === 'solid') style.dashArray = undefined;
-    else if (key === 'circle') style.circle = true;
-    else if (key === 'declare function' && cleanVal) {
-      if (!style.customFuncs) style.customFuncs = {};
-      parseDeclareFunctionsSpec(cleanVal, style.customFuncs);
-    } else if ((key === 'trig format' || key === 'trig format plots') && cleanVal === 'rad') {
-      style.trigRad = true;
-    } else if (key === 'color' && cleanVal) {
-      const c = resolveTikzColor(cleanVal, customColors);
-      if (c) style.stroke = c;
-    } else if (key === 'draw') {
-      if (cleanVal.toLowerCase() === 'none') {
-        style.hasDraw = false;
-        style.stroke = 'none';
-      } else {
-        style.hasDraw = true;
-        if (cleanVal) {
+    for (const part of parts) {
+      // Handle TikZ quotes syntax like `"$30^\circ$"` or `"$\alpha$"' {opts}`
+      if (part.startsWith('"')) {
+        const endQ = part.indexOf('"', 1);
+        if (endQ !== -1) {
+          style.picText = part.slice(1, endQ);
+          const tail = part.slice(endQ + 1).trim();
+          const braceIdx = tail.indexOf('{');
+          if (braceIdx !== -1) {
+            const br = readBalanced(tail, braceIdx, '{', '}');
+            if (br) style.picTextOpts = br.content;
+          }
+          continue;
+        }
+      }
+
+      const eqIdx = part.indexOf('=');
+      const key = (eqIdx === -1 ? part : part.slice(0, eqIdx)).trim();
+      const val = (eqIdx === -1 ? '' : part.slice(eqIdx + 1)).trim();
+      const cleanVal = val.startsWith('{') && val.endsWith('}') ? val.slice(1, -1).trim() : val;
+
+      // Style definition: `name/.style={...}` or `name/.append style={...}`
+      if (eqIdx !== -1) {
+        const styleDefM = key.match(/^(.+?)\/\.(style|append\s+style)$/);
+        if (styleDefM) {
+          const sName = styleDefM[1].trim();
+          if (sName) {
+            const nextVal =
+              styleDefM[2] === 'style'
+                ? cleanVal
+                : activeStyles[sName]
+                ? `${activeStyles[sName]}, ${cleanVal}`
+                : cleanVal;
+            activeStyles[sName] = nextVal;
+            if (!style.definedStyles) style.definedStyles = {};
+            style.definedStyles[sName] = nextVal;
+          }
+          continue;
+        }
+      }
+
+      if (key === '->' || key === '-latex' || key === '-stealth' || key === '->>') {
+        style.arrowEnd = true;
+      } else if (key === '<-' || key === 'latex-' || key === 'stealth-') {
+        style.arrowStart = true;
+      } else if (key === '<->' || key === 'latex-latex' || key === 'stealth-stealth') {
+        style.arrowStart = true;
+        style.arrowEnd = true;
+      } else if (key === 'clip') {
+        style.isClip = true;
+      } else if (key === 'ultra thin') style.strokeWidth = 0.5;
+      else if (key === 'very thin') style.strokeWidth = 0.7;
+      else if (key === 'thin') style.strokeWidth = 1.0;
+      else if (key === 'semithick') style.strokeWidth = 1.3;
+      else if (key === 'thick') style.strokeWidth = 1.8;
+      else if (key === 'very thick') style.strokeWidth = 2.4;
+      else if (key === 'ultra thick') style.strokeWidth = 3.2;
+      else if (key === 'line width' && cleanVal) {
+        const px = parseLengthToPx(cleanVal, unitPx);
+        if (px !== null) style.strokeWidth = Math.max(0.4, px);
+      } else if (key === 'dashed') style.dashArray = '6,4';
+      else if (key === 'densely dashed') style.dashArray = '4,2.5';
+      else if (key === 'loosely dashed') style.dashArray = '6,6';
+      else if (key === 'dotted') style.dashArray = '1.8,3.2';
+      else if (key === 'densely dotted') style.dashArray = '1.6,2';
+      else if (key === 'loosely dotted') style.dashArray = '1.8,5.5';
+      else if (key === 'solid') style.dashArray = undefined;
+      else if (key === 'circle') style.circle = true;
+      else if (key === 'declare function' && cleanVal) {
+        if (!style.customFuncs) style.customFuncs = {};
+        parseDeclareFunctionsSpec(cleanVal, style.customFuncs);
+      } else if ((key === 'trig format' || key === 'trig format plots') && cleanVal === 'rad') {
+        style.trigRad = true;
+      } else if (key === 'color' && cleanVal) {
+        const c = resolveTikzColor(cleanVal, customColors);
+        if (c) style.stroke = c;
+      } else if (key === 'draw') {
+        if (cleanVal.toLowerCase() === 'none') {
+          style.hasDraw = false;
+          style.stroke = 'none';
+        } else {
+          style.hasDraw = true;
+          if (cleanVal) {
+            const c = resolveTikzColor(cleanVal, customColors);
+            if (c) style.stroke = c;
+          }
+        }
+      } else if (key === 'fill') {
+        if (!cleanVal) {
+          style.hasFill = true;
+          style.fill = style.stroke;
+        } else if (cleanVal.toLowerCase() === 'none') {
+          style.hasFill = false;
+          style.fill = 'none';
+        } else {
           const c = resolveTikzColor(cleanVal, customColors);
+          if (c) {
+            style.hasFill = true;
+            style.fill = c;
+          }
+        }
+      } else if (key === 'fill opacity' && cleanVal) {
+        const op = parseFloat(cleanVal);
+        if (Number.isFinite(op)) style.fillOpacity = Math.max(0, Math.min(1, op));
+      } else if (key === 'opacity' && cleanVal) {
+        const op = parseFloat(cleanVal);
+        if (Number.isFinite(op)) {
+          style.fillOpacity = Math.max(0, Math.min(1, op));
+          style.strokeOpacity = style.fillOpacity;
+        }
+      } else if (key === 'angle radius' && cleanVal) {
+        const hasUnit = /[a-zA-Z]+$/.test(cleanVal);
+        if (hasUnit) {
+          const px = parseLengthToPx(cleanVal, unitPx);
+          if (px !== null && px > 0) style.angleRadiusPx = px;
+        } else {
+          const v = evalMathExpr(cleanVal, vars, false, customFuncs);
+          if (v !== null && v > 0) style.angleRadiusPx = v * unitPx * Math.abs(base.scaleX);
+        }
+      } else if (key === 'angle eccentricity' && cleanVal) {
+        const ecc = evalMathExpr(cleanVal, vars, false, customFuncs);
+        if (ecc !== null && Number.isFinite(ecc)) style.angleEccentricity = ecc;
+      } else if (key === 'pic text' && cleanVal) {
+        style.picText =
+          cleanVal.startsWith('"') && cleanVal.endsWith('"') && cleanVal.length >= 2
+            ? cleanVal.slice(1, -1)
+            : cleanVal;
+      } else if (key === 'pattern' && cleanVal) {
+        style.pattern = cleanVal.toLowerCase();
+      } else if (key === 'pattern color' && cleanVal) {
+        const c = resolveTikzColor(cleanVal, customColors);
+        if (c) style.patternColor = c;
+      } else if ((key === 'x' || key === 'y' || key === 'z') && cleanVal) {
+        const basisVec = parseBasisVector(cleanVal, unitPx, vars, customFuncs);
+        if (basisVec) {
+          const b = ensureBasis();
+          b[key] = basisVec;
+        } else {
+          const u = parseLengthToTikzUnits(cleanVal, unitPx);
+          if (u !== null && u > 0) {
+            if (key === 'x') style.scaleX = (style.scaleX ?? 1) * u;
+            else if (key === 'y') style.scaleY = (style.scaleY ?? 1) * u;
+            else {
+              const b = ensureBasis();
+              b.z = { x: -0.385 * u, y: -0.385 * u };
+            }
+          }
+        }
+      } else if (key === 'scale' && cleanVal) {
+        const sc = evalMathExpr(cleanVal, vars, false, customFuncs);
+        if (sc !== null && Number.isFinite(sc)) {
+          style.scaleX = (style.scaleX ?? 1) * sc;
+          style.scaleY = (style.scaleY ?? 1) * sc;
+        }
+      } else if (key === 'xscale' && cleanVal) {
+        const sc = evalMathExpr(cleanVal, vars, false, customFuncs);
+        if (sc !== null && Number.isFinite(sc)) style.scaleX = (style.scaleX ?? 1) * sc;
+      } else if (key === 'yscale' && cleanVal) {
+        const sc = evalMathExpr(cleanVal, vars, false, customFuncs);
+        if (sc !== null && Number.isFinite(sc)) style.scaleY = (style.scaleY ?? 1) * sc;
+      } else if (key === 'rotate' && cleanVal) {
+        const deg = evalMathExpr(cleanVal, vars, false, customFuncs);
+        if (deg !== null && Number.isFinite(deg)) style.rotateDeg = (style.rotateDeg ?? 0) + deg;
+      } else if (key === 'domain' && cleanVal) {
+        const dParts = splitTopLevel(cleanVal, ':');
+        if (dParts.length === 2) {
+          const d0 = evalMathExpr(dParts[0], vars, false, customFuncs);
+          const d1 = evalMathExpr(dParts[1], vars, false, customFuncs);
+          if (d0 !== null && d1 !== null) style.domain = [d0, d1];
+        }
+      } else if (key === 'samples' && cleanVal) {
+        const smp = parseInt(cleanVal, 10);
+        if (Number.isFinite(smp) && smp >= 2) style.samples = Math.min(400, smp);
+      } else if (key === 'step' && cleanVal) {
+        const st = parseLengthToTikzUnits(cleanVal, unitPx);
+        if (st !== null && st > 0) style.step = st;
+      } else if (key === 'pos' && cleanVal) {
+        const p = parseFloat(cleanVal);
+        if (Number.isFinite(p)) style.pos = p;
+      } else if (key === 'midway') style.pos = 0.5;
+      else if (key === 'near start') style.pos = 0.25;
+      else if (key === 'near end') style.pos = 0.75;
+      else if (key === 'at start') style.pos = 0;
+      else if (key === 'at end') style.pos = 1;
+      else if (
+        key === 'above' ||
+        key === 'below' ||
+        key === 'left' ||
+        key === 'right' ||
+        key === 'above left' ||
+        key === 'above right' ||
+        key === 'below left' ||
+        key === 'below right'
+      ) {
+        style.anchor = key;
+        if (cleanVal) {
+          const dPx = parseLengthToPx(cleanVal, unitPx);
+          if (dPx !== null && Number.isFinite(dPx)) style.anchorDist = dPx;
+        }
+      } else if (key === 'anchor' && cleanVal) {
+        const anchorMap: Record<string, string> = {
+          north: 'below',
+          south: 'above',
+          east: 'left',
+          west: 'right',
+          'north east': 'below left',
+          'north west': 'below right',
+          'south east': 'above left',
+          'south west': 'above right',
+          center: 'center',
+        };
+        if (anchorMap[cleanVal.toLowerCase()]) {
+          style.anchor = anchorMap[cleanVal.toLowerCase()];
+        }
+      } else if (key === 'xshift' && cleanVal) {
+        const px = parseLengthToPx(cleanVal, unitPx);
+        if (px !== null) style.shiftXPx = (style.shiftXPx ?? 0) + px;
+      } else if (key === 'yshift' && cleanVal) {
+        const px = parseLengthToPx(cleanVal, unitPx);
+        if (px !== null) style.shiftYPx = (style.shiftYPx ?? 0) - px;
+      } else if (key === 'shift' && cleanVal) {
+        if (cleanVal.startsWith('(') && cleanVal.endsWith(')')) {
+          const innerShift = cleanVal.slice(1, -1).trim();
+          const coords = splitTopLevel(innerShift, ',');
+          if (coords.length === 2) {
+            const sx = parseLengthToTikzUnits(coords[0], unitPx) ?? evalMathExpr(coords[0], vars, false, customFuncs);
+            const sy = parseLengthToTikzUnits(coords[1], unitPx) ?? evalMathExpr(coords[1], vars, false, customFuncs);
+            if (sx !== null && sy !== null) {
+              const activeB = style.basis ?? base.basis;
+              const hasUnit = /[a-zA-Z]+$/.test(coords[0].trim()) || /[a-zA-Z]+$/.test(coords[1].trim());
+              if (activeB && !hasUnit) {
+                style.shiftX = (style.shiftX ?? 0) + sx * activeB.x.x + sy * activeB.y.x;
+                style.shiftY = (style.shiftY ?? 0) + sx * activeB.x.y + sy * activeB.y.y;
+              } else {
+                style.shiftX = (style.shiftX ?? 0) + sx;
+                style.shiftY = (style.shiftY ?? 0) + sy;
+              }
+            }
+          } else if (coords.length === 3) {
+            const sx = parseLengthToTikzUnits(coords[0], unitPx) ?? evalMathExpr(coords[0], vars, false, customFuncs);
+            const sy = parseLengthToTikzUnits(coords[1], unitPx) ?? evalMathExpr(coords[1], vars, false, customFuncs);
+            const sz = parseLengthToTikzUnits(coords[2], unitPx) ?? evalMathExpr(coords[2], vars, false, customFuncs);
+            if (sx !== null && sy !== null && sz !== null) {
+              const activeB = style.basis ?? base.basis ?? DEFAULT_TIKZ_BASIS;
+              style.shiftX = (style.shiftX ?? 0) + sx * activeB.x.x + sy * activeB.y.x + sz * activeB.z.x;
+              style.shiftY = (style.shiftY ?? 0) + sx * activeB.x.y + sy * activeB.y.y + sz * activeB.z.y;
+            }
+          }
+        }
+      } else if (key === 'label' && cleanVal) {
+        style.labelSpec = cleanVal;
+      } else if (key === 'font' && cleanVal) {
+        if (cleanVal.includes('bf') || cleanVal.includes('bold')) style.fontWeight = 'bold';
+        if (cleanVal.includes('small') || cleanVal.includes('footnotesize')) style.fontSize = 11.5;
+        if (cleanVal.includes('tiny') || cleanVal.includes('scriptsize')) style.fontSize = 10;
+        if (cleanVal.includes('large') || cleanVal.includes('Large')) style.fontSize = 15;
+      } else if (key === 'inner sep' && cleanVal) {
+        const px = parseLengthToPx(cleanVal, unitPx);
+        if (px !== null) style.innerSep = px;
+      } else if (key === 'rounded corners') {
+        style.roundedCorners = cleanVal ? parseLengthToPx(cleanVal, unitPx) ?? 4 : 4;
+      } else if (eqIdx === -1) {
+        if (activeStyles[key]) {
+          applyOptString(activeStyles[key], depth + 1);
+        } else {
+          const c = resolveTikzColor(key, customColors);
           if (c) style.stroke = c;
         }
       }
-    } else if (key === 'fill') {
-      if (!cleanVal) {
-        style.hasFill = true;
-        style.fill = style.stroke;
-      } else if (cleanVal.toLowerCase() === 'none') {
-        style.hasFill = false;
-        style.fill = 'none';
-      } else {
-        const c = resolveTikzColor(cleanVal, customColors);
-        if (c) {
-          style.hasFill = true;
-          style.fill = c;
-        }
-      }
-    } else if (key === 'fill opacity' && cleanVal) {
-      const op = parseFloat(cleanVal);
-      if (Number.isFinite(op)) style.fillOpacity = Math.max(0, Math.min(1, op));
-    } else if (key === 'opacity' && cleanVal) {
-      const op = parseFloat(cleanVal);
-      if (Number.isFinite(op)) {
-        style.fillOpacity = Math.max(0, Math.min(1, op));
-        style.strokeOpacity = style.fillOpacity;
-      }
-    } else if (key === 'angle radius' && cleanVal) {
-      const hasUnit = /[a-zA-Z]+$/.test(cleanVal);
-      if (hasUnit) {
-        const px = parseLengthToPx(cleanVal, unitPx);
-        if (px !== null && px > 0) style.angleRadiusPx = px;
-      } else {
-        const v = evalMathExpr(cleanVal, vars, false, customFuncs);
-        if (v !== null && v > 0) style.angleRadiusPx = v * unitPx * Math.abs(base.scaleX);
-      }
-    } else if (key === 'angle eccentricity' && cleanVal) {
-      const ecc = evalMathExpr(cleanVal, vars, false, customFuncs);
-      if (ecc !== null && Number.isFinite(ecc)) style.angleEccentricity = ecc;
-    } else if (key === 'pic text' && cleanVal) {
-      style.picText =
-        cleanVal.startsWith('"') && cleanVal.endsWith('"') && cleanVal.length >= 2
-          ? cleanVal.slice(1, -1)
-          : cleanVal;
-    } else if (key === 'pattern' && cleanVal) {
-      style.pattern = cleanVal.toLowerCase();
-    } else if (key === 'pattern color' && cleanVal) {
-      const c = resolveTikzColor(cleanVal, customColors);
-      if (c) style.patternColor = c;
-    } else if (key === 'x' && cleanVal) {
-      const u = parseLengthToTikzUnits(cleanVal, unitPx);
-      if (u !== null && u > 0) style.scaleX = (style.scaleX ?? 1) * u;
-    } else if (key === 'y' && cleanVal) {
-      const u = parseLengthToTikzUnits(cleanVal, unitPx);
-      if (u !== null && u > 0) style.scaleY = (style.scaleY ?? 1) * u;
-    } else if (key === 'scale' && cleanVal) {
-      const sc = evalMathExpr(cleanVal, vars, false, customFuncs);
-      if (sc !== null && Number.isFinite(sc)) {
-        style.scaleX = (style.scaleX ?? 1) * sc;
-        style.scaleY = (style.scaleY ?? 1) * sc;
-      }
-    } else if (key === 'xscale' && cleanVal) {
-      const sc = evalMathExpr(cleanVal, vars, false, customFuncs);
-      if (sc !== null && Number.isFinite(sc)) style.scaleX = (style.scaleX ?? 1) * sc;
-    } else if (key === 'yscale' && cleanVal) {
-      const sc = evalMathExpr(cleanVal, vars, false, customFuncs);
-      if (sc !== null && Number.isFinite(sc)) style.scaleY = (style.scaleY ?? 1) * sc;
-    } else if (key === 'rotate' && cleanVal) {
-      const deg = evalMathExpr(cleanVal, vars, false, customFuncs);
-      if (deg !== null && Number.isFinite(deg)) style.rotateDeg = (style.rotateDeg ?? 0) + deg;
-    } else if (key === 'domain' && cleanVal) {
-      const dParts = splitTopLevel(cleanVal, ':');
-      if (dParts.length === 2) {
-        const d0 = evalMathExpr(dParts[0], vars, false, customFuncs);
-        const d1 = evalMathExpr(dParts[1], vars, false, customFuncs);
-        if (d0 !== null && d1 !== null) style.domain = [d0, d1];
-      }
-    } else if (key === 'samples' && cleanVal) {
-      const smp = parseInt(cleanVal, 10);
-      if (Number.isFinite(smp) && smp >= 2) style.samples = Math.min(400, smp);
-    } else if (key === 'step' && cleanVal) {
-      const st = parseLengthToTikzUnits(cleanVal, unitPx);
-      if (st !== null && st > 0) style.step = st;
-    } else if (key === 'pos' && cleanVal) {
-      const p = parseFloat(cleanVal);
-      if (Number.isFinite(p)) style.pos = p;
-    } else if (key === 'midway') style.pos = 0.5;
-    else if (key === 'near start') style.pos = 0.25;
-    else if (key === 'near end') style.pos = 0.75;
-    else if (key === 'at start') style.pos = 0;
-    else if (key === 'at end') style.pos = 1;
-    else if (
-      key === 'above' ||
-      key === 'below' ||
-      key === 'left' ||
-      key === 'right' ||
-      key === 'above left' ||
-      key === 'above right' ||
-      key === 'below left' ||
-      key === 'below right'
-    ) {
-      style.anchor = key;
-      if (cleanVal) {
-        const dPx = parseLengthToPx(cleanVal, unitPx);
-        if (dPx !== null && Number.isFinite(dPx)) style.anchorDist = dPx;
-      }
-    } else if (key === 'anchor' && cleanVal) {
-      const anchorMap: Record<string, string> = {
-        north: 'below',
-        south: 'above',
-        east: 'left',
-        west: 'right',
-        'north east': 'below left',
-        'north west': 'below right',
-        'south east': 'above left',
-        'south west': 'above right',
-        center: 'center',
-      };
-      if (anchorMap[cleanVal.toLowerCase()]) {
-        style.anchor = anchorMap[cleanVal.toLowerCase()];
-      }
-    } else if (key === 'xshift' && cleanVal) {
-      const px = parseLengthToPx(cleanVal, unitPx);
-      if (px !== null) style.shiftXPx = (style.shiftXPx ?? 0) + px;
-    } else if (key === 'yshift' && cleanVal) {
-      const px = parseLengthToPx(cleanVal, unitPx);
-      if (px !== null) style.shiftYPx = (style.shiftYPx ?? 0) - px;
-    } else if (key === 'shift' && cleanVal) {
-      if (cleanVal.startsWith('(') && cleanVal.endsWith(')')) {
-        const innerShift = cleanVal.slice(1, -1).trim();
-        const coords = splitTopLevel(innerShift, ',');
-        if (coords.length === 2) {
-          const sx = parseLengthToTikzUnits(coords[0], unitPx) ?? evalMathExpr(coords[0], vars, false, customFuncs);
-          const sy = parseLengthToTikzUnits(coords[1], unitPx) ?? evalMathExpr(coords[1], vars, false, customFuncs);
-          if (sx !== null && sy !== null) {
-            style.shiftX = (style.shiftX ?? 0) + sx;
-            style.shiftY = (style.shiftY ?? 0) + sy;
-          }
-        }
-      }
-    } else if (key === 'label' && cleanVal) {
-      style.labelSpec = cleanVal;
-    } else if (key === 'font' && cleanVal) {
-      if (cleanVal.includes('bf') || cleanVal.includes('bold')) style.fontWeight = 'bold';
-      if (cleanVal.includes('small') || cleanVal.includes('footnotesize')) style.fontSize = 11.5;
-      if (cleanVal.includes('tiny') || cleanVal.includes('scriptsize')) style.fontSize = 10;
-      if (cleanVal.includes('large') || cleanVal.includes('Large')) style.fontSize = 15;
-    } else if (key === 'inner sep' && cleanVal) {
-      const px = parseLengthToPx(cleanVal, unitPx);
-      if (px !== null) style.innerSep = px;
-    } else if (key === 'rounded corners') {
-      style.roundedCorners = cleanVal ? parseLengthToPx(cleanVal, unitPx) ?? 4 : 4;
-    } else if (eqIdx === -1) {
-      const c = resolveTikzColor(key, customColors);
-      if (c) style.stroke = c;
     }
-  }
+  };
 
+  applyOptString(rawOpts, 0);
   return style;
 }
 
@@ -1567,7 +1730,8 @@ function resolveCalcVectorTerm(
   namedCoords: Record<string, Point2D>,
   prevPoint: Point2D,
   vars: Record<string, number>,
-  customFuncs: Record<string, CustomMathFunc>
+  customFuncs: Record<string, CustomMathFunc>,
+  basis?: Basis3D
 ): Point2D | null {
   let rest = termRaw.trim();
   if (!rest) return null;
@@ -1599,7 +1763,7 @@ function resolveCalcVectorTerm(
   if (!rest.startsWith('(')) return null;
   const p1Br = readBalanced(rest, 0, '(', ')');
   if (!p1Br) return null;
-  const p1 = resolveCoordinateExpr(p1Br.content, namedCoords, prevPoint, false, vars, customFuncs);
+  const p1 = resolveCoordinateExpr(p1Br.content, namedCoords, prevPoint, false, vars, customFuncs, basis);
   if (!p1) return null;
 
   const after1 = rest.slice(p1Br.endIdx + 1).trim();
@@ -1657,14 +1821,14 @@ function resolveCalcVectorTerm(
   if (!tail.startsWith('(')) return null;
   const p2Br = readBalanced(tail, 0, '(', ')');
   if (!p2Br || tail.slice(p2Br.endIdx + 1).trim() !== '') return null;
-  const p2 = resolveCoordinateExpr(p2Br.content, namedCoords, prevPoint, false, vars, customFuncs);
+  const p2 = resolveCoordinateExpr(p2Br.content, namedCoords, prevPoint, false, vars, customFuncs, basis);
   if (!p2) return null;
 
   // Orthogonal projection $(A)!(P)!(B)$
   if (modStr.startsWith('(') && modStr.endsWith(')')) {
     const pProjBr = readBalanced(modStr, 0, '(', ')');
     if (pProjBr && pProjBr.endIdx === modStr.length - 1) {
-      const pProj = resolveCoordinateExpr(pProjBr.content, namedCoords, prevPoint, false, vars, customFuncs);
+      const pProj = resolveCoordinateExpr(pProjBr.content, namedCoords, prevPoint, false, vars, customFuncs, basis);
       if (!pProj) return null;
       const dx = p2.x - p1.x;
       const dy = p2.y - p1.y;
@@ -1710,7 +1874,8 @@ function resolveCoordinateExpr(
   prevPoint: Point2D,
   isRelativeMove: boolean,
   vars: Record<string, number>,
-  customFuncs: Record<string, CustomMathFunc> = {}
+  customFuncs: Record<string, CustomMathFunc> = {},
+  basis?: Basis3D
 ): Point2D | null {
   let s = rawCoord.trim();
   if (!s) return null;
@@ -1720,6 +1885,7 @@ function resolveCoordinateExpr(
   }
   if (s.startsWith('axis cs:')) s = s.slice('axis cs:'.length).trim();
   if (s.startsWith('canvas cs:')) s = s.slice('canvas cs:'.length).trim();
+  if (s.startsWith('xyz cs:')) s = s.slice('xyz cs:'.length).trim();
 
   // Named coordinate
   if (namedCoords[s]) {
@@ -1734,10 +1900,10 @@ function resolveCoordinateExpr(
       const seg1 = splitTopLevel(andParts[0], '--');
       const seg2 = splitTopLevel(andParts[1], '--');
       if (seg1.length === 2 && seg2.length === 2) {
-        const a1 = resolveCoordinateExpr(seg1[0], namedCoords, prevPoint, false, vars, customFuncs);
-        const a2 = resolveCoordinateExpr(seg1[1], namedCoords, prevPoint, false, vars, customFuncs);
-        const b1 = resolveCoordinateExpr(seg2[0], namedCoords, prevPoint, false, vars, customFuncs);
-        const b2 = resolveCoordinateExpr(seg2[1], namedCoords, prevPoint, false, vars, customFuncs);
+        const a1 = resolveCoordinateExpr(seg1[0], namedCoords, prevPoint, false, vars, customFuncs, basis);
+        const a2 = resolveCoordinateExpr(seg1[1], namedCoords, prevPoint, false, vars, customFuncs, basis);
+        const b1 = resolveCoordinateExpr(seg2[0], namedCoords, prevPoint, false, vars, customFuncs, basis);
+        const b2 = resolveCoordinateExpr(seg2[1], namedCoords, prevPoint, false, vars, customFuncs, basis);
         if (a1 && a2 && b1 && b2) {
           const d1x = a2.x - a1.x;
           const d1y = a2.y - a1.y;
@@ -1756,14 +1922,14 @@ function resolveCoordinateExpr(
   // Orthogonal intersection: (A |- B) -> (A.x, B.y), (A -| B) -> (B.x, A.y)
   const orthoParts = splitTopLevel(s, '|-');
   if (orthoParts.length === 2) {
-    const p1 = resolveCoordinateExpr(orthoParts[0], namedCoords, prevPoint, false, vars, customFuncs);
-    const p2 = resolveCoordinateExpr(orthoParts[1], namedCoords, prevPoint, false, vars, customFuncs);
+    const p1 = resolveCoordinateExpr(orthoParts[0], namedCoords, prevPoint, false, vars, customFuncs, basis);
+    const p2 = resolveCoordinateExpr(orthoParts[1], namedCoords, prevPoint, false, vars, customFuncs, basis);
     if (p1 && p2) return { x: p1.x, y: p2.y };
   }
   const orthoParts2 = splitTopLevel(s, '-|');
   if (orthoParts2.length === 2) {
-    const p1 = resolveCoordinateExpr(orthoParts2[0], namedCoords, prevPoint, false, vars, customFuncs);
-    const p2 = resolveCoordinateExpr(orthoParts2[1], namedCoords, prevPoint, false, vars, customFuncs);
+    const p1 = resolveCoordinateExpr(orthoParts2[0], namedCoords, prevPoint, false, vars, customFuncs, basis);
+    const p2 = resolveCoordinateExpr(orthoParts2[1], namedCoords, prevPoint, false, vars, customFuncs, basis);
     if (p1 && p2) return { x: p2.x, y: p1.y };
   }
 
@@ -1805,7 +1971,7 @@ function resolveCoordinateExpr(
       let sumY = 0;
       let allOk = true;
       for (const term of terms) {
-        const pt = resolveCalcVectorTerm(term.raw, namedCoords, prevPoint, vars, customFuncs);
+        const pt = resolveCalcVectorTerm(term.raw, namedCoords, prevPoint, vars, customFuncs, basis);
         if (!pt) {
           allOk = false;
           break;
@@ -1830,15 +1996,39 @@ function resolveCoordinateExpr(
     }
   }
 
-  // Cartesian: (x, y) or (x=..., y=...)
+  // Cartesian: (x, y) or (x, y, z) or (x=..., y=..., z=...)
   const xyParts = splitTopLevel(s, ',');
   if (xyParts.length === 2) {
-    const rawX = xyParts[0].replace(/^\s*x\s*=\s*/i, '');
-    const rawY = xyParts[1].replace(/^\s*y\s*=\s*/i, '');
+    const rawX = xyParts[0].replace(/^\s*x\s*=\s*/i, '').trim();
+    const rawY = xyParts[1].replace(/^\s*y\s*=\s*/i, '').trim();
+    const hasUnitX = /[a-zA-Z]+$/.test(rawX);
+    const hasUnitY = /[a-zA-Z]+$/.test(rawY);
     const x = parseLengthToTikzUnits(rawX) ?? evalMathExpr(rawX, vars, false, customFuncs);
     const y = parseLengthToTikzUnits(rawY) ?? evalMathExpr(rawY, vars, false, customFuncs);
     if (x !== null && y !== null) {
-      return isRelativeMove ? { x: prevPoint.x + x, y: prevPoint.y + y } : { x, y };
+      const pt =
+        basis && !hasUnitX && !hasUnitY
+          ? {
+              x: x * basis.x.x + y * basis.y.x,
+              y: x * basis.x.y + y * basis.y.y,
+            }
+          : { x, y };
+      return isRelativeMove ? { x: prevPoint.x + pt.x, y: prevPoint.y + pt.y } : pt;
+    }
+  } else if (xyParts.length === 3) {
+    const rawX = xyParts[0].replace(/^\s*x\s*=\s*/i, '').trim();
+    const rawY = xyParts[1].replace(/^\s*y\s*=\s*/i, '').trim();
+    const rawZ = xyParts[2].replace(/^\s*z\s*=\s*/i, '').trim();
+    const x = parseLengthToTikzUnits(rawX) ?? evalMathExpr(rawX, vars, false, customFuncs);
+    const y = parseLengthToTikzUnits(rawY) ?? evalMathExpr(rawY, vars, false, customFuncs);
+    const z = parseLengthToTikzUnits(rawZ) ?? evalMathExpr(rawZ, vars, false, customFuncs);
+    if (x !== null && y !== null && z !== null) {
+      const b = basis ?? DEFAULT_TIKZ_BASIS;
+      const pt = {
+        x: x * b.x.x + y * b.y.x + z * b.z.x,
+        y: x * b.x.y + y * b.y.y + z * b.z.y,
+      };
+      return isRelativeMove ? { x: prevPoint.x + pt.x, y: prevPoint.y + pt.y } : pt;
     }
   }
 
@@ -3185,6 +3375,11 @@ function executeTikzStatements(
           vars: { ...(scope.vars || {}) },
           customFuncs: childCustomFuncs,
           trigRad: st.trigRad ?? scope.trigRad,
+          basis: st.basis ?? scope.basis,
+          customStyles: {
+            ...(scope.customStyles || {}),
+            ...(st.definedStyles || {}),
+          },
         };
         executeTikzStatements(
           src.slice(startInner, foundEnd),
@@ -3209,6 +3404,7 @@ function executeTikzStatements(
           ...scope,
           vars: { ...(scope.vars || {}) },
           customFuncs: { ...(scope.customFuncs || {}) },
+          customStyles: { ...(scope.customStyles || {}) },
         };
         executeTikzStatements(
           grp.content,
@@ -3330,9 +3526,26 @@ function executeTikzStatements(
         const st = parseOptionsString(tsBr.content, scope, customColors, unitPx, scope.vars, scope.customFuncs);
         if (st.customFuncs) Object.assign(scope.customFuncs, st.customFuncs);
         if (st.trigRad !== undefined) scope.trigRad = st.trigRad;
+        if (st.definedStyles) {
+          if (!scope.customStyles) scope.customStyles = {};
+          Object.assign(scope.customStyles, st.definedStyles);
+        }
+        if (st.basis) scope.basis = st.basis;
         cursor = tsBr.endIdx + 1;
         continue;
       }
+    }
+
+    const tdplotM = rest.match(/^\\tdplotsetmaincoords\s*\{([^}]+)\}\s*\{([^}]+)\}/);
+    if (tdplotM) {
+      const th = evalMathExpr(tdplotM[1], scope.vars, false, scope.customFuncs);
+      const ph = evalMathExpr(tdplotM[2], scope.vars, false, scope.customFuncs);
+      if (th !== null && ph !== null) {
+        if (!scope.customStyles) scope.customStyles = {};
+        scope.customStyles['tdplot_main_coords'] = computeTdplotMainCoordsStyle(th, ph);
+      }
+      cursor += tdplotM[0].length;
+      continue;
     }
 
     // 6. Read single `;`-terminated TikZ statement
@@ -3404,7 +3617,7 @@ function executeTikzStatements(
 
       if (coordName) {
         const pt = atExpr
-          ? resolveCoordinateExpr(atExpr, namedCoords, { x: 0, y: 0 }, false, scope.vars, scope.customFuncs)
+          ? resolveCoordinateExpr(atExpr, namedCoords, { x: 0, y: 0 }, false, scope.vars, scope.customFuncs, scope.basis)
           : { x: 0, y: 0 };
         if (pt) {
           namedCoords[coordName] = pt;
@@ -3487,9 +3700,9 @@ function executeTikzStatements(
             const isRightAngle = /^right/i.test(angM[1]);
             const ptsRaw = splitTopLevel(angM[2], '--').map((t) => t.trim()).filter(Boolean);
             if (ptsRaw.length === 3) {
-              const p1 = resolveCoordinateExpr(ptsRaw[0], namedCoords, { x: 0, y: 0 }, false, scope.vars, scope.customFuncs);
-              const p2 = resolveCoordinateExpr(ptsRaw[1], namedCoords, { x: 0, y: 0 }, false, scope.vars, scope.customFuncs);
-              const p3 = resolveCoordinateExpr(ptsRaw[2], namedCoords, { x: 0, y: 0 }, false, scope.vars, scope.customFuncs);
+              const p1 = resolveCoordinateExpr(ptsRaw[0], namedCoords, { x: 0, y: 0 }, false, scope.vars, scope.customFuncs, scope.basis);
+              const p2 = resolveCoordinateExpr(ptsRaw[1], namedCoords, { x: 0, y: 0 }, false, scope.vars, scope.customFuncs, scope.basis);
+              const p3 = resolveCoordinateExpr(ptsRaw[2], namedCoords, { x: 0, y: 0 }, false, scope.vars, scope.customFuncs, scope.basis);
               if (p1 && p2 && p3) {
                 const s1 = toSvgPt(p1);
                 const s2 = toSvgPt(p2);
@@ -3651,7 +3864,7 @@ function executeTikzStatements(
               }
             }
           } else if (picAtCoord) {
-            const pt = resolveCoordinateExpr(picAtCoord, namedCoords, { x: 0, y: 0 }, false, scope.vars, scope.customFuncs);
+            const pt = resolveCoordinateExpr(picAtCoord, namedCoords, { x: 0, y: 0 }, false, scope.vars, scope.customFuncs, scope.basis);
             if (pt && st.picText) {
               emitNodeItem(st.picText, st, pt, toSvgPt);
             }
@@ -3666,7 +3879,7 @@ function executeTikzStatements(
       const parsedNode = parseNodeHeader(stmt, 5);
       if (parsedNode) {
         const pt = parsedNode.atCoord
-          ? resolveCoordinateExpr(parsedNode.atCoord, namedCoords, { x: 0, y: 0 }, false, scope.vars, scope.customFuncs)
+          ? resolveCoordinateExpr(parsedNode.atCoord, namedCoords, { x: 0, y: 0 }, false, scope.vars, scope.customFuncs, scope.basis)
           : { x: 0, y: 0 };
         if (pt) {
           if (parsedNode.name) namedCoords[parsedNode.name] = pt;
@@ -3715,6 +3928,10 @@ function executeTikzStatements(
       shiftXPx: (scope.shiftXPx ?? 0) + (st.shiftXPx ?? 0),
       shiftYPx: (scope.shiftYPx ?? 0) + (st.shiftYPx ?? 0),
       rotateDeg: scope.rotateDeg + (st.rotateDeg ?? 0),
+      basis: st.basis ?? scope.basis,
+      customStyles: st.definedStyles
+        ? { ...(scope.customStyles || {}), ...st.definedStyles }
+        : scope.customStyles,
     };
     const localToSvgPt = (pt: Point2D): Point2D => scopeToSvgPt(pt, drawScope);
 
@@ -3760,7 +3977,7 @@ function executeTikzStatements(
       if (pathStr[idx] === '(') {
         const paren = readBalanced(pathStr, idx, '(', ')');
         if (!paren) break;
-        const pt = resolveCoordinateExpr(paren.content, namedCoords, curPt, relMode, scope.vars, scope.customFuncs);
+        const pt = resolveCoordinateExpr(paren.content, namedCoords, curPt, relMode, scope.vars, scope.customFuncs, drawScope.basis);
         idx = paren.endIdx + 1;
         if (pt) {
           const sp = localToSvgPt(pt);
@@ -3860,7 +4077,7 @@ function executeTikzStatements(
         if (pathStr[idx] === '(') {
           const paren = readBalanced(pathStr, idx, '(', ')');
           if (!paren) break;
-          const nextPt = resolveCoordinateExpr(paren.content, namedCoords, curPt, rMode, scope.vars, scope.customFuncs);
+          const nextPt = resolveCoordinateExpr(paren.content, namedCoords, curPt, rMode, scope.vars, scope.customFuncs, drawScope.basis);
           idx = paren.endIdx + 1;
           if (nextPt) {
             if (conn === '|-') {
@@ -3947,11 +4164,11 @@ function executeTikzStatements(
                 if (pathStr[p] === '(') {
                   const endBr = readBalanced(pathStr, p, '(', ')');
                   if (endBr) {
-                    const c1 = resolveCoordinateExpr(c1Br.content, namedCoords, curPt, false, scope.vars, scope.customFuncs);
+                    const c1 = resolveCoordinateExpr(c1Br.content, namedCoords, curPt, false, scope.vars, scope.customFuncs, drawScope.basis);
                     const c2 = c2Expr
-                      ? resolveCoordinateExpr(c2Expr, namedCoords, curPt, false, scope.vars, scope.customFuncs)
+                      ? resolveCoordinateExpr(c2Expr, namedCoords, curPt, false, scope.vars, scope.customFuncs, drawScope.basis)
                       : c1;
-                    const endPt = resolveCoordinateExpr(endBr.content, namedCoords, curPt, relEnd, scope.vars, scope.customFuncs);
+                    const endPt = resolveCoordinateExpr(endBr.content, namedCoords, curPt, relEnd, scope.vars, scope.customFuncs, drawScope.basis);
                     if (c1 && c2 && endPt) {
                       const sc1 = localToSvgPt(c1);
                       const sc2 = localToSvgPt(c2);
@@ -3983,7 +4200,7 @@ function executeTikzStatements(
         if (parenIdx !== -1 && restR.startsWith('(')) {
           const paren = readBalanced(pathStr, parenIdx, '(', ')');
           if (paren) {
-            const p2 = resolveCoordinateExpr(paren.content, namedCoords, curPt, false, scope.vars, scope.customFuncs);
+            const p2 = resolveCoordinateExpr(paren.content, namedCoords, curPt, false, scope.vars, scope.customFuncs, drawScope.basis);
             if (p2) {
               const s1 = localToSvgPt(curPt);
               const s2 = localToSvgPt(p2);
@@ -4180,7 +4397,7 @@ function executeTikzStatements(
         if (pathStr[nextIdx] === '(') {
           const paren = readBalanced(pathStr, nextIdx, '(', ')');
           if (paren) {
-            const p2 = resolveCoordinateExpr(paren.content, namedCoords, curPt, false, scope.vars, scope.customFuncs);
+            const p2 = resolveCoordinateExpr(paren.content, namedCoords, curPt, false, scope.vars, scope.customFuncs, drawScope.basis);
             if (p2) {
               const step = st.step ?? 1;
               const x0 = Math.min(curPt.x, p2.x);
@@ -4250,7 +4467,8 @@ function executeTikzStatements(
                       curPt,
                       false,
                       scope.vars,
-                      scope.customFuncs
+                      scope.customFuncs,
+                      plotScope.basis
                     );
                     if (pt) {
                       const sp = plotToSvgPt(pt);
@@ -4317,7 +4535,7 @@ function executeTikzStatements(
           const nStyle = parseOptionsString(parsedInline.opts, nodeBaseScope, customColors, unitPx, scope.vars, scope.customFuncs);
           const tPos = nStyle.pos ?? 1;
           const anchorPt: Point2D = parsedInline.atCoord
-            ? resolveCoordinateExpr(parsedInline.atCoord, namedCoords, curPt, false, scope.vars, scope.customFuncs) ?? curPt
+            ? resolveCoordinateExpr(parsedInline.atCoord, namedCoords, curPt, false, scope.vars, scope.customFuncs, drawScope.basis) ?? curPt
             : nStyle.pos !== undefined
             ? {
                 x: lastSegFrom.x + (lastSegTo.x - lastSegFrom.x) * tPos,
@@ -4363,7 +4581,7 @@ function executeTikzStatements(
         if (pathStr[p] === '(') {
           const ePar = readBalanced(pathStr, p, '(', ')');
           if (ePar) {
-            const targetPt = resolveCoordinateExpr(ePar.content, namedCoords, curPt, false, scope.vars, scope.customFuncs);
+            const targetPt = resolveCoordinateExpr(ePar.content, namedCoords, curPt, false, scope.vars, scope.customFuncs, drawScope.basis);
             if (targetPt) {
               const eStyle = parseOptionsString(edgeOptsRaw, drawScope, customColors, unitPx, scope.vars, scope.customFuncs);
               const s1 = localToSvgPt(curPt);
@@ -4433,7 +4651,7 @@ function executeTikzStatements(
         if (pathStr[nextIdx] === '(') {
           const paren = readBalanced(pathStr, nextIdx, '(', ')');
           if (paren) {
-            const nextPt = resolveCoordinateExpr(paren.content, namedCoords, curPt, false, scope.vars, scope.customFuncs);
+            const nextPt = resolveCoordinateExpr(paren.content, namedCoords, curPt, false, scope.vars, scope.customFuncs, drawScope.basis);
             if (nextPt) {
               const s1 = localToSvgPt(curPt);
               const s2 = localToSvgPt(nextPt);
@@ -4666,7 +4884,8 @@ function renderPictureEnvToItems(
 export function renderLatexPictureToSvgDataUrl(
   envName: 'tikzpicture' | 'pgfpicture' | 'picture',
   rawBody: string,
-  customColors: Record<string, string> = {}
+  customColors: Record<string, string> = {},
+  customTikzStyles: Record<string, string> = {}
 ): RenderedLatexFigure | null {
   const unitPx = 42;
   const items: SvgItem[] = [];
@@ -4702,6 +4921,7 @@ export function renderLatexPictureToSvgDataUrl(
       lineWidth: 1.3,
       fill: 'none',
       fillOpacity: 1,
+      customStyles: { ...customTikzStyles },
     };
     if (envOptsRaw) {
       const st = parseOptionsString(envOptsRaw, baseScope, customColors, unitPx);
@@ -4719,6 +4939,10 @@ export function renderLatexPictureToSvgDataUrl(
       if (st.fontWeight !== undefined) baseScope.fontWeight = st.fontWeight;
       if (st.customFuncs) baseScope.customFuncs = st.customFuncs;
       if (st.trigRad !== undefined) baseScope.trigRad = st.trigRad;
+      if (st.basis) baseScope.basis = st.basis;
+      if (st.definedStyles) {
+        baseScope.customStyles = { ...(baseScope.customStyles || {}), ...st.definedStyles };
+      }
     }
 
     if (/\\tkzTab(?:Init|Line|Var)/.test(body)) {

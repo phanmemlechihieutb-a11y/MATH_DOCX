@@ -264,16 +264,24 @@ function RenderSegments({
           color: hex ? `#${hex}` : undefined,
         };
 
+        const innerLines = lines.map((line, lIdx) => (
+          <span key={lIdx} className="whitespace-pre-wrap">
+            {line}
+            {lIdx < lines.length - 1 && <br />}
+          </span>
+        ));
+
         return (
           <span key={idx}>
             {tabPrefix}
             <span className={textClass} style={segStyle}>
-              {lines.map((line, lIdx) => (
-                <span key={lIdx} className="whitespace-pre-wrap">
-                  {line}
-                  {lIdx < lines.length - 1 && <br />}
-                </span>
-              ))}
+              {seg.vert_align === 'subscript' ? (
+                <sub className="text-[0.72em] leading-none">{innerLines}</sub>
+              ) : seg.vert_align === 'superscript' ? (
+                <sup className="text-[0.72em] leading-none">{innerLines}</sup>
+              ) : (
+                innerLines
+              )}
             </span>
           </span>
         );
