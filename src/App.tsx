@@ -67,19 +67,6 @@ async function parseJsonResponseSafe<T>(res: Response): Promise<T> {
     if (res.status === 504) {
       throw new Error('Máy chủ xử lý quá thời gian cho phép (HTTP 504). Vui lòng thử lại.');
     }
-    const looksLikeHtml =
-      /^\s*<!doctype html/i.test(raw) ||
-      /^\s*<html[\s>]/i.test(raw) ||
-      raw.includes('<meta charset');
-    if (looksLikeHtml) {
-      throw new Error(
-        'Máy chủ trả về trang HTML thay vì JSON API. ' +
-          'API OCR/export chưa chạy. Hãy: (1) chạy `npm run dev` (tsx server.ts), ' +
-          'không mở file tĩnh hay `vite` thuần; (2) kiểm tra http://localhost:3000/api/health; ' +
-          '(3) đặt GEMINI_API_KEY trong file .env. ' +
-          `HTTP ${res.status}.`
-      );
-    }
     const snippet = raw.replace(/\s+/g, ' ').trim().slice(0, 120);
     throw new Error(
       `Máy chủ trả về phản hồi không hợp lệ (HTTP ${res.status})${snippet ? `: ${snippet}` : ''}`
@@ -1245,15 +1232,6 @@ export default function App() {
     const hasPaste = pastedLatex.trim().length > 0;
 
     if (!hasFile && !hasDocx && !hasPaste) return;
-
-    // OCR PDF/ảnh cần Gemini API Key do người dùng tự nhập
-    if (hasFile && inputSource === 'file' && !userApiKey.trim()) {
-      setErrorMessage(
-        'Vui lòng nhập Gemini API Key của bạn ở mục "2. Tùy chọn chuyển đổi" (lấy tại aistudio.google.com/apikey).'
-      );
-      return;
-    }
-
     recordConversionSuccess();
 
     if (inputSource === 'docx' && hasDocx) {
@@ -1284,6 +1262,14 @@ export default function App() {
     }
 
     if (!hasFile) return;
+
+    // OCR PDF/ảnh cần Gemini API Key do người dùng tự nhập
+    if (inputSource === 'file' && !userApiKey.trim()) {
+      setErrorMessage(
+        'Vui lòng nhập Gemini API Key của bạn ở mục "2. Tùy chọn chuyển đổi" (lấy tại aistudio.google.com/apikey).'
+      );
+      return;
+    }
 
     resetResults();
     setIsConverting(true);
@@ -1378,12 +1364,10 @@ export default function App() {
         setStatusMessage(`Đã nhận dạng xong ${completedCount}/${total} trang...`);
       };
 
-      // Free-tier dễ 503 nếu gửi song song nhiều trang — giới hạn 2 request cùng lúc
-      const concurrency = Math.min(2, total);
+      const concurrency = Math.min(5, total);
       const workers = Array.from({ length: concurrency }, async (_, workerIdx) => {
         if (workerIdx > 0) {
-          // Giãn cách request để giảm 503 free-tier
-          await new Promise((r) => setTimeout(r, workerIdx * 400));
+          await new Promise((r) => setTimeout(r, workerIdx * 90));
         }
         while (!abortedError) {
           const idx = nextIndex++;
