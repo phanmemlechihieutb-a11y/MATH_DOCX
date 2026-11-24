@@ -1,6 +1,6 @@
 {
-  "name": "Remix MathDocx_Lê Chí Hiếu 1",
-  "description": "Chuyển đổi tài liệu Toán học từ PDF hoặc Ảnh chụp sang file Word (.docx) với công thức Equation OMML chỉnh sửa trực tiếp.",
+  "name": "MathDocx Studio - User API Key",
+  "description": "Chuyển PDF/ảnh đề toán → Word (.docx) OMML. Mỗi người dùng tự nhập & lưu Gemini API Key riêng trên trình duyệt (localStorage).",
   "requestFramePermissions": [],
   "majorCapabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"

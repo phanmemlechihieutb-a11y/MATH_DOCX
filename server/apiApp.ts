@@ -11,15 +11,17 @@ import { normalizePagesTableGrids } from '../src/utils/layoutMetrics.ts';
 import { buildDocxBuffer } from './docxBuilder.ts';
 import { latexToOmmlXml } from './omml.ts';
 
-let cachedAiClient: GoogleGenAI | null = null;
+const geminiClientCache = new Map<string, GoogleGenAI>();
 
-function getGeminiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
+/** Ưu tiên API key người dùng gửi lên; fallback GEMINI_API_KEY trên server. */
+function getGeminiClient(clientApiKey?: string): GoogleGenAI {
+  const apiKey = (clientApiKey || process.env.GEMINI_API_KEY || '').trim();
   if (!apiKey) {
     throw new Error('MISSING_API_KEY');
   }
-  if (!cachedAiClient) {
-    cachedAiClient = new GoogleGenAI({
+  let client = geminiClientCache.get(apiKey);
+  if (!client) {
+    client = new GoogleGenAI({
       apiKey,
       httpOptions: {
         headers: {
@@ -27,8 +29,9 @@ function getGeminiClient(): GoogleGenAI {
         },
       },
     });
+    geminiClientCache.set(apiKey, client);
   }
-  return cachedAiClient;
+  return client;
 }
 
 const inlineSegmentSchema = {
@@ -408,9 +411,10 @@ export async function handleOcrPage(req: RequestWithOptionalBody, res: ServerRes
       imageDataUrl?: string;
       pageNumber?: number;
       speedMode?: 'fast' | 'accurate';
+      apiKey?: string;
     }>(req);
 
-    const { imageDataUrl, pageNumber, speedMode } = body;
+    const { imageDataUrl, pageNumber, speedMode, apiKey: clientApiKey } = body;
 
     if (!imageDataUrl || typeof imageDataUrl !== 'string') {
       sendJson(res, 400, { error: 'Thiếu dữ liệu ảnh trang cần nhận dạng.' });
@@ -425,7 +429,7 @@ export async function handleOcrPage(req: RequestWithOptionalBody, res: ServerRes
 
     const mimeType = match[1];
     const base64Data = match[2];
-    const ai = getGeminiClient();
+    const ai = getGeminiClient(clientApiKey);
 
     const response = await generateOcrWithModelFallback(
       ai,
@@ -448,8 +452,9 @@ export async function handleOcrPage(req: RequestWithOptionalBody, res: ServerRes
   } catch (err: unknown) {
     const message = getErrorMessage(err) || 'Lỗi không xác định khi gọi Gemini OCR.';
     if (message === 'MISSING_API_KEY') {
-      sendJson(res, 500, {
-        error: 'Chưa cấu hình GEMINI_API_KEY trong biến môi trường của máy chủ (Secrets / Environment Variables).',
+      sendJson(res, 400, {
+        error:
+          'Chưa có Gemini API Key. Hãy nhập API Key của bạn ở ô bên trái (mỗi người dùng key riêng), hoặc quản trị viên cấu hình GEMINI_API_KEY trên server.',
       });
       return;
     }

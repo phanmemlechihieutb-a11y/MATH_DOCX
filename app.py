@@ -4,7 +4,9 @@ import os
 import re
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
@@ -631,19 +633,29 @@ def latex_to_omml_fallback(latex: str, display_mode: bool = False) -> Optional[e
         return None
 
 
+# Cache OMML XML string để tránh chuyển lại cùng một công thức nhiều lần
+@lru_cache(maxsize=2048)
+def _cached_latex_to_omml_xml(latex: str, display_mode: bool) -> Optional[str]:
+    """
+    Ưu tiên pure-Python (latex2mathml → OMML) — nhanh gấp nhiều lần so với gọi Pandoc
+    cho từng công thức. Chỉ fallback Pandoc khi pure-Python thất bại.
+    """
+    omml_elem = latex_to_omml_fallback(latex, display_mode=display_mode)
+    if omml_elem is None:
+        omml_elem = latex_to_omml_via_pandoc(latex, display_mode=display_mode)
+    if omml_elem is None:
+        return None
+    return etree.tostring(omml_elem, encoding="unicode")
+
+
 def append_omml_to_paragraph(paragraph, latex: str, display_mode: bool = False) -> bool:
     """
-    Chuyển LaTeX thành Word Equation (OMML) và gắn trực tiếp vào đối tượng paragraph của python-docx.
-    Ưu tiên Pandoc trước; fallback sang MathML->OMML; cuối cùng fallback text nếu công thức lỗi cú pháp.
+    Chuyển LaTeX thành Word Equation (OMML) và gắn trực tiếp vào paragraph.
+    Dùng cache + pure-Python trước để tăng tốc độ rõ rệt trên tài liệu nhiều công thức.
     """
-    omml_elem = latex_to_omml_via_pandoc(latex, display_mode=display_mode)
-    if omml_elem is None:
-        omml_elem = latex_to_omml_fallback(latex, display_mode=display_mode)
-
-    if omml_elem is not None:
-        # Chuyển đổi sang node lxml tương thích python-docx oxml
-        xml_bytes = etree.tostring(omml_elem, encoding="utf-8")
-        paragraph._p.append(parse_xml(xml_bytes))
+    xml_str = _cached_latex_to_omml_xml(latex.strip(), display_mode)
+    if xml_str:
+        paragraph._p.append(parse_xml(xml_str))
         return True
 
     # Fallback an toàn để không mất dữ liệu
@@ -880,7 +892,7 @@ def main() -> None:
 
         st.divider()
         st.caption(
-            "💡 Công thức Toán học được biên dịch sang định dạng OMML chuẩn Microsoft Word bằng Pandoc + LaTeX2MathML."
+            "💡 Công thức được biên dịch OMML bằng pure-Python (latex2mathml) + cache — nhanh hơn nhiều so với gọi Pandoc từng công thức."
         )
 
     # Khu vực tải lên tệp
@@ -943,32 +955,55 @@ def main() -> None:
                     total_pages = len(pages_pil)
                     status.write(f"✅ Đã nạp thành công {total_pages} trang tài liệu.")
 
-                    # Bước 3: Gọi Gemini OCR từng trang + Cắt hình minh họa
-                    for idx, page_img in enumerate(pages_pil):
-                        step_pct = 25 + int(((idx + 0.5) / total_pages) * 50)
-                        progress_bar.progress(
-                            step_pct,
-                            text=f"Đang xử lý công thức toán trang {idx + 1}/{total_pages}...",
-                        )
-                        status.write(f"🧮 Đang phân tích bố cục & nhận diện công thức toán trang {idx + 1}/{total_pages}...")
+                    # Bước 3: OCR Gemini song song (giới hạn worker để tránh rate-limit)
+                    # Giữ thứ tự trang bằng mảng cố định index.
+                    all_pages_blocks = [None] * total_pages  # type: ignore
+                    max_workers = min(4, max(1, total_pages))
+                    status.write(
+                        f"🧮 Đang OCR {total_pages} trang song song (tối đa {max_workers} worker)..."
+                    )
 
-                        page_json = call_gemini_ocr_with_retry(
+                    def _ocr_one(idx_img):
+                        idx, page_img = idx_img
+                        return idx, call_gemini_ocr_with_retry(
                             api_key=effective_api_key,
                             model_name=selected_model,
                             page_image=page_img,
                             page_index=idx,
                         )
-                        all_pages_blocks.append(page_json)
 
-                        # Trích xuất & cắt hình vẽ trong trang này
+                    completed = 0
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = {
+                            executor.submit(_ocr_one, (idx, img)): idx
+                            for idx, img in enumerate(pages_pil)
+                        }
+                        for fut in as_completed(futures):
+                            idx, page_json = fut.result()
+                            all_pages_blocks[idx] = page_json
+                            completed += 1
+                            step_pct = 25 + int((completed / total_pages) * 50)
+                            progress_bar.progress(
+                                step_pct,
+                                text=f"Đã OCR {completed}/{total_pages} trang...",
+                            )
+                            status.write(
+                                f"✅ Hoàn tất OCR trang {idx + 1}/{total_pages}"
+                            )
+
+                    # Cắt hình minh họa (nhanh, giữ tuần tự)
+                    for idx, page_json in enumerate(all_pages_blocks):
+                        if not page_json:
+                            continue
+                        page_img = pages_pil[idx]
                         blocks = page_json.get("blocks", [])
-                        fig_count_on_page = 0
                         for b_idx, blk in enumerate(blocks):
                             if (blk.get("type") or "").lower() == "figure":
-                                fig_count_on_page += 1
                                 fid = blk.get("figure_id") or f"fig_{b_idx + 1}"
                                 blk["figure_id"] = fid
-                                status.write(f"✂️ Đang trích xuất & cắt hình ảnh `{fid}` trên trang {idx + 1}...")
+                                status.write(
+                                    f"✂️ Đang cắt hình `{fid}` trang {idx + 1}..."
+                                )
                                 cropped_bytes = crop_figure_from_page(
                                     page_img=page_img,
                                     bbox_norm=blk.get("bbox_norm"),
@@ -986,8 +1021,13 @@ def main() -> None:
                                     )
 
                     # Bước 4: Biên dịch LaTeX -> Word OMML & Lắp ráp .docx
-                    progress_bar.progress(85, text="Đang chuyển đổi công thức LaTeX sang Word Equation (OMML)...")
-                    status.write("⚙️ Đang biên dịch toàn bộ công thức LaTeX sang OMML và ghép hình vào file Word...")
+                    # (pure-Python + cache — không gọi Pandoc cho từng công thức)
+                    progress_bar.progress(
+                        85, text="Đang chuyển đổi công thức LaTeX sang Word Equation (OMML)..."
+                    )
+                    status.write(
+                        "⚙️ Đang biên dịch LaTeX → OMML (pure-Python + cache) và ghép hình vào Word..."
+                    )
                     docx_bytes = build_word_document(all_pages_blocks, figures_map)
 
                     progress_bar.progress(100, text="Hoàn tất chuyển đổi!")

@@ -67,6 +67,19 @@ async function parseJsonResponseSafe<T>(res: Response): Promise<T> {
     if (res.status === 504) {
       throw new Error('Máy chủ xử lý quá thời gian cho phép (HTTP 504). Vui lòng thử lại.');
     }
+    const looksLikeHtml =
+      /^\s*<!doctype html/i.test(raw) ||
+      /^\s*<html[\s>]/i.test(raw) ||
+      raw.includes('<meta charset');
+    if (looksLikeHtml) {
+      throw new Error(
+        'Máy chủ trả về trang HTML thay vì JSON API. ' +
+          'API OCR/export chưa chạy. Hãy: (1) chạy `npm run dev` (tsx server.ts), ' +
+          'không mở file tĩnh hay `vite` thuần; (2) kiểm tra http://localhost:3000/api/health; ' +
+          '(3) đặt GEMINI_API_KEY trong file .env. ' +
+          `HTTP ${res.status}.`
+      );
+    }
     const snippet = raw.replace(/\s+/g, ' ').trim().slice(0, 120);
     throw new Error(
       `Máy chủ trả về phản hồi không hợp lệ (HTTP ${res.status})${snippet ? `: ${snippet}` : ''}`
@@ -142,6 +155,13 @@ export default function App() {
   const [renderedPages, setRenderedPages] = useState<RenderedPage[]>([]);
   const [selectedPageNum, setSelectedPageNum] = useState<number>(1);
   const [renderDpi, setRenderDpi] = useState<number>(250);
+  const [userApiKey, setUserApiKey] = useState<string>(() => {
+    try {
+      return window.localStorage.getItem('mathdocx_gemini_api_key') || '';
+    } catch {
+      return '';
+    }
+  });
   const [addPageBreaks, setAddPageBreaks] = useState<boolean>(true);
   const [autoCropFigures, setAutoCropFigures] = useState<boolean>(true);
   const [choiceLayout, setChoiceLayout] = useState<ChoiceLayoutMode>('tabs');
@@ -1225,6 +1245,15 @@ export default function App() {
     const hasPaste = pastedLatex.trim().length > 0;
 
     if (!hasFile && !hasDocx && !hasPaste) return;
+
+    // OCR PDF/ảnh cần Gemini API Key do người dùng tự nhập
+    if (hasFile && inputSource === 'file' && !userApiKey.trim()) {
+      setErrorMessage(
+        'Vui lòng nhập Gemini API Key của bạn ở mục "2. Tùy chọn chuyển đổi" (lấy tại aistudio.google.com/apikey).'
+      );
+      return;
+    }
+
     recordConversionSuccess();
 
     if (inputSource === 'docx' && hasDocx) {
@@ -1283,6 +1312,7 @@ export default function App() {
             body: JSON.stringify({
               imageDataUrl: page.ocrDataUrl || page.dataUrl,
               pageNumber: page.pageNumber,
+              apiKey: userApiKey.trim() || undefined,
             }),
           },
           2
@@ -2032,6 +2062,46 @@ export default function App() {
           {/* 2. Tùy chọn chuyển đổi & Định dạng */}
           <section className="p-5 space-y-4">
             <h2 className="text-sm font-semibold text-slate-900">2. Tùy chọn chuyển đổi</h2>
+
+            <div>
+              <label
+                htmlFor="gemini-api-key"
+                className="block text-xs font-medium text-slate-700 mb-1.5"
+              >
+                Gemini API Key (mỗi người dùng key riêng)
+              </label>
+              <input
+                id="gemini-api-key"
+                type="password"
+                autoComplete="off"
+                value={userApiKey}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  setUserApiKey(v);
+                  try {
+                    window.localStorage.setItem('mathdocx_gemini_api_key', v);
+                  } catch {
+                    /* ignore quota / private mode */
+                  }
+                }}
+                disabled={isConverting}
+                placeholder="Dán API Key từ Google AI Studio..."
+                className="w-full h-10 px-3 text-sm bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-600 font-mono"
+              />
+              <p className="mt-1.5 text-[11px] text-slate-500 leading-relaxed">
+                Key chỉ lưu trên trình duyệt của bạn, không chia sẻ cho người khác.
+                Lấy key tại{' '}
+                <a
+                  href="https://aistudio.google.com/apikey"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-blue-700 underline"
+                >
+                  aistudio.google.com/apikey
+                </a>
+                .
+              </p>
+            </div>
 
             <div>
               <label
