@@ -1378,10 +1378,12 @@ export default function App() {
         setStatusMessage(`Đã nhận dạng xong ${completedCount}/${total} trang...`);
       };
 
-      const concurrency = Math.min(5, total);
+      // Free-tier dễ 503 nếu gửi song song nhiều trang — giới hạn 2 request cùng lúc
+      const concurrency = Math.min(2, total);
       const workers = Array.from({ length: concurrency }, async (_, workerIdx) => {
         if (workerIdx > 0) {
-          await new Promise((r) => setTimeout(r, workerIdx * 90));
+          // Giãn cách request để giảm 503 free-tier
+          await new Promise((r) => setTimeout(r, workerIdx * 400));
         }
         while (!abortedError) {
           const idx = nextIndex++;

@@ -246,8 +246,19 @@ Quy tắc bắt buộc:
 6. Giữ nguyên ngôn ngữ gốc, chính tả, dấu câu và không tự ý thêm nội dung không có trên trang.
 7. TỐI ƯU TỐC ĐỘ JSON: Chỉ xuất các trường tùy chọn (bold, italic, underline, font_size_pt, color, tab_before, heading_level, indent_left_pt, first_line_indent_pt, tab_stops_pt, table_borderless, is_choice_block, alignment/width_pct/col_span của ô, caption) khi có giá trị thực sự là true hoặc khác null/0. TUYỆT ĐỐI KHÔNG gộp segment khiến chữ thường bị gán nhầm bold=true.`;
 
-const OCR_MODELS_FAST = ['gemini-3.1-flash-lite', 'gemini-4-hydrogen'] as const;
-const OCR_MODELS_ACCURATE = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'] as const;
+/** Model ưu tiên free-tier ổn định trước, rồi mới tới model mạnh hơn. */
+const OCR_MODELS_FAST = [
+  'gemini-3.5-flash-lite',
+  'gemini-3.1-flash-lite',
+  'gemini-3.8-flash',
+  'gemini-4-hydrogen',
+] as const;
+const OCR_MODELS_ACCURATE = [
+  'gemini-4-hydrogen',
+  'gemini-3.8-flash',
+  'gemini-3.5-flash-lite',
+  'gemini-3.1-flash-lite',
+] as const;
 const DAILY_QUOTA_COOLDOWN_MS = 10 * 60 * 1000;
 const modelCooldownUntil = new Map<string, number>();
 
@@ -310,7 +321,7 @@ async function generateOcrWithModelFallback(
   let lastError: unknown;
 
   for (const model of modelsToTry) {
-    const maxRetries = 2;
+    const maxRetries = 3;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
         const thinkingLevel = ThinkingLevel.LOW;
@@ -346,7 +357,7 @@ async function generateOcrWithModelFallback(
             break;
           }
           if (attempt < maxRetries) {
-            await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
+            await new Promise((r) => setTimeout(r, 1200 * (attempt + 1)));
             continue;
           }
           break;
@@ -354,7 +365,8 @@ async function generateOcrWithModelFallback(
 
         if (isTransientServerError(err, msg)) {
           if (attempt < maxRetries) {
-            await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
+            // Backoff dài hơn với free-tier / 503
+            await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
             continue;
           }
           // Exhausted retries on this model -> break to try the next fallback model
@@ -472,9 +484,12 @@ export async function handleOcrPage(req: RequestWithOptionalBody, res: ServerRes
       return;
     }
     if (isTransientServerError(err, message)) {
+      const short = message.replace(/\s+/g, ' ').trim().slice(0, 160);
       sendJson(res, 503, {
         error:
-          'Máy chủ AI đang quá tải tạm thời (503). Hệ thống đã tự thử chuyển model dự phòng nhưng chưa thành công — vui lòng nhấn "Bắt đầu chuyển đổi" lại sau vài giây.',
+          'Máy chủ AI đang quá tải tạm thời (503) hoặc model đang bận. Hệ thống đã tự thử nhiều model dự phòng nhưng chưa thành công. ' +
+          'Với API Key miễn phí hãy: (1) đợi 15–30 giây rồi thử lại, (2) chuyển ít trang / DPI 200, (3) cân nhắc bật Billing. ' +
+          (short ? `Chi tiết: ${short}` : ''),
       });
       return;
     }
