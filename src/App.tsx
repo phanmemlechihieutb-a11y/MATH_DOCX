@@ -1162,7 +1162,6 @@ export default function App() {
 
       setProgressPct(100);
       setStatusMessage(targetFormat === 'latex' ? successMsgLatex : successMsgOmml);
-      recordConversionSuccess();
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Không thể chuyển đổi nội dung.';
       setErrorMessage(msg);
@@ -1224,6 +1223,9 @@ export default function App() {
     const hasFile = renderedPages.length > 0;
     const hasDocx = pendingDocxPages.length > 0;
     const hasPaste = pastedLatex.trim().length > 0;
+
+    if (!hasFile && !hasDocx && !hasPaste) return;
+    recordConversionSuccess();
 
     if (inputSource === 'docx' && hasDocx) {
       await handleConvertStructuredPages(
@@ -1464,7 +1466,6 @@ export default function App() {
 
       setProgressPct(100);
       setStatusMessage('Hoàn tất chuyển đổi! File Word đã sẵn sàng để tải xuống.');
-      recordConversionSuccess();
       setActiveTab('preview');
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Đã xảy ra lỗi khi chuyển đổi.';
