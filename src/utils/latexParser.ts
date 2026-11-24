@@ -7891,6 +7891,7 @@ export function splitTextPreservingInlineMath(
       ...(baseStyle.bold ? { bold: true } : {}),
       ...(baseStyle.italic ? { italic: true } : {}),
       ...(baseStyle.underline ? { underline: true } : {}),
+      ...(baseStyle.vert_align ? { vert_align: baseStyle.vert_align } : {}),
       ...(baseStyle.font_size_pt ? { font_size_pt: baseStyle.font_size_pt } : {}),
       ...(baseStyle.color ? { color: baseStyle.color } : {}),
     });

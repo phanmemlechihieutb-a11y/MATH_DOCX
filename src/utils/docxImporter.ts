@@ -74,6 +74,7 @@ const UNICODE_MATH_TO_LATEX: Record<string, string> = {
   '∂': '\\partial ',
   '∇': '\\nabla ',
   '°': '^\\circ ',
+  '˚': '^\\circ ',
   '′': "'",
   '″': "''",
   '…': '\\dots ',
@@ -280,12 +281,37 @@ function ommlElementToLatex(el: Element): string {
       return '';
 
     case 'r': {
-      const rPr = getFirstChild(el, 'rPr');
-      const sty = getAttr(getFirstChild(rPr ?? el, 'sty'), 'val');
+      const mRPr = Array.from(el.childNodes).find(
+        (n) =>
+          n.nodeType === 1 &&
+          getLocalName(n as Element) === 'rPr' &&
+          ((n as Element).prefix === 'm' || (n as Element).namespaceURI?.includes('/math'))
+      ) as Element | undefined;
+      const wRPr = Array.from(el.childNodes).find(
+        (n) =>
+          n.nodeType === 1 &&
+          getLocalName(n as Element) === 'rPr' &&
+          n !== mRPr
+      ) as Element | undefined;
+      const sty = getAttr(getFirstChild(mRPr ?? el, 'sty'), 'val');
       const tNodes = getChildElements(el, 't');
       const rawText = tNodes.map((t) => t.textContent ?? '').join('');
       if (!rawText) return '';
-      const isPlain = sty === 'p' || getAttr(rPr ? getFirstChild(rPr, 'nor') : null, 'val') === '1';
+
+      const wStyle = parseRPrElement(wRPr ?? null);
+      const scriptKind: 'superscript' | 'subscript' | undefined =
+        wStyle.vert_align === 'superscript' || wStyle.vert_align === 'subscript'
+          ? wStyle.vert_align
+          : wStyle.vert_align !== null && typeof wStyle.position_hp === 'number'
+          ? wStyle.position_hp >= 3
+            ? 'superscript'
+            : wStyle.position_hp <= -3
+            ? 'subscript'
+            : undefined
+          : undefined;
+
+      const isPlain = sty === 'p' || getAttr(mRPr ? getFirstChild(mRPr, 'nor') : null, 'val') === '1';
+      let runLatex: string;
       if (isPlain && /^[A-Za-zÀ-ỹ\s.,;:!?()-]+$/.test(rawText) && rawText.trim().length >= 2) {
         const knownFuncs = new Set([
           'sin', 'cos', 'tan', 'cot', 'sec', 'csc',
@@ -296,14 +322,27 @@ function ommlElementToLatex(el: Element): string {
         const trimmed = rawText.replace(/\u2009/g, ' ').trim();
         const compact = trimmed.replace(/\s+/g, '');
         if (compact === 'limsup' || compact === 'liminf') {
-          return `\\${compact} `;
+          runLatex = `\\${compact} `;
+        } else if (knownFuncs.has(trimmed)) {
+          runLatex = `\\${trimmed} `;
+        } else {
+          runLatex = `\\text{${rawText}}`;
         }
-        if (knownFuncs.has(trimmed)) {
-          return `\\${trimmed} `;
-        }
-        return `\\text{${rawText}}`;
+      } else {
+        runLatex = mapMathChars(rawText);
       }
-      return mapMathChars(rawText);
+
+      if (scriptKind === 'superscript') {
+        const trimmed = runLatex.trim();
+        if (!trimmed) return '';
+        return trimmed.startsWith('^') ? trimmed : `^${wrapBracesIfNeeded(trimmed)}`;
+      }
+      if (scriptKind === 'subscript') {
+        const trimmed = runLatex.trim();
+        if (!trimmed) return '';
+        return trimmed.startsWith('_') ? trimmed : `_${wrapBracesIfNeeded(trimmed)}`;
+      }
+      return runLatex;
     }
 
     case 'f': {
@@ -336,7 +375,10 @@ function ommlElementToLatex(el: Element): string {
       const eEl = getFirstChild(el, 'e');
       const supEl = getFirstChild(el, 'sup');
       const base = wrapOmmlBaseForScript(eEl ? ommlElementToLatex(eEl).trim() : '', eEl);
-      const sup = supEl ? ommlElementToLatex(supEl).trim() : '';
+      let sup = supEl ? ommlElementToLatex(supEl).trim() : '';
+      if (sup.startsWith('^')) {
+        sup = sup.slice(1).trim();
+      }
       return `${base}^${wrapBracesIfNeeded(sup) || '{}'}`;
     }
 
@@ -622,6 +664,7 @@ interface ResolvedRunProps {
   italicCs?: boolean;
   underline?: boolean;
   vert_align?: 'subscript' | 'superscript' | null;
+  position_hp?: number;
   font_size_pt?: number;
   color?: string | null;
 }
@@ -786,11 +829,19 @@ function parseRPrElement(rPr: Element | null, themeColors?: Map<string, string>)
 
   const vertAlignEl = getFirstChild(rPr, 'vertAlign');
   if (vertAlignEl) {
-    const vVal = getAttr(vertAlignEl, 'val');
+    const vVal = (getAttr(vertAlignEl, 'val') ?? '').trim().toLowerCase();
     if (vVal === 'subscript' || vVal === 'superscript') {
       style.vert_align = vVal;
     } else if (vVal === 'baseline') {
       style.vert_align = null;
+    }
+  }
+
+  const positionEl = getFirstChild(rPr, 'position');
+  if (positionEl) {
+    const posRaw = getAttr(positionEl, 'val');
+    if (posRaw !== null && posRaw.trim() !== '' && !Number.isNaN(Number(posRaw))) {
+      style.position_hp = Number(posRaw);
     }
   }
 
@@ -834,6 +885,7 @@ function mergeRunProps(...layers: Array<ResolvedRunProps | undefined>): Resolved
     if (layer.italicCs !== undefined) out.italicCs = layer.italicCs;
     if (layer.underline !== undefined) out.underline = layer.underline;
     if (layer.vert_align !== undefined) out.vert_align = layer.vert_align;
+    if (layer.position_hp !== undefined) out.position_hp = layer.position_hp;
     if (layer.font_size_pt !== undefined) out.font_size_pt = layer.font_size_pt;
     if (layer.color !== undefined) out.color = layer.color;
   }
@@ -842,7 +894,8 @@ function mergeRunProps(...layers: Array<ResolvedRunProps | undefined>): Resolved
 
 function resolvedPropsToSegmentStyle(
   props: ResolvedRunProps,
-  textSample?: string
+  textSample?: string,
+  allowPositionFallback = true
 ): Omit<InlineSegment, 'type' | 'content'> {
   const out: Omit<InlineSegment, 'type' | 'content'> = {};
   const isComplexScriptOnly =
@@ -854,7 +907,16 @@ function resolvedPropsToSegmentStyle(
   if (isBold) out.bold = true;
   if (isItalic) out.italic = true;
   if (props.underline) out.underline = true;
-  if (props.vert_align) out.vert_align = props.vert_align;
+  if (props.vert_align) {
+    out.vert_align = props.vert_align;
+  } else if (
+    allowPositionFallback &&
+    props.vert_align !== null &&
+    typeof props.position_hp === 'number'
+  ) {
+    if (props.position_hp >= 3) out.vert_align = 'superscript';
+    else if (props.position_hp <= -3) out.vert_align = 'subscript';
+  }
   if (props.font_size_pt !== undefined) out.font_size_pt = props.font_size_pt;
   if (props.color) out.color = props.color;
   return out;
@@ -1051,18 +1113,27 @@ function resolveCharacterStyleChain(
   return mergeRunProps(...chain);
 }
 
-function parseRunFormatting(
+function resolveRunMergedProps(
   rEl: Element,
   baseRunProps?: ResolvedRunProps,
-  styleCtx?: DocxStyleContext,
-  textSample?: string
-): Omit<InlineSegment, 'type' | 'content'> {
+  styleCtx?: DocxStyleContext
+): ResolvedRunProps {
   const rPr = getFirstChild(rEl, 'rPr');
   const rStyleId = rPr ? getAttr(getFirstChild(rPr, 'rStyle'), 'val') ?? undefined : undefined;
   const charStyleProps = resolveCharacterStyleChain(styleCtx, rStyleId);
   const directProps = parseRPrElement(rPr, styleCtx?.themeColors);
-  const merged = mergeRunProps(baseRunProps, charStyleProps, directProps);
-  return resolvedPropsToSegmentStyle(merged, textSample);
+  return mergeRunProps(baseRunProps, charStyleProps, directProps);
+}
+
+function parseRunFormatting(
+  rEl: Element,
+  baseRunProps?: ResolvedRunProps,
+  styleCtx?: DocxStyleContext,
+  textSample?: string,
+  allowPositionFallback = true
+): Omit<InlineSegment, 'type' | 'content'> {
+  const merged = resolveRunMergedProps(rEl, baseRunProps, styleCtx);
+  return resolvedPropsToSegmentStyle(merged, textSample, allowPositionFallback);
 }
 
 function extractOmmlRunStyle(
@@ -1150,19 +1221,104 @@ function countUnescapedDollars(s: string): number {
   return count;
 }
 
+const SYMBOL_FONT_CHAR_TO_UNICODE: Record<number, string> = {
+  0xb0: '°',
+  0xb1: '±',
+  0xb4: '×',
+  0xb8: '÷',
+  0xb9: '≠',
+  0xa3: '≤',
+  0xb3: '≥',
+  0xbb: '≈',
+  0xa5: '∞',
+  0xd0: '∠',
+  0xd1: '∇',
+  0xd6: '√',
+  0xd7: '·',
+  0xde: '⇒',
+  0xdb: '⇔',
+  0xae: '→',
+  0xac: '←',
+  0xab: '↔',
+  0x61: 'α',
+  0x62: 'β',
+  0x63: 'χ',
+  0x64: 'δ',
+  0x65: 'ε',
+  0x66: 'φ',
+  0x67: 'γ',
+  0x68: 'η',
+  0x69: 'ι',
+  0x6a: 'ϕ',
+  0x6b: 'κ',
+  0x6c: 'λ',
+  0x6d: 'μ',
+  0x6e: 'ν',
+  0x6f: 'o',
+  0x70: 'π',
+  0x71: 'θ',
+  0x72: 'ρ',
+  0x73: 'σ',
+  0x74: 'τ',
+  0x75: 'υ',
+  0x77: 'ω',
+  0x78: 'ξ',
+  0x79: 'ψ',
+  0x7a: 'ζ',
+  0x44: 'Δ',
+  0x46: 'Φ',
+  0x47: 'Γ',
+  0x4c: 'Λ',
+  0x50: 'Π',
+  0x51: 'Θ',
+  0x53: 'Σ',
+  0x57: 'Ω',
+  0x58: 'Ξ',
+  0x59: 'Ψ',
+};
+
+function decodeWordSymbolChar(fontLower: string, code: number): string {
+  const lowByte = code >= 0xf020 && code <= 0xf0ff ? code & 0xff : code;
+  if (fontLower === 'symbol' || (code >= 0xf020 && code <= 0xf0ff)) {
+    if (SYMBOL_FONT_CHAR_TO_UNICODE[lowByte]) {
+      return SYMBOL_FONT_CHAR_TO_UNICODE[lowByte];
+    }
+    if (lowByte >= 0x20 && lowByte <= 0x7e) {
+      return String.fromCharCode(lowByte);
+    }
+    return '';
+  }
+  if (code >= 0x20 && !(code >= 0xe000 && code <= 0xf8ff)) {
+    return String.fromCharCode(code);
+  }
+  return '';
+}
+
 function splitParagraphTextSegmentsForLatex(segments: InlineSegment[]): InlineSegment[] {
-  // First merge adjacent text segments with identical styles (or unbalanced $) so Word rsid splits don't break $...$
+  // First merge adjacent text segments with identical styles (or unbalanced $ that closes later) so Word rsid splits don't break $...$
   const merged: InlineSegment[] = [];
-  for (const seg of segments) {
+  for (let idx = 0; idx < segments.length; idx++) {
+    const seg = segments[idx];
     const prev = merged[merged.length - 1];
+    const prevHasOpenDollar =
+      Boolean(prev && prev.type === 'text' && countUnescapedDollars(prev.content) % 2 === 1);
+    const hasLaterDollar =
+      prevHasOpenDollar &&
+      segments.slice(idx).some((s) => s.type === 'text' && (s.content.includes('$') || s.content.includes('＄')));
     if (
       prev &&
       prev.type === 'text' &&
       seg.type === 'text' &&
       !seg.tab_before &&
-      (sameTextStyle(prev, seg) || countUnescapedDollars(prev.content) % 2 === 1)
+      (sameTextStyle(prev, seg) || hasLaterDollar)
     ) {
-      prev.content += seg.content;
+      if (!sameTextStyle(prev, seg) && seg.vert_align === 'superscript') {
+        prev.content += `^{${seg.content}}`;
+      } else if (!sameTextStyle(prev, seg) && seg.vert_align === 'subscript') {
+        prev.content += `_{${seg.content}}`;
+      } else {
+        prev.content += seg.content;
+      }
     } else {
       merged.push({ ...seg });
     }
@@ -1454,6 +1610,39 @@ function parseParagraphElement(
     }
   };
 
+  // Guard against whole-paragraph vertical position offsets: only treat w:position as sub/superscript
+  // when not all non-empty text runs in the paragraph share the same non-zero w:position.
+  const paragraphRunPositions: number[] = [];
+  let paragraphPlainLen = 0;
+  const collectRunPositionMeta = (el: Element) => {
+    const tag = getLocalName(el);
+    if (tag === 'pPr' || tag === 'del' || tag === 'proofErr' || tag === 'oMathPara' || tag === 'oMath') {
+      return;
+    }
+    if (tag === 'hyperlink' || tag === 'ins' || tag === 'smartTag' || tag === 'sdt' || tag === 'sdtContent' || tag === 'fldSimple') {
+      getChildElements(el).forEach(collectRunPositionMeta);
+      return;
+    }
+    if (tag === 'r') {
+      const txt = getChildElements(el, 't')
+        .concat(getChildElements(el, 'delText'))
+        .map((n) => n.textContent ?? '')
+        .join('');
+      if (txt.trim().length > 0) {
+        paragraphPlainLen += txt.trim().length;
+        const resolved = resolveRunMergedProps(el, baseRunProps, ctx.styleCtx);
+        paragraphRunPositions.push(resolved.position_hp ?? 0);
+      }
+    }
+  };
+  getChildElements(pEl).forEach(collectRunPositionMeta);
+  const allSameNonZeroPosition =
+    paragraphPlainLen > 8 &&
+    paragraphRunPositions.length > 0 &&
+    paragraphRunPositions[0] !== 0 &&
+    paragraphRunPositions.every((p) => p === paragraphRunPositions[0]);
+  const allowPositionFallback = !allSameNonZeroPosition;
+
   const processNode = (el: Element) => {
     const tag = getLocalName(el);
     if (tag === 'pPr' || tag === 'del' || tag === 'proofErr' || tag === 'bookmarkStart' || tag === 'bookmarkEnd') {
@@ -1507,7 +1696,7 @@ function parseParagraphElement(
       return;
     }
 
-    if (tag === 'hyperlink' || tag === 'ins' || tag === 'smartTag' || tag === 'sdt' || tag === 'sdtContent') {
+    if (tag === 'hyperlink' || tag === 'ins' || tag === 'smartTag' || tag === 'sdt' || tag === 'sdtContent' || tag === 'fldSimple') {
       getChildElements(el).forEach(processNode);
       return;
     }
@@ -1517,7 +1706,7 @@ function parseParagraphElement(
         .concat(getChildElements(el, 'delText'))
         .map((n) => n.textContent ?? '')
         .join('');
-      const rStyle = parseRunFormatting(el, baseRunProps, ctx.styleCtx, rTextSample);
+      const rStyle = parseRunFormatting(el, baseRunProps, ctx.styleCtx, rTextSample, allowPositionFallback);
       for (let i = 0; i < el.childNodes.length; i++) {
         const ch = el.childNodes[i];
         if (ch.nodeType !== 1) continue;
@@ -1535,6 +1724,23 @@ function parseParagraphElement(
               ...(pendingTab ? { tab_before: true } : {}),
             });
             pendingTab = false;
+          }
+        } else if (cTag === 'sym') {
+          const fontLower = (getAttr(cEl, 'font') ?? '').trim().toLowerCase();
+          const charHex = (getAttr(cEl, 'char') ?? '').trim();
+          const code = charHex ? parseInt(charHex, 16) : NaN;
+          if (!Number.isNaN(code)) {
+            const symChar = decodeWordSymbolChar(fontLower, code);
+            if (symChar) {
+              if (symChar.trim()) hasNonEmptyTextRuns = true;
+              rawSegments.push({
+                type: 'text',
+                content: symChar,
+                ...rStyle,
+                ...(pendingTab ? { tab_before: true } : {}),
+              });
+              pendingTab = false;
+            }
           }
         } else if (cTag === 'tab') {
           pendingTab = true;

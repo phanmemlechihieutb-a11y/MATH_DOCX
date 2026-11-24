@@ -199,7 +199,12 @@ function formatTextSegmentForTex(seg: InlineSegment, baseFontPt = 12): string {
 
   if (!core) return raw;
 
-  let out = escapeLatexText(core).replace(/\r\n?|\n/g, ' \\\\\n');
+  let out =
+    seg.vert_align === 'superscript' && core === '°'
+      ? '$^\\circ$'
+      : escapeLatexText(core).replace(/\r\n?|\n/g, ' \\\\\n');
+  if (seg.vert_align === 'subscript') out = `\\textsubscript{${out}}`;
+  else if (seg.vert_align === 'superscript' && core !== '°') out = `\\textsuperscript{${out}}`;
   if (seg.underline) out = `\\underline{${out}}`;
   if (seg.italic) out = `\\textit{${out}}`;
   if (seg.bold) out = `\\textbf{${out}}`;
