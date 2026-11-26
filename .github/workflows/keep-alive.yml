@@ -1,0 +1,14 @@
+name: Keep Render Alive
+
+on:
+  schedule:
+    # Tự động chạy mỗi 14 phút một lần
+    - cron: '*/14 * * * *'
+  workflow_dispatch: # Cho phép bấm chạy thử thủ công
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Render App
+        run: curl -s -o /dev/null -w "%{http_code}\n"https://math-docx.onrender.com/
